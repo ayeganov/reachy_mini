@@ -72,7 +72,7 @@ class Backend:
         )
         self.kinematics_engine = kinematics_engine
 
-        self.logger.info(f"Using {self.kinematics_engine} kinematics engine")
+        self.logger.info("Using %s kinematics engine", self.kinematics_engine)
 
         if self.check_collision:
             assert self.kinematics_engine == "Placo", (

@@ -27,7 +27,9 @@ from reachy_mini.io import (
     AsyncWebSocketFrameSender,
     ZenohServer,
 )
+from reachy_mini.media.capture import CaptureConfig, MediaCapture
 from reachy_mini.media.media_manager import MediaManager
+from reachy_mini.media.publishers import ZeroMQPublisher
 
 from .backend.mujoco import MujocoBackend, MujocoBackendStatus
 from .backend.robot import RobotBackend, RobotBackendStatus
@@ -61,7 +63,7 @@ class Daemon:
         # Get package version
         try:
             package_version = version("reachy_mini")
-            self.logger.info(f"Daemon version: {package_version}")
+            self.logger.info("Daemon version: %s", package_version)
         except PackageNotFoundError:
             package_version = None
             self.logger.warning("Could not determine daemon version")
@@ -80,17 +82,14 @@ class Daemon:
         )
         self._thread_event_publish_status = Event()
 
-        self._webrtc: Optional[Any] = (
-            None  # type GstWebRTC imported for wireless version only
-        )
-        if stream:
-            if not wireless_version:
-                raise RuntimeError(
-                    "WebRTC streaming is only supported for wireless version. Use --wireless-version flag."
-                )
-            from reachy_mini.media.webrtc_daemon import GstWebRTC
-
-            self._webrtc = GstWebRTC(log_level)
+        self._media_capture: Optional[MediaCapture] = None
+        self._zeromq_publisher: Optional[ZeroMQPublisher] = None
+        self._stream_enabled = stream
+        if stream and not wireless_version:
+            raise RuntimeError(
+                "Media streaming is only supported for wireless version. "
+                "Use --wireless-version flag."
+            )
 
     async def start(
         self,
@@ -132,7 +131,11 @@ class Daemon:
             return self._status.state
 
         self.logger.info(
-            f"Daemon start parameters: sim={sim}, serialport={serialport}, scene={scene}, localhost_only={localhost_only}, wake_up_on_start={wake_up_on_start}, check_collision={check_collision}, kinematics_engine={kinematics_engine}, headless={headless}, hardware_config_filepath={hardware_config_filepath}"
+            "Daemon start parameters: sim=%s, serialport=%s, scene=%s, localhost_only=%s, "
+            "wake_up_on_start=%s, check_collision=%s, kinematics_engine=%s, headless=%s, "
+            "hardware_config_filepath=%s",
+            sim, serialport, scene, localhost_only, wake_up_on_start, check_collision,
+            kinematics_engine, headless, hardware_config_filepath,
         )
 
         self._status.simulation_enabled = sim
@@ -222,7 +225,7 @@ class Daemon:
             try:
                 self.backend.wrapped_run()
             except Exception as e:
-                self.logger.error(f"Backend encountered an error: {e}")
+                self.logger.error("Backend encountered an error: %s", e)
                 self._status.state = DaemonState.ERROR
                 self._status.error = str(e)
                 self.zenoh_server.stop()
@@ -271,7 +274,7 @@ class Daemon:
                 self.backend.set_motor_control_mode(MotorControlMode.Enabled)
                 await self.backend.wake_up()
             except Exception as e:
-                self.logger.error(f"Error while waking up Reachy Mini: {e}")
+                self.logger.error("Error while waking up Reachy Mini: %s", e)
                 self._status.state = DaemonState.ERROR
                 self._status.error = str(e)
                 return self._status.state
@@ -280,11 +283,11 @@ class Daemon:
                 self._status.state = DaemonState.STOPPING
                 return self._status.state
 
-        if self._webrtc:
+        if self._stream_enabled:
             await asyncio.sleep(
                 0.2
             )  # Give some time for the backend to release the audio device
-            self._webrtc.start()
+            self._start_media_streaming()
 
         self.logger.info("Daemon started successfully.")
         self._status.state = DaemonState.RUNNING
@@ -298,7 +301,7 @@ class Daemon:
         ):
             self.logger.warning("_publish_frames called but not properly initialized.")
             return
-        while self._thread_event_publish_frames.is_set() is False:
+        while not self._thread_event_publish_frames.is_set():
             frame = self.media_manager.get_frame()
             if frame is not None:
                 self.websocket_frame_sender.send_frame(frame)
@@ -313,7 +316,7 @@ class Daemon:
             self.logger.warning("_publish_audio called but not properly initialized.")
             return
 
-        while self._thread_event_publish_audio.is_set() is False:
+        while not self._thread_event_publish_audio.is_set():
             audio = self.media_manager.get_audio_sample()
             if audio is not None:
                 self.websocket_audio_sender.send_audio_chunk(audio)
@@ -321,6 +324,45 @@ class Daemon:
             if received_audio is not None:
                 self.media_manager.push_audio_sample(received_audio)
             time.sleep(0.05)
+
+    def _start_media_streaming(self) -> None:
+        """Start media capture and streaming publishers.
+
+        Initialize MediaCapture to own camera/microphone hardware and
+        publish to IPC bus. Start ZeroMQ publisher to consume from IPC
+        and stream to clients over TCP.
+        """
+        try:
+            capture_config = CaptureConfig(log_level=self.log_level)
+            self._media_capture = MediaCapture(config=capture_config)
+            if not self._media_capture.start():
+                self.logger.error("Failed to start MediaCapture")
+                return
+
+            self._zeromq_publisher = ZeroMQPublisher(log_level=self.log_level)
+            if not self._zeromq_publisher.start():
+                self.logger.error("Failed to start ZeroMQ publisher")
+                self._media_capture.stop()
+                self._media_capture = None
+                return
+
+            self.logger.info("Media streaming started successfully")
+
+        except Exception as e:
+            self.logger.error("Failed to start media streaming: %s", e)
+            self._stop_media_streaming()
+
+    def _stop_media_streaming(self) -> None:
+        """Stop media capture and streaming publishers."""
+        if self._zeromq_publisher is not None:
+            self._zeromq_publisher.stop()
+            self._zeromq_publisher = None
+
+        if self._media_capture is not None:
+            self._media_capture.stop()
+            self._media_capture = None
+
+        self.logger.info("Media streaming stopped")
 
     async def stop(self, goto_sleep_on_stop: bool = True) -> "DaemonState":
         """Stop the Reachy Mini daemon.
@@ -353,8 +395,8 @@ class Daemon:
             if self.websocket_server is not None:
                 self.websocket_server.stop()
 
-            if self._webrtc:
-                self._webrtc.stop()
+            if self._stream_enabled:
+                self._stop_media_streaming()
 
             if goto_sleep_on_stop:
                 try:
@@ -363,7 +405,7 @@ class Daemon:
                     await self.backend.goto_sleep()
                     self.backend.set_motor_control_mode(MotorControlMode.Disabled)
                 except Exception as e:
-                    self.logger.error(f"Error while putting Reachy Mini to sleep: {e}")
+                    self.logger.error("Error while putting Reachy Mini to sleep: %s", e)
                     self._status.state = DaemonState.ERROR
                     self._status.error = str(e)
                 except KeyboardInterrupt:
@@ -383,7 +425,7 @@ class Daemon:
                 self.logger.info("Daemon stopped successfully.")
                 self._status.state = DaemonState.STOPPED
         except Exception as e:
-            self.logger.error(f"Error while stopping the daemon: {e}")
+            self.logger.error("Error while stopping the daemon: %s", e)
             self._status.state = DaemonState.ERROR
             self._status.error = str(e)
         except KeyboardInterrupt:
@@ -492,7 +534,7 @@ class Daemon:
 
     def _publish_status(self) -> None:
         self._thread_event_publish_status.clear()
-        while self._thread_event_publish_status.is_set() is False:
+        while not self._thread_event_publish_status.is_set():
             json_str = json.dumps(
                 asdict(self.status(), dict_factory=convert_enum_to_dict)
             )
@@ -551,7 +593,7 @@ class Daemon:
             try:
                 self.logger.info("Daemon is running. Press Ctrl+C to stop.")
                 while self.backend_run_thread.is_alive():
-                    self.logger.info(f"Daemon status: {self.status()}")
+                    self.logger.info("Daemon status: %s", self.status())
                     for _ in range(10):
                         self.backend_run_thread.join(timeout=1.0)
                 else:
@@ -560,7 +602,7 @@ class Daemon:
             except KeyboardInterrupt:
                 self.logger.warning("Daemon interrupted by user.")
             except Exception as e:
-                self.logger.error(f"An error occurred: {e}")
+                self.logger.error("An error occurred: %s", e)
                 self._status.state = DaemonState.ERROR
                 self._status.error = str(e)
 
@@ -592,7 +634,7 @@ class Daemon:
             if serialport == "auto":
                 ports = find_serial_port(wireless_version=wireless_version)
 
-                if len(ports) == 0:
+                if not ports:
                     raise RuntimeError(
                         "No Reachy Mini serial port found. "
                         "Check USB connection and permissions. "
@@ -605,10 +647,12 @@ class Daemon:
                     )
 
                 serialport = ports[0]
-                self.logger.info(f"Found Reachy Mini serial port: {serialport}")
+                self.logger.info("Found Reachy Mini serial port: %s", serialport)
 
             self.logger.info(
-                f"Creating RobotBackend with parameters: serialport={serialport}, check_collision={check_collision}, kinematics_engine={kinematics_engine}"
+                "Creating RobotBackend with parameters: serialport=%s, "
+                "check_collision=%s, kinematics_engine=%s",
+                serialport, check_collision, kinematics_engine,
             )
             return RobotBackend(
                 serialport=serialport,

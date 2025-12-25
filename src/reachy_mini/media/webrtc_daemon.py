@@ -4,6 +4,7 @@ Starts a gstreamer webrtc pipeline to stream video and audio.
 """
 
 import logging
+import time
 from threading import Thread
 from typing import Optional, Tuple, cast
 
@@ -146,7 +147,7 @@ class GstWebRTC:
     def _configure_video(
         self, cam_path: str, pipeline: Gst.Pipeline, webrtcsink: Gst.Element
     ) -> None:
-        self._logger.debug(f"Configuring video {cam_path}")
+        self._logger.debug("Configuring video %s", cam_path)
         camerasrc = Gst.ElementFactory.make("libcamerasrc")
         caps = Gst.Caps.from_string(
             f"video/x-raw,width={self.resolution[0]},height={self.resolution[1]},framerate={self.framerate}/1,format=YUY2,colorimetry=bt709,interlace-mode=progressive"
@@ -233,7 +234,7 @@ class GstWebRTC:
             if snd_card_name in name:
                 if device_props and device_props.has_field("object.serial"):
                     serial = device_props.get_string("object.serial")
-                    self._logger.debug(f"Found audio input device with serial {serial}")
+                    self._logger.debug("Found audio input device with serial %s", serial)
                     monitor.stop()
                     return str(serial)
 
@@ -266,12 +267,12 @@ class GstWebRTC:
                             if cam_name == "Arducam_12MP"
                             else cast(CameraSpecs, ReachyMiniLiteCamSpecs)
                         )
-                        self._logger.debug(f"Found {cam_name} camera at {device_path}")
+                        self._logger.debug("Found %s camera at %s", cam_name, device_path)
                         monitor.stop()
                         return str(device_path), camera_specs
                     elif cam_name == "imx708":
                         camera_specs = cast(CameraSpecs, ReachyMiniWirelessCamSpecs)
-                        self._logger.debug(f"Found {cam_name} camera")
+                        self._logger.debug("Found %s camera", cam_name)
                         monitor.stop()
                         return cam_name, camera_specs
         monitor.stop()
@@ -286,7 +287,7 @@ class GstWebRTC:
 
         elif t == Gst.MessageType.ERROR:
             err, debug = msg.parse_error()
-            self._logger.error(f"Error: {err} {debug}")
+            self._logger.error("Error: %s %s", err, debug)
             return False
 
         else:
@@ -316,8 +317,6 @@ class GstWebRTC:
 
 
 if __name__ == "__main__":
-    import time
-
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

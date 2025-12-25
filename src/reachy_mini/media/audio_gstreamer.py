@@ -151,7 +151,7 @@ class GStreamerAudio(AudioBase):
 
         elif t == Gst.MessageType.ERROR:
             err, debug = msg.parse_error()
-            self.logger.error(f"Error: {err} {debug}")
+            self.logger.error("Error: %s %s", err, debug)
             return False
 
         return True

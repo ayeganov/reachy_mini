@@ -22,6 +22,8 @@ from reachy_mini.daemon.utils import daemon_check
 from reachy_mini.io.protocol import GotoTaskRequest
 from reachy_mini.io.zenoh_client import ZenohClient
 from reachy_mini.media.media_manager import MediaBackend, MediaManager
+from reachy_mini.media.receivers import ZeroMQReceiver
+from reachy_mini.media.receivers.base import MediaSource
 from reachy_mini.motion.move import Move
 from reachy_mini.utils.interpolation import InterpolationTechnique, minimum_jerk
 
@@ -69,7 +71,6 @@ class ReachyMini:
         timeout: float = 5.0,
         automatic_body_yaw: bool = True,
         log_level: str = "INFO",
-        media_backend: str = "default",
     ) -> None:
         """Initialize the Reachy Mini robot.
 
@@ -81,13 +82,13 @@ class ReachyMini:
             timeout (float): Timeout for the client connection, defaults to 5.0 seconds.
             automatic_body_yaw (bool): If True, the body yaw will be used to compute the IK and FK. Default is False.
             log_level (str): Logging level, defaults to "INFO".
-            media_backend (str): Media backend to use, either "default" (OpenCV), "gstreamer" or "webrtc", defaults to "default".
 
         It will try to connect to the daemon, and if it fails, it will raise an exception.
 
         """
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(log_level)
+        self._log_level = log_level
         self.robot_name = robot_name
         daemon_check(spawn_daemon, use_sim)
         self.client = ZenohClient(robot_name, localhost_only)
@@ -106,17 +107,16 @@ class ReachyMini:
             ]
         )
 
-        # When connecting to a remote robot, check if streaming is available
-        if not localhost_only and media_backend == "default":
-            daemon_status = self.client.get_status()
-            if daemon_status.get("wireless_version") and daemon_status.get("stream_enabled"):
-                self.logger.info("Remote connection detected with streaming enabled - using WebRTC backend.")
-                media_backend = "webrtc"
-            else:
-                self.logger.info("Remote connection detected without streaming - disabling media. Start daemon with '--stream' flag to enable WebRTC.")
-                media_backend = "no_media"
+        # Initialize media source based on connection type
+        self._media_source: Optional[MediaSource] = None
+        self.media_manager: Optional[MediaManager] = None
 
-        self.media_manager = self._configure_mediamanager(media_backend, log_level)
+        if not localhost_only:
+            # Remote connection - use ZeroMQ receiver directly
+            self._init_remote_media(log_level)
+        else:
+            # Local connection - use MediaManager for simulation/direct access
+            self._init_local_media(log_level)
 
     def __del__(self) -> None:
         """Destroy the Reachy Mini instance.
@@ -133,13 +133,65 @@ class ReachyMini:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:  # type: ignore [no-untyped-def]
         """Context manager exit point for Reachy Mini."""
-        self.media_manager.close()
+        if self._media_source is not None:
+            self._media_source.close()
+        if self.media_manager is not None:
+            self.media_manager.close()
         self.client.disconnect()
 
     @property
-    def media(self) -> MediaManager:
-        """Expose the MediaManager instance used by ReachyMini."""
+    def media(self) -> Optional[MediaSource]:
+        """Expose the media source used by ReachyMini.
+
+        Returns:
+            MediaSource for getting frames/audio, or None if media is disabled.
+
+        """
+        if self._media_source is not None:
+            return self._media_source
         return self.media_manager
+
+    def _init_remote_media(self, log_level: str) -> None:
+        """Initialize media for remote connections using ZeroMQ."""
+        daemon_status = self.client.get_status()
+
+        if not daemon_status.get("stream_enabled"):
+            self.logger.info(
+                "Remote connection detected but streaming not enabled on daemon. "
+                "Start daemon with '--stream' flag to enable media."
+            )
+            return
+
+        wlan_ip = daemon_status.get("wlan_ip")
+        if not wlan_ip:
+            self.logger.warning(
+                "Could not determine daemon IP address for media streaming"
+            )
+            return
+
+        self.logger.info(f"Connecting to media stream at {wlan_ip}...")
+        self._media_source = ZeroMQReceiver(host=wlan_ip, log_level=log_level)
+
+        if not self._media_source.start(wait_timeout=3.0):
+            self.logger.warning(
+                f"Failed to connect to media stream at {wlan_ip}. "
+                "Media will be unavailable."
+            )
+            self._media_source.close()
+            self._media_source = None
+        else:
+            self.logger.info(f"Media stream connected to {wlan_ip}")
+
+    def _init_local_media(self, log_level: str) -> None:
+        """Initialize media for local connections using MediaManager."""
+        daemon_status = self.client.get_status()
+        use_sim = daemon_status.get("simulation_enabled", False)
+
+        self.media_manager = MediaManager(
+            use_sim=use_sim,
+            backend=MediaBackend.DEFAULT,
+            log_level=log_level,
+        )
 
     def _configure_mediamanager(
         self, media_backend: str, log_level: str
@@ -150,17 +202,29 @@ class ReachyMini:
             case "webrtc":
                 if not daemon_status.get("wireless_version"):
                     self.logger.warning(
-                        "Non-wireless version detected, daemon should use the flag '--wireless-version'. Reverting to default"
+                        "Non-wireless version detected, daemon should use the "
+                        "flag '--wireless-version'. Reverting to default"
                     )
                     mbackend = MediaBackend.DEFAULT
                 elif not daemon_status.get("stream_enabled"):
                     self.logger.warning(
-                        "WebRTC requested but streaming is not enabled on daemon. Start daemon with '--stream' flag. Reverting to no_media"
+                        "WebRTC requested but streaming is not enabled on daemon. "
+                        "Start daemon with '--stream' flag. Reverting to no_media"
                     )
                     mbackend = MediaBackend.NO_MEDIA
                 else:
                     self.logger.info("WebRTC backend configured successfully.")
                     mbackend = MediaBackend.WEBRTC
+            case "zeromq":
+                if not daemon_status.get("stream_enabled"):
+                    self.logger.warning(
+                        "ZeroMQ requested but streaming is not enabled on daemon. "
+                        "Start daemon with '--stream' flag. Reverting to no_media"
+                    )
+                    mbackend = MediaBackend.NO_MEDIA
+                else:
+                    self.logger.info("ZeroMQ backend configured successfully.")
+                    mbackend = MediaBackend.ZEROMQ
             case "gstreamer":
                 mbackend = MediaBackend.GSTREAMER
             case "default":
@@ -171,7 +235,9 @@ class ReachyMini:
                 mbackend = MediaBackend.DEFAULT_NO_VIDEO
             case _:
                 raise ValueError(
-                    f"Invalid media_backend '{media_backend}'. Supported values are 'default', 'gstreamer', 'no_media', 'default_no_video', and 'webrtc'."
+                    f"Invalid media_backend '{media_backend}'. Supported values are "
+                    "'default', 'gstreamer', 'no_media', 'default_no_video', "
+                    "'webrtc', and 'zeromq'."
                 )
 
         return MediaManager(

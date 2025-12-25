@@ -25,6 +25,7 @@ class MediaBackend(Enum):
     GSTREAMER = "gstreamer"
     GSTREAMER_NO_VIDEO = "gstreamer_no_video"
     WEBRTC = "webrtc"
+    ZEROMQ = "zeromq"
 
 
 class MediaManager:
@@ -65,6 +66,9 @@ class MediaManager:
                 self.logger.info("Using WebRTC GStreamer backend.")
                 self._init_webrtc(log_level, signalling_host, 8443)
                 # self._init_audio(log_level)
+            case MediaBackend.ZEROMQ:
+                self.logger.info("Using ZeroMQ TCP streaming backend.")
+                self._init_zeromq(log_level, signalling_host)
             case _:
                 raise NotImplementedError(f"Media backend {backend} not implemented.")
 
@@ -164,6 +168,25 @@ class MediaManager:
         self.audio = webrtc_media  # GstWebRTCClient handles both audio and video
         self.camera.open()
 
+    def _init_zeromq(self, log_level: str, host: str) -> None:
+        """Initialize ZeroMQ TCP streaming backend.
+
+        Args:
+            log_level: Logging level string.
+            host: Remote host address where ZeroMQ publishers are running.
+
+        """
+        from reachy_mini.media.audio_zeromq import ZeroMQAudio
+        from reachy_mini.media.camera_zeromq import ZeroMQCamera
+
+        self.camera = ZeroMQCamera(host=host, log_level=log_level)
+        self.camera.open()
+
+        self.audio = ZeroMQAudio(host=host, log_level=log_level)
+        self.audio.start_recording()
+
+        self.logger.info("ZeroMQ media connected to %s", host)
+
     def play_sound(self, sound_file: str) -> None:
         """Play a sound file.
 
@@ -250,7 +273,8 @@ class MediaManager:
 
         if data.ndim > 2 or data.ndim == 0:
             self.logger.warning(
-                f"Audio samples arrays must have at most 2 dimensions and at least 1 dimension, got {data.ndim}"
+                "Audio samples arrays must have at most 2 dimensions and at least 1 dimension, got %s",
+                data.ndim,
             )
             return
 

@@ -1,6 +1,7 @@
 """Utility functions for audio handling, specifically for detecting the ReSpeaker sound card."""
 
 import logging
+import re
 import subprocess
 from pathlib import Path
 
@@ -11,12 +12,12 @@ def _process_card_number_output(output: str) -> int:
     for line in lines:
         if "reachy mini audio" in line.lower():
             card_number = line.split(" ")[1].split(":")[0]
-            logging.debug(f"Found Reachy Mini Audio sound card: {card_number}")
+            logging.debug("Found Reachy Mini Audio sound card: %s", card_number)
             return int(card_number)
         elif "respeaker" in line.lower():
             card_number = line.split(" ")[1].split(":")[0]
             logging.warning(
-                f"Found ReSpeaker sound card: {card_number}. Please update firmware!"
+                "Found ReSpeaker sound card: %s. Please update firmware!", card_number
             )
             return int(card_number)
 
@@ -35,7 +36,7 @@ def get_respeaker_card_number() -> int:
         return _process_card_number_output(output)
 
     except subprocess.CalledProcessError as e:
-        logging.error(f"Cannot find sound card: {e}")
+        logging.error("Cannot find sound card: %s", e)
         return -1
 
 
@@ -59,8 +60,6 @@ def check_reachymini_asoundrc() -> bool:
     if not ("reachymini_audio_sink" in content and "reachymini_audio_src" in content):
         return False
     # Check that the card number in .asoundrc matches the detected card_id
-    import re
-
     card_numbers = set(re.findall(r"card\s+(\d+)", content))
     if str(card_id) not in card_numbers:
         return False

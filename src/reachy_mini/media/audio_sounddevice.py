@@ -86,7 +86,7 @@ class SoundDeviceAudio(AudioBase):
             self._logs["input_underflows"] += 1
             if self._logs["input_underflows"] % 10 == 1:
                 self.logger.debug(
-                    f"Audio input underflow count: {self._logs['input_underflows']}"
+                    "Audio input underflow count: %d", self._logs["input_underflows"]
                 )
 
         with self._input_lock:
@@ -194,7 +194,7 @@ class SoundDeviceAudio(AudioBase):
     ) -> None:
         """Handle audio output stream callback."""
         if status:
-            self.logger.warning(f"SoundDevice output status: {status}")
+            self.logger.warning("SoundDevice output status: %s", status)
         
         with self._output_lock:
             filled = 0
@@ -270,7 +270,7 @@ class SoundDeviceAudio(AudioBase):
             )
         data = self.ensure_chunk_shape(data, (-1, self.get_output_channels()))
 
-        self.logger.debug(f"Playing sound '{file_path}' at {samplerate_in} Hz")
+        self.logger.debug("Playing sound '%s' at %d Hz", file_path, samplerate_in)
 
         if self._output_stream is not None:
             self.push_audio_sample(data)
@@ -304,7 +304,8 @@ class SoundDeviceAudio(AudioBase):
                     return idx
         # Return default output device if not found
         self.logger.warning(
-            f"No {device_io_type} device found containing '{names_contains}', using default."
+            "No %s device found containing '%s', using default.",
+            device_io_type, names_contains,
         )
         return self._safe_query_device(device_io_type)
 

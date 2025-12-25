@@ -117,7 +117,7 @@ class GStreamerCamera(CameraBase):
 
         elif t == Gst.MessageType.ERROR:
             err, debug = msg.parse_error()
-            self.logger.error(f"Error: {err} {debug}")
+            self.logger.error("Error: %s %s", err, debug)
             return False
 
         return True
@@ -218,12 +218,12 @@ class GStreamerCamera(CameraBase):
                             if cam_name == "Arducam_12MP"
                             else cast(CameraSpecs, ReachyMiniLiteCamSpecs)
                         )
-                        self.logger.debug(f"Found {cam_name} camera at {device_path}")
+                        self.logger.debug("Found %s camera at %s", cam_name, device_path)
                         monitor.stop()
                         return str(device_path), camera_specs
                     elif cam_name == "imx708":
                         camera_specs = cast(CameraSpecs, ReachyMiniWirelessCamSpecs)
-                        self.logger.debug(f"Found {cam_name} camera")
+                        self.logger.debug("Found %s camera", cam_name)
                         monitor.stop()
                         return cam_name, camera_specs
         monitor.stop()
