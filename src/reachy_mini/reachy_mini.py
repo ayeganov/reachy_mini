@@ -73,6 +73,7 @@ class ReachyMini:
         timeout: float = 5.0,
         automatic_body_yaw: bool = True,
         log_level: str = "INFO",
+        media_enabled: bool = True,
     ) -> None:
         """Initialize the Reachy Mini robot.
 
@@ -84,6 +85,7 @@ class ReachyMini:
             timeout (float): Timeout for the client connection, defaults to 5.0 seconds.
             automatic_body_yaw (bool): If True, the body yaw will be used to compute the IK and FK. Default is False.
             log_level (str): Logging level, defaults to "INFO".
+            media_enabled (bool): If True, initialize media (video/audio). Defaults to True.
 
         It will try to connect to the daemon, and if it fails, it will raise an exception.
 
@@ -113,12 +115,13 @@ class ReachyMini:
         self._media_source: Optional[MediaClient] = None
         self._mic_publisher: Optional[GenericMediaPublisher] = None
 
-        if not localhost_only:
-            # Remote connection - use ZeroMQ receiver
-            self._init_remote_media(log_level)
-        else:
-            # Local connection - use LocalIPCReceiver
-            self._init_local_media(log_level)
+        if media_enabled:
+            if not localhost_only:
+                # Remote connection - use ZeroMQ receiver
+                self._init_remote_media(log_level)
+            else:
+                # Local connection - use LocalIPCReceiver
+                self._init_local_media(log_level)
 
     def __del__(self) -> None:
         """Destroy the Reachy Mini instance.

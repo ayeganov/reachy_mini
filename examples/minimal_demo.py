@@ -7,7 +7,7 @@ import numpy as np
 from reachy_mini import ReachyMini
 from reachy_mini.utils import create_head_pose
 
-with ReachyMini(media_backend="no_media") as mini:
+with ReachyMini(media_enabled=False) as mini:
     mini.goto_target(create_head_pose(), antennas=[0.0, 0.0], duration=1.0)
     try:
         while True:

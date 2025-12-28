@@ -1,6 +1,5 @@
 """Reachy Mini sound recording example."""
 
-import argparse
 import logging
 import time
 
@@ -13,13 +12,13 @@ DURATION = 5  # seconds
 OUTPUT_FILE = "recorded_audio.wav"
 
 
-def main(backend: str) -> None:
+def main() -> None:
     """Record audio for 5 seconds and save to a WAV file."""
     logging.basicConfig(
         level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s"
     )
 
-    with ReachyMini(log_level="INFO", media_backend=backend) as mini:
+    with ReachyMini(log_level="INFO") as mini:
         print(f"Recording for {DURATION} seconds...")
         audio_samples = []
         t0 = time.time()
@@ -31,8 +30,7 @@ def main(backend: str) -> None:
                 audio_samples.append(sample)
             else:
                 print("No audio data available yet...")
-            if backend == "default":
-                time.sleep(0.2)
+            time.sleep(0.2)
         mini.media.stop_recording()
 
         # Concatenate all samples and save
@@ -46,16 +44,4 @@ def main(backend: str) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Records audio from Reachy Mini's microphone."
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["default", "gstreamer", "webrtc"],
-        default="default",
-        help="Media backend to use.",
-    )
-
-    args = parser.parse_args()
-    main(backend=args.backend)
+    main()

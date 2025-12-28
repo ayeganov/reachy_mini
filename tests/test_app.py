@@ -58,7 +58,7 @@ async def test_app_manager() -> None:
 
     assert len(after_installed_apps) == len(before_installed_apps) + 1
 
-    status = await app_mngr.start_app("ok_app", media_backend="no_media")
+    status = await app_mngr.start_app("ok_app", media_enabled=False)
     assert status is not None and status.state in (AppState.STARTING, AppState.RUNNING)
     assert app_mngr.is_app_running()
     status = await app_mngr.current_app_status()
@@ -96,7 +96,7 @@ async def test_faulty_app() -> None:
     )
     await app_mngr.install_new_app(app_info, daemon.logger)
 
-    status = await app_mngr.start_app("faulty_app", media_backend="no_media")
+    status = await app_mngr.start_app("faulty_app", media_enabled=False)
 
     success = False
     for _ in range(10):

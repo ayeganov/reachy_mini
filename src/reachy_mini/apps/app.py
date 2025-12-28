@@ -31,7 +31,7 @@ class ReachyMiniApp(ABC):
 
     custom_app_url: str | None = None
     dont_start_webserver: bool = False
-    request_media_backend: str | None = None
+    request_media_enabled: bool | None = None
 
     def __init__(self, running_on_wireless: bool = False) -> None:
         """Initialize the Reachy Mini app."""
@@ -43,10 +43,12 @@ class ReachyMiniApp(ABC):
         running_on_wireless = self._check_systemd_service_exists()
         self.logger.info(f"Running on wireless: {running_on_wireless}")
 
-        self.media_backend = (
-            self.request_media_backend
-            if self.request_media_backend is not None
-            else ("zeromq" if running_on_wireless else "default")
+        # Determine media and connection settings
+        self.localhost_only = not running_on_wireless
+        self.media_enabled = (
+            self.request_media_enabled
+            if self.request_media_enabled is not None
+            else True
         )
 
         self.settings_app: FastAPI | None = None
@@ -122,9 +124,12 @@ class ReachyMiniApp(ABC):
 
         try:
             self.logger.info("Starting Reachy Mini app...")
-            self.logger.info(f"Using media backend: {self.media_backend}")
+            self.logger.info(
+                f"localhost_only={self.localhost_only}, media_enabled={self.media_enabled}"
+            )
             with ReachyMini(
-                media_backend=self.media_backend,
+                localhost_only=self.localhost_only,
+                media_enabled=self.media_enabled,
                 *args,
                 **kwargs,  # type: ignore
             ) as reachy_mini:
