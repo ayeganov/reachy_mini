@@ -106,6 +106,24 @@ class MediaClient(Protocol):
         """
         ...
 
+    def stream_sound(self, sound_file: str) -> None:
+        """Read a local audio file and stream its raw data to the robot.
+
+        This method reads the entire file into memory and pushes it to the
+        send queue for streaming.
+
+        Args:
+            sound_file (str): Path to the local audio file (e.g., WAV).
+        """
+
+    def push_audio_sample(self, data: npt.NDArray[np.float32], sample_rate: int):
+        """Push a chunk of audio data to be sent to the robot.
+
+        Args:
+            data (npt.NDArray[np.float32]): Numpy array of audio data.
+            sample_rate (int): The sample rate of the audio data.
+        """
+
     def close(self) -> None:
         """Release resources and close connections."""
         ...
