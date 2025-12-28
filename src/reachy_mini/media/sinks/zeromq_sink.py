@@ -127,6 +127,8 @@ class JPEGEncodedZMQSink(
                 height=metadata.height,
                 encoding="jpeg",
                 quality=self._jpeg_quality,
+                K=metadata.K,
+                D=metadata.D,
             )
 
             self._send_multipart(

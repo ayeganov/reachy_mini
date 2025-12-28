@@ -11,12 +11,8 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import zmq
 
-from reachy_mini.media.capture import (
-    AUDIO_IPC_ENDPOINT,
-    VIDEO_IPC_ENDPOINT,
-    AudioMetadata,
-    VideoMetadata,
-)
+from reachy_mini.media.capture import AudioMetadata, VideoMetadata
+from reachy_mini.media.media_constants import AUDIO_IPC_ENDPOINT, VIDEO_IPC_ENDPOINT
 from reachy_mini.media.publishers.base import AudioData, MediaChunk, VideoData
 
 if TYPE_CHECKING:

@@ -93,15 +93,14 @@ class MediaClient(Protocol):
         """
         ...
 
-    def play_sound(self, asset_file: str) -> None:
-        """
-        Play a sound file.
+    def play_sound(self, asset_name: str) -> None:
+        """Play a sound file.
 
         Note: Not all receivers support audio playback. Remote receivers
         may log a warning instead.
 
         Args:
-            asset_file: Name of the asset file to play
+            asset_name: Name of the asset file to play
 
         """
         ...
@@ -141,4 +140,14 @@ class MediaClient(Protocol):
     @property
     def audio_sample_rate(self) -> Optional[int]:
         """Get the current audio sample rate in Hz."""
+        ...
+
+    @property
+    def K(self) -> Optional[npt.NDArray[np.float64]]:
+        """Get camera intrinsic matrix for current resolution."""
+        ...
+
+    @property
+    def D(self) -> Optional[npt.NDArray[np.float64]]:
+        """Get camera distortion coefficients."""
         ...

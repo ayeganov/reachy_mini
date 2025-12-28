@@ -16,12 +16,8 @@ import numpy as np
 import numpy.typing as npt
 import zmq
 
-from reachy_mini.media.capture import (
-    AUDIO_IPC_ENDPOINT,
-    VIDEO_IPC_ENDPOINT,
-    AudioMetadata,
-    VideoMetadata,
-)
+from reachy_mini.media.capture import AudioMetadata, VideoMetadata
+from reachy_mini.media.media_constants import AUDIO_IPC_ENDPOINT, VIDEO_IPC_ENDPOINT
 
 if TYPE_CHECKING:
     from zmq import Context, Socket
@@ -109,6 +105,10 @@ class LocalIPCReceiver:
         self._last_video_receive_time: float = 0.0
         self._last_audio_receive_time: float = 0.0
 
+        # Camera intrinsics from video stream
+        self._K: Optional[npt.NDArray[np.float64]] = None
+        self._D: Optional[npt.NDArray[np.float64]] = None
+
     @property
     def is_connected(self) -> bool:
         """Check if receiver is actively receiving data from producer.
@@ -138,6 +138,16 @@ class LocalIPCReceiver:
     def audio_sample_rate(self) -> Optional[int]:
         """Get current audio sample rate in Hz."""
         return self._audio_sample_rate
+
+    @property
+    def K(self) -> Optional[npt.NDArray[np.float64]]:
+        """Get camera intrinsic matrix for current resolution."""
+        return self._K
+
+    @property
+    def D(self) -> Optional[npt.NDArray[np.float64]]:
+        """Get camera distortion coefficients."""
+        return self._D
 
     def start(self) -> bool:
         """Start receiving media from IPC bus.
@@ -309,6 +319,11 @@ class LocalIPCReceiver:
                         "format": metadata.format.value,
                     }
                     self._video_resolution = (metadata.width, metadata.height)
+                    # Update camera intrinsics from metadata
+                    if metadata.K is not None:
+                        self._K = np.array(metadata.K, dtype=np.float64)
+                    if metadata.D is not None:
+                        self._D = np.array(metadata.D, dtype=np.float64)
 
                 self._last_video_receive_time = time.monotonic()
 

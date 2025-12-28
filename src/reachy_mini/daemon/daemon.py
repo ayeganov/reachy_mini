@@ -5,7 +5,6 @@ It includes methods to start, stop, and restart the daemon, as well as to check 
 It also provides a command-line interface for easy interaction.
 """
 
-import asyncio
 import json
 import logging
 import time
@@ -28,14 +27,16 @@ from reachy_mini.io import (
     ZenohServer,
 )
 from reachy_mini.media.capture import (
-    AUDIO_TCP_PORT,
-    AUDIO_TOPIC,
-    VIDEO_TCP_PORT,
-    VIDEO_TOPIC,
     AudioOutput,
     AudioOutputConfig,
     CaptureConfig,
     MediaCapture,
+)
+from reachy_mini.media.media_constants import (
+    AUDIO_TCP_PORT,
+    AUDIO_TOPIC,
+    VIDEO_TCP_PORT,
+    VIDEO_TOPIC,
 )
 from reachy_mini.media.publishers.base import GenericMediaPublisher
 from reachy_mini.media.receivers.local_ipc_receiver import LocalIPCReceiver
@@ -300,6 +301,10 @@ class Daemon:
         if self._audio_output is not None:
             self.backend.set_audio_output(self._audio_output)
 
+        # Pass MediaCapture to Backend for resolution control
+        if self._media_capture is not None:
+            self.backend.set_media_capture(self._media_capture)
+
         if wake_up_on_start:
             try:
                 self.logger.info("Waking up Reachy Mini...")
@@ -386,7 +391,9 @@ class Daemon:
                 self._media_capture = None
                 return
 
-            self.logger.info("MediaCapture and AudioOutput started for WebSocket streaming")
+            self.logger.info(
+                "MediaCapture and AudioOutput started for WebSocket streaming"
+            )
 
         except Exception as e:
             self.logger.error("Failed to start media capture/output: %s", e)
@@ -514,9 +521,6 @@ class Daemon:
             if self.websocket_server is not None:
                 self.websocket_server.stop()
 
-            if self._stream_enabled:
-                self._stop_media_streaming()
-
             if goto_sleep_on_stop:
                 try:
                     self.logger.info("Putting Reachy Mini to sleep...")
@@ -530,6 +534,9 @@ class Daemon:
                 except KeyboardInterrupt:
                     self.logger.warning("Sleep interrupted by user.")
                     self._status.state = DaemonState.STOPPING
+
+            if self._stream_enabled:
+                self._stop_media_streaming()
 
             self.backend.should_stop.set()
             self.backend_run_thread.join(timeout=5.0)

@@ -17,16 +17,15 @@ import numpy as np
 import numpy.typing as npt
 import zmq
 
-from reachy_mini.media.capture import (
-    AUDIO_TCP_PORT,
-    AUDIO_TOPIC,
-    VIDEO_TCP_PORT,
-    VIDEO_TOPIC,
-    AudioMetadata,
-    EncodedVideoMetadata,
+from reachy_mini.media.capture import AudioMetadata, EncodedVideoMetadata
+from reachy_mini.media.media_constants import (
     AUDIO_OUTPUT_TCP_PORT,
     AUDIO_OUTPUT_TOPIC,
+    AUDIO_TCP_PORT,
+    AUDIO_TOPIC,
     PLAY_SOUND_TOPIC,
+    VIDEO_TCP_PORT,
+    VIDEO_TOPIC,
 )
 from reachy_mini.media.publishers import GenericMediaPublisher
 from reachy_mini.media.sinks import ZeroMQClientSink
@@ -132,6 +131,10 @@ class ZeroMQClient:
         self._first_video_received: bool = False
         self._first_audio_received: bool = False
 
+        # Camera intrinsics from video stream
+        self._K: Optional[npt.NDArray[np.float64]] = None
+        self._D: Optional[npt.NDArray[np.float64]] = None
+
         # For sending audio to the robot
         self._audio_out_source = SinkableSource()
         self._audio_out_sink = ZeroMQClientSink(
@@ -174,6 +177,16 @@ class ZeroMQClient:
     def audio_sample_rate(self) -> Optional[int]:
         """Get current audio sample rate in Hz."""
         return self._audio_sample_rate
+
+    @property
+    def K(self) -> Optional[npt.NDArray[np.float64]]:
+        """Get camera intrinsic matrix for current resolution."""
+        return self._K
+
+    @property
+    def D(self) -> Optional[npt.NDArray[np.float64]]:
+        """Get camera distortion coefficients."""
+        return self._D
 
     def start(self, wait_timeout: float = 0.0) -> bool:
         """Start receiving media.
@@ -441,16 +454,23 @@ class ZeroMQClient:
                 jpeg_bytes = parts[2]
 
                 frame = self._decode_jpeg(jpeg_bytes)
+                receive_time = time.monotonic()
                 if frame is not None:
                     with self._video_lock:
                         self._latest_frame = frame
                         self._latest_frame_metadata = {
                             "ts": metadata.ts,
+                            "receive_ts": receive_time,
                             "width": metadata.width,
                             "height": metadata.height,
                             "encoding": metadata.encoding,
                         }
                         self._video_resolution = (metadata.width, metadata.height)
+                        # Update camera intrinsics from metadata
+                        if metadata.K is not None:
+                            self._K = np.array(metadata.K, dtype=np.float64)
+                        if metadata.D is not None:
+                            self._D = np.array(metadata.D, dtype=np.float64)
 
                     if not self._first_video_received:
                         self._first_video_received = True
@@ -460,7 +480,7 @@ class ZeroMQClient:
                             metadata.height,
                         )
 
-                self._last_video_receive_time = time.monotonic()
+                self._last_video_receive_time = receive_time
 
             except zmq.ZMQError as e:
                 if self._running:

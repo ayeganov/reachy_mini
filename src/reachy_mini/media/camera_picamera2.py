@@ -7,20 +7,13 @@ from typing import Optional, cast
 
 import numpy as np
 import numpy.typing as npt
+from picamera2 import Picamera2
 
 from reachy_mini.media.camera_constants import (
     CameraResolution,
     CameraSpecs,
-    ReachyMiniLiteCamSpecs,
+    ReachyMiniWirelessCamSpecs,
 )
-
-try:
-    from picamera2 import Picamera2
-except ImportError as e:
-    raise ImportError(
-        "The 'picamera2' module is required for Picamera2Camera but could not be imported. "
-        "Please install the picamera2 backend: pip install .[picamera2]."
-    ) from e
 
 from .camera_base import CameraBase
 
@@ -81,7 +74,7 @@ class Picamera2Camera(CameraBase):
     def open(self) -> None:
         """Open the camera using Picamera2."""
         self.picam2 = Picamera2()
-        self.camera_specs = cast(CameraSpecs, ReachyMiniLiteCamSpecs)
+        self.camera_specs = cast(CameraSpecs, ReachyMiniWirelessCamSpecs)
         self._resolution = self.camera_specs.default_resolution
         self.resized_K = self.camera_specs.K
 

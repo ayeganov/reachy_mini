@@ -28,8 +28,10 @@ if typing.TYPE_CHECKING:
     from reachy_mini.daemon.backend.mujoco.backend import MujocoBackendStatus
     from reachy_mini.daemon.backend.robot.backend import RobotBackendStatus
     from reachy_mini.kinematics import AnyKinematics
-    from reachy_mini.media.capture import AudioOutput
+    from reachy_mini.media.capture import AudioOutput, MediaCapture
+
 from reachy_mini.media.audio_sounddevice import SoundDeviceAudio
+from reachy_mini.media.camera_constants import CameraResolution
 from reachy_mini.motion.goto import GotoMove
 from reachy_mini.motion.move import Move
 from reachy_mini.utils.constants import MODELS_ROOT_PATH, URDF_ROOT_PATH
@@ -171,9 +173,14 @@ class Backend:
             self.logger.debug("Initializing daemon audio backend.")
             self._local_audio = SoundDeviceAudio(log_level=log_level)
 
+        # Media capture reference for resolution control
+        self._media_capture: Optional[MediaCapture] = None
+
         # Guard to ensure only one play_move/goto is executed at a time (goto itself uses play_move, so we need an RLock)
         self._play_move_lock = threading.RLock()
-        self._active_move_depth = 0  # Tracks nested acquisitions within the owning thread
+        self._active_move_depth = (
+            0  # Tracks nested acquisitions within the owning thread
+        )
 
     # Life cycle methods
     def wrapped_run(self) -> None:
@@ -379,8 +386,8 @@ class Backend:
 
         try:
             if initial_goto_duration > 0.0:
-                start_head_pose, start_antennas_positions, start_body_yaw = move.evaluate(
-                    0.0
+                start_head_pose, start_antennas_positions, start_body_yaw = (
+                    move.evaluate(0.0)
                 )
                 await self.goto_target(
                     head=start_head_pose,
@@ -664,6 +671,29 @@ class Backend:
             self._local_audio.stop_playing()
             self._local_audio = None
             self.logger.info("Switched audio playback to AudioOutput (streaming mode)")
+
+    def set_media_capture(self, media_capture: "MediaCapture") -> None:
+        """Set MediaCapture instance for video resolution control.
+
+        Args:
+            media_capture: The MediaCapture instance from the daemon.
+
+        """
+        self._media_capture = media_capture
+        self.logger.info("MediaCapture reference set on backend")
+
+    def set_video_resolution(self, resolution: CameraResolution) -> None:
+        """Set the video capture resolution.
+
+        Args:
+            resolution: The CameraResolution to set.
+
+        """
+        if self._media_capture is not None:
+            self._media_capture.set_resolution(resolution)
+            self.logger.info("Video resolution changed to %s", resolution.name)
+        else:
+            self.logger.warning("Cannot set resolution: no MediaCapture available")
 
     def play_sound(self, sound_file: str) -> None:
         """Play a sound file from the assets directory.

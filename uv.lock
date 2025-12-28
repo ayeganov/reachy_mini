@@ -2380,6 +2380,7 @@ dependencies = [
     { name = "psutil" },
     { name = "pyserial" },
     { name = "pyusb" },
+    { name = "pyzmq" },
     { name = "questionary" },
     { name = "reachy-mini-motor-controller" },
     { name = "reachy-mini-rust-kinematics" },
@@ -2435,9 +2436,6 @@ wireless-version = [
     { name = "pollen-bmi088-imu-library" },
     { name = "semver" },
 ]
-zeromq = [
-    { name = "pyzmq" },
-]
 
 [package.metadata]
 requires-dist = [
@@ -2472,7 +2470,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-asyncio", marker = "extra == 'dev'" },
     { name = "pyusb", specifier = ">=1.2.1" },
-    { name = "pyzmq", marker = "extra == 'zeromq'", specifier = ">=25.0.0" },
+    { name = "pyzmq", specifier = ">=25.0.0" },
     { name = "questionary" },
     { name = "reachy-mini-motor-controller", specifier = ">=1.4.2" },
     { name = "reachy-mini-rust-kinematics", specifier = ">=1.0.3" },
@@ -2494,7 +2492,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"] },
     { name = "websockets", specifier = ">=12,<16" },
 ]
-provides-extras = ["dev", "examples", "mujoco", "nn-kinematics", "placo-kinematics", "zeromq", "picamera2", "rerun", "wireless-version"]
+provides-extras = ["dev", "examples", "mujoco", "nn-kinematics", "placo-kinematics", "picamera2", "rerun", "wireless-version"]
 
 [[package]]
 name = "reachy-mini-motor-controller"
