@@ -22,10 +22,6 @@ class MediaBackend(Enum):
     NO_MEDIA = "no_media"
     DEFAULT = "default"
     DEFAULT_NO_VIDEO = "default_no_video"
-    GSTREAMER = "gstreamer"
-    GSTREAMER_NO_VIDEO = "gstreamer_no_video"
-    WEBRTC = "webrtc"
-    ZEROMQ = "zeromq"
 
 
 class MediaManager:
@@ -36,7 +32,6 @@ class MediaManager:
         backend: MediaBackend = MediaBackend.DEFAULT,
         log_level: str = "INFO",
         use_sim: bool = False,
-        signalling_host: str = "localhost",
     ) -> None:
         """Initialize the audio device."""
         self.logger = logging.getLogger(__name__)
@@ -55,20 +50,6 @@ class MediaManager:
             case MediaBackend.DEFAULT_NO_VIDEO:
                 self.logger.info("Using default media backend (SoundDevice only).")
                 self._init_audio(log_level)
-            case MediaBackend.GSTREAMER:
-                self.logger.info("Using GStreamer media backend.")
-                self._init_camera(use_sim, log_level)
-                self._init_audio(log_level)
-            case MediaBackend.GSTREAMER_NO_VIDEO:
-                self.logger.info("Using GStreamer audio backend.")
-                self._init_audio(log_level)
-            case MediaBackend.WEBRTC:
-                self.logger.info("Using WebRTC GStreamer backend.")
-                self._init_webrtc(log_level, signalling_host, 8443)
-                # self._init_audio(log_level)
-            case MediaBackend.ZEROMQ:
-                self.logger.info("Using ZeroMQ TCP streaming backend.")
-                self._init_zeromq(log_level, signalling_host)
             case _:
                 raise NotImplementedError(f"Media backend {backend} not implemented.")
 
@@ -100,14 +81,6 @@ class MediaManager:
                 self.camera.open(udp_camera="udp://@127.0.0.1:5005")
             else:
                 self.camera.open()
-        elif self.backend == MediaBackend.GSTREAMER:
-            self.logger.info("Using GStreamer camera backend.")
-            from reachy_mini.media.camera_gstreamer import GStreamerCamera
-
-            self.camera = GStreamerCamera(log_level=log_level)
-            self.camera.open()
-            # Todo: use simulation with gstreamer?
-
         else:
             raise NotImplementedError(f"Camera backend {self.backend} not implemented.")
 
@@ -134,58 +107,8 @@ class MediaManager:
             from reachy_mini.media.audio_sounddevice import SoundDeviceAudio
 
             self.audio = SoundDeviceAudio(log_level=log_level)
-        elif (
-            self.backend == MediaBackend.GSTREAMER
-            or self.backend == MediaBackend.GSTREAMER_NO_VIDEO
-        ):
-            self.logger.info("Using GStreamer audio backend.")
-            from reachy_mini.media.audio_gstreamer import GStreamerAudio
-
-            self.audio = GStreamerAudio(log_level=log_level)
         else:
             raise NotImplementedError(f"Audio backend {self.backend} not implemented.")
-
-    def _init_webrtc(
-        self, log_level: str, signalling_host: str, signalling_port: int
-    ) -> None:
-        """Initialize the WebRTC system (not implemented yet)."""
-        from gst_signalling.utils import find_producer_peer_id_by_name
-
-        from reachy_mini.media.webrtc_client_gstreamer import GstWebRTCClient
-
-        peer_id = find_producer_peer_id_by_name(
-            signalling_host, signalling_port, "reachymini"
-        )
-
-        webrtc_media: GstWebRTCClient = GstWebRTCClient(
-            log_level=log_level,
-            peer_id=peer_id,
-            signaling_host=signalling_host,
-            signaling_port=signalling_port,
-        )
-
-        self.camera = webrtc_media
-        self.audio = webrtc_media  # GstWebRTCClient handles both audio and video
-        self.camera.open()
-
-    def _init_zeromq(self, log_level: str, host: str) -> None:
-        """Initialize ZeroMQ TCP streaming backend.
-
-        Args:
-            log_level: Logging level string.
-            host: Remote host address where ZeroMQ publishers are running.
-
-        """
-        from reachy_mini.media.audio_zeromq import ZeroMQAudio
-        from reachy_mini.media.camera_zeromq import ZeroMQCamera
-
-        self.camera = ZeroMQCamera(host=host, log_level=log_level)
-        self.camera.open()
-
-        self.audio = ZeroMQAudio(host=host, log_level=log_level)
-        self.audio.start_recording()
-
-        self.logger.info("ZeroMQ media connected to %s", host)
 
     def play_sound(self, sound_file: str) -> None:
         """Play a sound file.

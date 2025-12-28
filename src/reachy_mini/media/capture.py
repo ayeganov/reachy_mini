@@ -24,21 +24,30 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
+from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
 import numpy as np
 import numpy.typing as npt
 import zmq
 
+from reachy_mini.media.audio_control_utils import ReSpeaker, init_respeaker_usb
+
 if TYPE_CHECKING:
     from zmq import Context, Socket
 
 VIDEO_IPC_ENDPOINT = "ipc:///tmp/reachy_video"
 AUDIO_IPC_ENDPOINT = "ipc:///tmp/reachy_audio"
+
+VIDEO_TCP_PORT = 5555
+AUDIO_TCP_PORT = 5556
+VIDEO_TOPIC = b"reachy_video"
+AUDIO_TOPIC = b"reachy_audio"
 
 
 class VideoFormat(str, Enum):
@@ -73,14 +82,16 @@ class VideoMetadata:
 
     def to_json(self) -> str:
         """Serialize metadata to JSON string."""
-        return json.dumps({
-            "ts": self.ts,
-            "width": self.width,
-            "height": self.height,
-            "channels": self.channels,
-            "format": self.format.value,
-            "dtype": self.dtype,
-        })
+        return json.dumps(
+            {
+                "ts": self.ts,
+                "width": self.width,
+                "height": self.height,
+                "channels": self.channels,
+                "format": self.format.value,
+                "dtype": self.dtype,
+            }
+        )
 
     @classmethod
     def from_json(cls, data: str) -> VideoMetadata:
@@ -105,6 +116,57 @@ class VideoMetadata:
 
 
 @dataclass
+class EncodedVideoMetadata:
+    """Metadata for encoded video frames (e.g. JPEG).
+
+    Attributes:
+        ts: Timestamp in seconds (monotonic clock).
+        width: Frame width in pixels.
+        height: Frame height in pixels.
+        encoding: Encoding format (e.g., 'jpeg').
+        quality: Encoding quality.
+    """
+
+    ts: float
+    width: int
+    height: int
+    encoding: str = "jpeg"
+    quality: int = 85
+
+    def to_json(self) -> str:
+        """Serialize metadata to JSON string."""
+        return json.dumps(
+            {
+                "ts": self.ts,
+                "width": self.width,
+                "height": self.height,
+                "encoding": self.encoding,
+                "quality": self.quality,
+            }
+        )
+
+    @classmethod
+    def from_json(cls, data: str) -> EncodedVideoMetadata:
+        """Deserialize metadata from JSON string.
+
+        Args:
+            data: JSON string containing video metadata.
+
+        Returns:
+            EncodedVideoMetadata instance.
+
+        """
+        parsed = json.loads(data)
+        return cls(
+            ts=parsed["ts"],
+            width=parsed["width"],
+            height=parsed["height"],
+            encoding=parsed.get("encoding", "jpeg"),
+            quality=parsed.get("quality", 85),
+        )
+
+
+@dataclass
 class AudioMetadata:
     """Metadata for audio samples transmitted over IPC.
 
@@ -114,6 +176,8 @@ class AudioMetadata:
         channels: Number of audio channels.
         samples: Number of samples in the chunk.
         dtype: Numpy dtype string (e.g., 'float32').
+        doa_rad: Optional direction of arrival in radians.
+        doa_is_speech: Optional speech detection flag.
 
     """
 
@@ -122,16 +186,23 @@ class AudioMetadata:
     channels: int
     samples: int
     dtype: str = "float32"
+    doa_rad: Optional[float] = None
+    doa_is_speech: Optional[bool] = None
 
     def to_json(self) -> str:
         """Serialize metadata to JSON string."""
-        return json.dumps({
+        data = {
             "ts": self.ts,
             "sample_rate": self.sample_rate,
             "channels": self.channels,
             "samples": self.samples,
             "dtype": self.dtype,
-        })
+        }
+        if self.doa_rad is not None:
+            data["doa_rad"] = self.doa_rad
+        if self.doa_is_speech is not None:
+            data["doa_is_speech"] = self.doa_is_speech
+        return json.dumps(data)
 
     @classmethod
     def from_json(cls, data: str) -> AudioMetadata:
@@ -151,6 +222,8 @@ class AudioMetadata:
             channels=parsed["channels"],
             samples=parsed["samples"],
             dtype=parsed.get("dtype", "float32"),
+            doa_rad=parsed.get("doa_rad"),
+            doa_is_speech=parsed.get("doa_is_speech"),
         )
 
 
@@ -564,7 +637,9 @@ class OpenCVCapture(VideoCaptureBase):
 
             self._logger.info(
                 "OpenCV capture opened: %dx%d@%dfps",
-                self._width, self._height, self._fps,
+                self._width,
+                self._height,
+                self._fps,
             )
             return True
 
@@ -656,7 +731,9 @@ class Picamera2Capture(VideoCaptureBase):
 
             self._logger.info(
                 "Picamera2 capture opened: %dx%d@%dfps",
-                self._width, self._height, self._fps,
+                self._width,
+                self._height,
+                self._fps,
             )
             return True
 
@@ -733,6 +810,11 @@ class AudioCapture:
         self._device_id: Optional[int] = None
         self._running = False
         self._lock = threading.Lock()
+        self._publish_thread: Optional[threading.Thread] = None
+        self._audio_queue: Queue[tuple[npt.NDArray[np.float32], int]] = Queue(
+            maxsize=100
+        )
+        self._respeaker: Optional[ReSpeaker] = init_respeaker_usb()
 
     @property
     def sample_rate(self) -> int:
@@ -776,7 +858,9 @@ class AudioCapture:
                 self._channels = min(device_info["max_input_channels"], 4)
                 self._logger.info(
                     "Using ReSpeaker device %s: %sHz, %sch",
-                    self._device_id, self._sample_rate, self._channels,
+                    self._device_id,
+                    self._sample_rate,
+                    self._channels,
                 )
             else:
                 self._logger.warning("ReSpeaker not found, using default device")
@@ -809,6 +893,10 @@ class AudioCapture:
             )
             self._stream.start()
             self._running = True
+            self._publish_thread = threading.Thread(
+                target=self._publish_loop, name="AudioCapture_publish", daemon=True
+            )
+            self._publish_thread.start()
             self._logger.info("Audio capture started")
 
         except Exception as e:
@@ -817,6 +905,11 @@ class AudioCapture:
     def stop(self) -> None:
         """Stop audio capture stream."""
         self._running = False
+
+        if self._publish_thread is not None:
+            self._publish_thread.join(timeout=2.0)
+            self._publish_thread = None
+
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -830,6 +923,8 @@ class AudioCapture:
     def close(self) -> None:
         """Close audio capture and release resources."""
         self.stop()
+        if self._respeaker:
+            self._respeaker.close()
 
     def _audio_callback(
         self,
@@ -840,34 +935,53 @@ class AudioCapture:
     ) -> None:
         """SoundDevice callback for audio data.
 
-        Args:
-            indata: Input audio data.
-            frames: Number of frames.
-            time_info: Stream time information.
-            status: Stream status flags.
-
+        This should be as fast as possible to avoid blocking the audio driver.
         """
         if status:
             self._logger.debug("Audio callback status: %s", status)
 
-        if self._zmq_socket is None:
-            return
-
-        metadata = AudioMetadata(
-            ts=time.monotonic(),
-            sample_rate=self._sample_rate,
-            channels=indata.shape[1] if indata.ndim > 1 else 1,
-            samples=frames,
-            dtype=str(indata.dtype),
-        )
-
         try:
-            self._zmq_socket.send_multipart(
-                [metadata.to_json().encode("utf-8"), indata.tobytes()],
-                copy=False,
+            self._audio_queue.put_nowait((indata.copy(), frames))
+        except Full:
+            self._logger.warning("Audio capture queue is full, dropping frame.")
+
+    def _publish_loop(self) -> None:
+        """Pulls audio from the queue and publishes it over ZMQ."""
+        while self._running:
+            try:
+                indata, frames = self._audio_queue.get(timeout=0.1)
+            except Empty:
+                continue
+
+            if self._zmq_socket is None:
+                continue
+
+            doa_rad, doa_is_speech = None, None
+            if self._respeaker:
+                try:
+                    result = self._respeaker.read("DOA_VALUE_RADIANS")
+                    if result:
+                        doa_rad, doa_is_speech = float(result[0]), bool(result[1])
+                except Exception as e:
+                    self._logger.warning("Could not read DoA from ReSpeaker: %s", e)
+
+            metadata = AudioMetadata(
+                ts=time.monotonic(),
+                sample_rate=self._sample_rate,
+                channels=indata.shape[1] if indata.ndim > 1 else 1,
+                samples=frames,
+                dtype=str(indata.dtype),
+                doa_rad=doa_rad,
+                doa_is_speech=doa_is_speech,
             )
-        except Exception as e:
-            self._logger.error("Failed to publish audio: %s", e)
+
+            try:
+                self._zmq_socket.send_multipart(
+                    [metadata.to_json().encode("utf-8"), indata.tobytes()],
+                    copy=False,
+                )
+            except Exception as e:
+                self._logger.error("Failed to publish audio: %s", e)
 
     def _find_respeaker_device(self) -> Optional[int]:
         """Find ReSpeaker audio device.
@@ -1119,3 +1233,368 @@ class MediaCapture:
         if self._zmq_context is not None:
             self._zmq_context.term()
             self._zmq_context = None
+
+
+# Audio Output Constants
+AUDIO_OUTPUT_TCP_PORT = 5557
+AUDIO_OUTPUT_TOPIC = b"reachy_audio_out"
+PLAY_SOUND_TOPIC = b"reachy_play_sound"
+
+
+@dataclass
+class AudioOutputConfig:
+    """Configuration for AudioOutput.
+
+    Attributes:
+        tcp_port: TCP port to bind for receiving audio.
+        bind_address: Network address to bind to.
+        sample_rate: Audio sample rate for playback.
+        channels: Number of audio channels for playback.
+        buffer_size_ms: Target buffer size in milliseconds for low-latency playback.
+        log_level: Logging level string.
+
+    """
+
+    tcp_port: int = AUDIO_OUTPUT_TCP_PORT
+    bind_address: str = "*"
+    sample_rate: int = 48000
+    channels: int = 2
+    buffer_size_ms: int = 50
+    log_level: str = "INFO"
+
+
+class AudioOutput:
+    """Receives audio from ZeroMQ and plays through speaker.
+
+    Listens on a TCP port for audio samples from remote clients and plays
+    them through the local speaker using SoundDevice. Also handles play_sound
+    commands for playing pre-recorded sound files.
+
+    Example:
+        config = AudioOutputConfig(tcp_port=5557)
+        output = AudioOutput(config)
+        output.start()
+        # ... audio is received and played
+        output.stop()
+
+    """
+
+    def __init__(
+        self,
+        config: Optional[AudioOutputConfig] = None,
+        log_level: str = "INFO",
+    ) -> None:
+        """Initialize audio output.
+
+        Args:
+            config: Audio output configuration.
+            log_level: Logging level string.
+
+        """
+        self._config = config or AudioOutputConfig()
+        self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        self._logger.setLevel(log_level)
+
+        self._zmq_context: Optional[Context] = None
+        self._audio_socket: Optional[Socket] = None
+        self._command_socket: Optional[Socket] = None
+
+        self._running = False
+        self._receive_thread: Optional[threading.Thread] = None
+
+        self._output_stream: Optional[Any] = None
+        self._output_buffer: list[npt.NDArray[np.float32]] = []
+        self._output_lock = threading.Lock()
+
+        self._output_device_id: Optional[int] = None
+
+    @property
+    def is_running(self) -> bool:
+        """Check if audio output is active."""
+        return self._running
+
+    def start(self) -> bool:
+        """Start receiving and playing audio.
+
+        Returns:
+            True if started successfully, False otherwise.
+
+        """
+        if self._running:
+            self._logger.warning("AudioOutput already running")
+            return True
+
+        try:
+            self._init_sounddevice()
+            self._init_zmq()
+            self._start_output_stream()
+
+            self._running = True
+            self._receive_thread = threading.Thread(
+                target=self._receive_loop,
+                name="AudioOutput_receive",
+                daemon=True,
+            )
+            self._receive_thread.start()
+
+            self._logger.info("AudioOutput started on port %d", self._config.tcp_port)
+            return True
+
+        except Exception as e:
+            self._logger.error("Failed to start AudioOutput: %s", e)
+            self.stop()
+            return False
+
+    def stop(self) -> None:
+        """Stop receiving and playing audio."""
+        self._running = False
+
+        if self._receive_thread is not None:
+            self._receive_thread.join(timeout=2.0)
+            self._receive_thread = None
+
+        self._stop_output_stream()
+        self._cleanup_zmq()
+
+        self._logger.info("AudioOutput stopped")
+
+    def _init_sounddevice(self) -> None:
+        """Initialize SoundDevice and find output device."""
+        try:
+            import sounddevice as sd
+
+            devices = sd.query_devices()
+            respeaker_names = ["Reachy Mini Audio", "respeaker", "ReSpeaker"]
+
+            for idx, device in enumerate(devices):
+                for name in respeaker_names:
+                    if (
+                        name.lower() in device["name"].lower()
+                        and device["max_output_channels"] > 0
+                    ):
+                        self._output_device_id = idx
+                        self._config.sample_rate = int(device["default_samplerate"])
+                        self._config.channels = min(device["max_output_channels"], 2)
+                        self._logger.info(
+                            "Using output device %s: %dHz, %dch",
+                            device["name"],
+                            self._config.sample_rate,
+                            self._config.channels,
+                        )
+                        return
+
+            self._logger.warning("ReSpeaker not found, using default output device")
+
+        except ImportError:
+            self._logger.error("SoundDevice not available")
+            raise
+
+    def _init_zmq(self) -> None:
+        """Initialize ZMQ context and sockets."""
+        self._zmq_context = zmq.Context()
+
+        self._audio_socket = self._zmq_context.socket(zmq.SUB)
+        self._audio_socket.setsockopt(zmq.SUBSCRIBE, AUDIO_OUTPUT_TOPIC)
+        self._audio_socket.setsockopt(zmq.SUBSCRIBE, PLAY_SOUND_TOPIC)
+        self._audio_socket.set_hwm(10)
+        addr = f"tcp://{self._config.bind_address}:{self._config.tcp_port}"
+        self._audio_socket.bind(addr)
+        self._logger.info("AudioOutput ZMQ bound to %s", addr)
+
+    def _start_output_stream(self) -> None:
+        """Start the SoundDevice output stream."""
+        try:
+            import sounddevice as sd
+
+            self._output_stream = sd.OutputStream(
+                device=self._output_device_id,
+                samplerate=self._config.sample_rate,
+                channels=self._config.channels,
+                dtype="float32",
+                callback=self._output_callback,
+                blocksize=int(
+                    self._config.sample_rate * self._config.buffer_size_ms / 1000
+                ),
+            )
+            self._output_stream.start()
+            self._logger.info("Audio output stream started")
+
+        except Exception as e:
+            self._logger.error("Failed to start output stream: %s", e)
+            raise
+
+    def _stop_output_stream(self) -> None:
+        """Stop the SoundDevice output stream."""
+        if self._output_stream is not None:
+            try:
+                self._output_stream.stop()
+                self._output_stream.close()
+            except Exception as e:
+                self._logger.warning("Error stopping output stream: %s", e)
+            finally:
+                self._output_stream = None
+
+        with self._output_lock:
+            self._output_buffer.clear()
+
+    def _cleanup_zmq(self) -> None:
+        """Clean up ZMQ sockets and context."""
+        if self._audio_socket is not None:
+            self._audio_socket.close()
+            self._audio_socket = None
+
+        if self._zmq_context is not None:
+            self._zmq_context.term()
+            self._zmq_context = None
+
+    def _receive_loop(self) -> None:
+        """Receive audio from ZMQ in a loop."""
+        while self._running:
+            if self._audio_socket is None:
+                break
+
+            try:
+                if self._audio_socket.poll(timeout=100) == 0:
+                    continue
+
+                parts = self._audio_socket.recv_multipart()
+                if len(parts) < 2:
+                    continue
+
+                topic = parts[0]
+
+                if topic == AUDIO_OUTPUT_TOPIC:
+                    self._handle_audio_data(parts)
+                elif topic == PLAY_SOUND_TOPIC:
+                    self._handle_play_sound(parts)
+
+            except zmq.ZMQError as e:
+                if self._running:
+                    self._logger.error("ZMQ error in receive loop: %s", e)
+            except Exception as e:
+                self._logger.error("Error in audio receive loop: %s", e)
+
+    def _process_and_queue_audio(
+        self, data: npt.NDArray[np.float32], input_samplerate: int
+    ) -> None:
+        """Resample, remap channels, and queue audio data for playback."""
+        # Resample if necessary
+        if input_samplerate != self._config.sample_rate:
+            try:
+                import scipy.signal
+
+                num_samples = int(
+                    len(data) * self._config.sample_rate / input_samplerate
+                )
+                data = scipy.signal.resample(data, num_samples)
+            except ImportError:
+                self._logger.warning(
+                    "scipy not available, skipping resampling from %d to %d Hz",
+                    input_samplerate,
+                    self._config.sample_rate,
+                )
+
+        # Ensure correct channel mapping
+        if data.ndim == 1 and self._config.channels > 1:
+            data = np.column_stack([data] * self._config.channels)
+        elif data.ndim == 2 and data.shape[1] != self._config.channels:
+            if data.shape[1] > self._config.channels:
+                data = data[:, : self._config.channels]
+            else:
+                # Duplicate first channel to fill the rest
+                data = np.column_stack([data[:, 0]] * self._config.channels)
+
+        with self._output_lock:
+            self._output_buffer.append(data.astype(np.float32))
+
+    def _handle_audio_data(self, parts: list[bytes]) -> None:
+        """Handle incoming audio data from ZMQ."""
+        if len(parts) != 3:
+            self._logger.warning("Invalid audio message: %d parts", len(parts))
+            return
+
+        try:
+            metadata = AudioMetadata.from_json(parts[1].decode("utf-8"))
+            audio_bytes = parts[2]
+
+            audio = np.frombuffer(audio_bytes, dtype=np.dtype(metadata.dtype))
+            if metadata.channels > 1:
+                audio = audio.reshape((-1, metadata.channels))
+
+            self._process_and_queue_audio(audio, metadata.sample_rate)
+
+        except Exception as e:
+            self._logger.error("Failed to handle audio data: %s", e)
+
+    def _handle_play_sound(self, parts: list[bytes]) -> None:
+        """Handle play_sound command from ZMQ."""
+        if len(parts) != 2:
+            self._logger.warning("Invalid play_sound message: %d parts", len(parts))
+            return
+
+        try:
+            sound_file = parts[1].decode("utf-8")
+            self._play_sound_file(sound_file)
+        except Exception as e:
+            self._logger.error("Failed to handle play_sound: %s", e)
+
+    def _play_sound_file(self, sound_file: str) -> None:
+        """Play a sound file from local assets."""
+        try:
+            if not os.path.exists(sound_file):
+                file_path = f"{ASSETS_ROOT_PATH}/{sound_file}"
+                if not os.path.exists(file_path):
+                    self._logger.error("Sound file not found: %s", sound_file)
+                    return
+            else:
+                file_path = sound_file
+
+            data, samplerate_in = sf.read(file_path, dtype="float32")
+            self._process_and_queue_audio(data, samplerate_in)
+            self._logger.info("Playing sound: %s", sound_file)
+
+        except ImportError:
+            self._logger.error(
+                "soundfile library is required to play local sounds. "
+                "Please install it (`pip install soundfile`)."
+            )
+        except Exception as e:
+            self._logger.error("Failed to play sound %s: %s", sound_file, e)
+
+    def _output_callback(
+        self,
+        outdata: npt.NDArray[np.float32],
+        frames: int,
+        time_info: object,
+        status: object,
+    ) -> None:
+        """SoundDevice callback for audio output.
+
+        Args:
+            outdata: Output buffer to fill.
+            frames: Number of frames requested.
+            time_info: Stream time information.
+            status: Stream status flags.
+
+        """
+        if status:
+            self._logger.debug("Output callback status: %s", status)
+
+        with self._output_lock:
+            filled = 0
+            while filled < frames and self._output_buffer:
+                chunk = self._output_buffer[0]
+                needed = frames - filled
+                available = len(chunk)
+                take = min(needed, available)
+
+                outdata[filled : filled + take] = chunk[:take]
+                filled += take
+
+                if take < available:
+                    self._output_buffer[0] = chunk[take:]
+                else:
+                    self._output_buffer.pop(0)
+
+            if filled < frames:
+                outdata[filled:] = 0

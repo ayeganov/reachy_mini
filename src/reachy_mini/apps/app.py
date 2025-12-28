@@ -46,7 +46,7 @@ class ReachyMiniApp(ABC):
         self.media_backend = (
             self.request_media_backend
             if self.request_media_backend is not None
-            else ("gstreamer" if running_on_wireless else "default")
+            else ("zeromq" if running_on_wireless else "default")
         )
 
         self.settings_app: FastAPI | None = None

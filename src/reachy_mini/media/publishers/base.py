@@ -8,30 +8,86 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Protocol, runtime_checkable
+from typing import (
+    Generic,
+    Optional,
+    Protocol,
+    TypeVar,
+    runtime_checkable,
+)
 
 import numpy as np
 import numpy.typing as npt
-import zmq
 
-from reachy_mini.media.capture import (
-    AUDIO_IPC_ENDPOINT,
-    VIDEO_IPC_ENDPOINT,
-    AudioMetadata,
-    VideoMetadata,
-)
+# Generic type variables for media protocols
+DataType = TypeVar("DataType", bound=object, contravariant=True)
+MetaType = TypeVar("MetaType", bound=object, contravariant=True)
 
-if TYPE_CHECKING:
-    from zmq import Context, Socket
+# Concrete type aliases for convenience
+VideoData = npt.NDArray[np.uint8]
+AudioData = npt.NDArray[np.float32]
+
+
+@dataclass
+class MediaChunk(Generic[DataType, MetaType]):
+    """Container for media data and its metadata."""
+
+    data: DataType
+    metadata: MetaType
+
+
+class MediaSourceProtocol(Protocol[DataType, MetaType]):
+    """Protocol for media data sources."""
+
+    def open(self) -> bool:
+        """Initialize the source."""
+        ...
+
+    def read(self) -> Optional[MediaChunk[DataType, MetaType]]:
+        """Read next chunk. Returns None if no data available (non-blocking)."""
+        ...
+
+    def poll(self, timeout_ms: int = 100) -> bool:
+        """Wait for data to be available."""
+        ...
+
+    def close(self) -> None:
+        """Release resources."""
+        ...
+
+    @property
+    def is_open(self) -> bool:
+        """Check if source is open and ready."""
+        ...
+
+
+class MediaSinkProtocol(Protocol[MetaType, DataType]):
+    """Protocol for media transport sinks.
+
+    Handlers bind vs connect internally based on implementation.
+    """
+
+    def open(self) -> bool:
+        """Initialize the sink (bind or connect as appropriate)."""
+        ...
+
+    def send(self, topic: bytes, metadata: MetaType, data: DataType) -> None:
+        """Send encoded data."""
+        ...
+
+    def close(self) -> None:
+        """Release resources."""
+        ...
+
+    @property
+    def is_open(self) -> bool:
+        """Check if sink is open and ready."""
+        ...
 
 
 @runtime_checkable
 class MediaPublisherProtocol(Protocol):
-    """Protocol defining the interface for media publishers.
-
-    Publishers consume media from the IPC bus and republish over
-    specific network protocols (ZMQ TCP, WebRTC, WebSocket).
-    """
+    """Protocol defining the interface for media publishers."""
 
     @property
     def is_running(self) -> bool:
@@ -43,7 +99,6 @@ class MediaPublisherProtocol(Protocol):
 
         Returns:
             True if started successfully, False otherwise.
-
         """
         ...
 
@@ -54,57 +109,45 @@ class MediaPublisherProtocol(Protocol):
 
 @dataclass
 class PublisherConfig:
-    """Configuration for media publishers.
+    """Configuration for media publishers."""
 
-    Attributes:
-        video_ipc_endpoint: ZMQ IPC endpoint to subscribe for video.
-        audio_ipc_endpoint: ZMQ IPC endpoint to subscribe for audio.
-        video_enabled: Whether to publish video.
-        audio_enabled: Whether to publish audio.
-        log_level: Logging level string.
-
-    """
-
-    video_ipc_endpoint: str = VIDEO_IPC_ENDPOINT
-    audio_ipc_endpoint: str = AUDIO_IPC_ENDPOINT
+    video_ipc_endpoint: str = "ipc:///tmp/reachy_video"
+    audio_ipc_endpoint: str = "ipc:///tmp/reachy_audio"
     video_enabled: bool = True
     audio_enabled: bool = True
     log_level: str = "INFO"
 
 
-class PublisherBase:
-    """Base implementation for media publishers.
-
-    Handles IPC subscription boilerplate. Subclasses implement
-    protocol-specific publishing logic.
-    """
+class GenericMediaPublisher(Generic[DataType, MetaType]):
+    """Generic publisher that moves data from a Source to a Sink."""
 
     def __init__(
         self,
-        config: Optional[PublisherConfig] = None,
+        source: MediaSourceProtocol[DataType, MetaType],
+        sink: MediaSinkProtocol[MetaType, DataType],
+        topic: bytes,
         log_level: str = "INFO",
+        name: str = "GenericMediaPublisher",
     ) -> None:
-        """Initialize publisher base.
+        """Initialize publisher.
 
         Args:
-            config: Publisher configuration.
-            log_level: Logging level string.
-
+            source: Source protocol implementation.
+            sink: Sink protocol implementation.
+            topic: Topic bytes for the sink.
+            log_level: Logging level.
+            name: Name for the publisher thread.
         """
-        self._config = config or PublisherConfig()
+        self._source = source
+        self._sink = sink
+        self._topic = topic
         self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         self._logger.setLevel(log_level)
-
-        self._zmq_context: Optional[Context] = None
-        self._video_sub_socket: Optional[Socket] = None
-        self._audio_sub_socket: Optional[Socket] = None
+        self._name = name
 
         self._running = False
-        self._video_thread: Optional[threading.Thread] = None
-        self._audio_thread: Optional[threading.Thread] = None
-
-        self._video_frame_count: int = 0
-        self._audio_chunk_count: int = 0
+        self._thread: Optional[threading.Thread] = None
+        self._item_count = 0
 
     @property
     def is_running(self) -> bool:
@@ -112,39 +155,30 @@ class PublisherBase:
         return self._running
 
     def start(self) -> bool:
-        """Start the publisher.
-
-        Returns:
-            True if started successfully, False otherwise.
-
-        """
+        """Start the publisher."""
         if self._running:
             self._logger.warning("Publisher already running")
             return True
 
         try:
-            self._init_ipc_subscribers()
-            self._init_output()
+            if not self._source.open():
+                self._logger.error("Failed to open source")
+                return False
+
+            if not self._sink.open():
+                self._logger.error("Failed to open sink")
+                self._source.close()
+                return False
 
             self._running = True
-
-            if self._config.video_enabled:
-                self._video_thread = threading.Thread(
-                    target=self._video_loop,
-                    name=f"{self.__class__.__name__}_video",
-                    daemon=True,
-                )
-                self._video_thread.start()
-
-            if self._config.audio_enabled:
-                self._audio_thread = threading.Thread(
-                    target=self._audio_loop,
-                    name=f"{self.__class__.__name__}_audio",
-                    daemon=True,
-                )
-                self._audio_thread.start()
-
-            self._logger.info("Publisher started")
+            self._item_count = 0
+            self._thread = threading.Thread(
+                target=self._loop,
+                name=self._name,
+                daemon=True,
+            )
+            self._thread.start()
+            self._logger.info("%s started", self._name)
             return True
 
         except Exception as e:
@@ -153,152 +187,33 @@ class PublisherBase:
             return False
 
     def stop(self) -> None:
-        """Stop the publisher and release resources."""
+        """Stop the publisher."""
         self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
 
-        if self._video_thread is not None:
-            self._video_thread.join(timeout=2.0)
-            self._video_thread = None
+        self._source.close()
+        self._sink.close()
+        self._logger.info("%s stopped (items: %d)", self._name, self._item_count)
 
-        if self._audio_thread is not None:
-            self._audio_thread.join(timeout=2.0)
-            self._audio_thread = None
-
-        self._cleanup_ipc()
-        self._cleanup_output()
-        self._logger.info("Publisher stopped")
-
-    def _init_ipc_subscribers(self) -> None:
-        """Initialize ZMQ IPC subscriber sockets."""
-        self._zmq_context = zmq.Context()
-
-        if self._config.video_enabled:
-            self._video_sub_socket = self._zmq_context.socket(zmq.SUB)
-            self._video_sub_socket.connect(self._config.video_ipc_endpoint)
-            self._video_sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
-            self._video_sub_socket.set_hwm(2)
-            self._logger.info(
-                "Video IPC subscribed to %s", self._config.video_ipc_endpoint
-            )
-
-        if self._config.audio_enabled:
-            self._audio_sub_socket = self._zmq_context.socket(zmq.SUB)
-            self._audio_sub_socket.connect(self._config.audio_ipc_endpoint)
-            self._audio_sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
-            self._audio_sub_socket.set_hwm(10)
-            self._logger.info(
-                "Audio IPC subscribed to %s", self._config.audio_ipc_endpoint
-            )
-
-    def _cleanup_ipc(self) -> None:
-        """Clean up IPC subscriber sockets."""
-        if self._video_sub_socket is not None:
-            self._video_sub_socket.close()
-            self._video_sub_socket = None
-
-        if self._audio_sub_socket is not None:
-            self._audio_sub_socket.close()
-            self._audio_sub_socket = None
-
-        if self._zmq_context is not None:
-            self._zmq_context.term()
-            self._zmq_context = None
-
-    def _init_output(self) -> None:
-        """Initialize output transport. Override in subclasses."""
-        pass
-
-    def _cleanup_output(self) -> None:
-        """Clean up output transport. Override in subclasses."""
-        pass
-
-    def _video_loop(self) -> None:
-        """Video processing loop. Receives from IPC and publishes."""
+    def _loop(self) -> None:
+        """Run the main publish loop."""
         while self._running:
-            if self._video_sub_socket is None:
-                break
+            if not self._source.poll(timeout_ms=100):
+                continue
+
+            chunk = self._source.read()
+            if chunk is None:
+                continue
 
             try:
-                if self._video_sub_socket.poll(timeout=100) == 0:
-                    continue
-
-                parts = self._video_sub_socket.recv_multipart()
-                if len(parts) != 2:
-                    self._logger.warning("Invalid video message: %d parts", len(parts))
-                    continue
-
-                metadata = VideoMetadata.from_json(parts[0].decode("utf-8"))
-                frame_bytes = parts[1]
-
-                frame = np.frombuffer(frame_bytes, dtype=np.dtype(metadata.dtype))
-                frame = frame.reshape(
-                    (metadata.height, metadata.width, metadata.channels)
+                self._sink.send(
+                    self._topic,
+                    chunk.metadata,
+                    chunk.data,
                 )
+                self._item_count += 1
 
-                self._process_video_frame(frame, metadata)
-                self._video_frame_count += 1
-
-            except zmq.ZMQError as e:
-                if self._running:
-                    self._logger.error("ZMQ error in video loop: %s", e)
             except Exception as e:
-                self._logger.error("Error in video loop: %s", e)
-
-    def _audio_loop(self) -> None:
-        """Audio processing loop. Receives from IPC and publishes."""
-        while self._running:
-            if self._audio_sub_socket is None:
-                break
-
-            try:
-                if self._audio_sub_socket.poll(timeout=100) == 0:
-                    continue
-
-                parts = self._audio_sub_socket.recv_multipart()
-                if len(parts) != 2:
-                    self._logger.warning("Invalid audio message: %d parts", len(parts))
-                    continue
-
-                metadata = AudioMetadata.from_json(parts[0].decode("utf-8"))
-                audio_bytes = parts[1]
-
-                audio = np.frombuffer(audio_bytes, dtype=np.dtype(metadata.dtype))
-                if metadata.channels > 1:
-                    audio = audio.reshape((metadata.samples, metadata.channels))
-
-                self._process_audio_chunk(audio, metadata)
-                self._audio_chunk_count += 1
-
-            except zmq.ZMQError as e:
-                if self._running:
-                    self._logger.error("ZMQ error in audio loop: %s", e)
-            except Exception as e:
-                self._logger.error("Error in audio loop: %s", e)
-
-    def _process_video_frame(
-        self,
-        frame: npt.NDArray[np.uint8],
-        metadata: VideoMetadata,
-    ) -> None:
-        """Process and publish a video frame. Override in subclasses.
-
-        Args:
-            frame: Video frame as numpy array (H, W, C).
-            metadata: Frame metadata.
-
-        """
-        pass
-
-    def _process_audio_chunk(
-        self,
-        audio: npt.NDArray[np.float32],
-        metadata: AudioMetadata,
-    ) -> None:
-        """Process and publish an audio chunk. Override in subclasses.
-
-        Args:
-            audio: Audio samples as numpy array.
-            metadata: Audio metadata.
-
-        """
-        pass
+                self._logger.error("Error in publish loop: %s", e)

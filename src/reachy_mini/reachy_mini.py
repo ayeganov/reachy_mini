@@ -21,9 +21,13 @@ from scipy.spatial.transform import Rotation as R
 from reachy_mini.daemon.utils import daemon_check
 from reachy_mini.io.protocol import GotoTaskRequest
 from reachy_mini.io.zenoh_client import ZenohClient
+from reachy_mini.media.capture import AUDIO_OUTPUT_TCP_PORT, AUDIO_OUTPUT_TOPIC
 from reachy_mini.media.media_manager import MediaBackend, MediaManager
-from reachy_mini.media.receivers import ZeroMQReceiver
-from reachy_mini.media.receivers.base import MediaSource
+from reachy_mini.media.publishers.base import GenericMediaPublisher
+from reachy_mini.media.receivers import ZeroMQClient
+from reachy_mini.media.receivers.base import MediaClient
+from reachy_mini.media.sinks.zeromq_sink import ZeroMQClientSink
+from reachy_mini.media.sources.local_capture_source import LocalAudioCaptureSource
 from reachy_mini.motion.move import Move
 from reachy_mini.utils.interpolation import InterpolationTechnique, minimum_jerk
 
@@ -108,8 +112,9 @@ class ReachyMini:
         )
 
         # Initialize media source based on connection type
-        self._media_source: Optional[MediaSource] = None
+        self._media_source: Optional[MediaClient] = None
         self.media_manager: Optional[MediaManager] = None
+        self._mic_publisher: Optional[GenericMediaPublisher] = None
 
         if not localhost_only:
             # Remote connection - use ZeroMQ receiver directly
@@ -137,14 +142,16 @@ class ReachyMini:
             self._media_source.close()
         if self.media_manager is not None:
             self.media_manager.close()
+        if self._mic_publisher is not None:
+            self._mic_publisher.stop()
         self.client.disconnect()
 
     @property
-    def media(self) -> Optional[MediaSource]:
+    def media(self) -> Optional[MediaClient]:
         """Expose the media source used by ReachyMini.
 
         Returns:
-            MediaSource for getting frames/audio, or None if media is disabled.
+            MediaClient for getting frames/audio, or None if media is disabled.
 
         """
         if self._media_source is not None:
@@ -170,7 +177,7 @@ class ReachyMini:
             return
 
         self.logger.info(f"Connecting to media stream at {wlan_ip}...")
-        self._media_source = ZeroMQReceiver(host=wlan_ip, log_level=log_level)
+        self._media_source = ZeroMQClient(host=wlan_ip, log_level=log_level)
 
         if not self._media_source.start(wait_timeout=3.0):
             self.logger.warning(
@@ -197,36 +204,7 @@ class ReachyMini:
         self, media_backend: str, log_level: str
     ) -> MediaManager:
         mbackend = MediaBackend.DEFAULT
-        daemon_status = self.client.get_status()
         match media_backend.lower():
-            case "webrtc":
-                if not daemon_status.get("wireless_version"):
-                    self.logger.warning(
-                        "Non-wireless version detected, daemon should use the "
-                        "flag '--wireless-version'. Reverting to default"
-                    )
-                    mbackend = MediaBackend.DEFAULT
-                elif not daemon_status.get("stream_enabled"):
-                    self.logger.warning(
-                        "WebRTC requested but streaming is not enabled on daemon. "
-                        "Start daemon with '--stream' flag. Reverting to no_media"
-                    )
-                    mbackend = MediaBackend.NO_MEDIA
-                else:
-                    self.logger.info("WebRTC backend configured successfully.")
-                    mbackend = MediaBackend.WEBRTC
-            case "zeromq":
-                if not daemon_status.get("stream_enabled"):
-                    self.logger.warning(
-                        "ZeroMQ requested but streaming is not enabled on daemon. "
-                        "Start daemon with '--stream' flag. Reverting to no_media"
-                    )
-                    mbackend = MediaBackend.NO_MEDIA
-                else:
-                    self.logger.info("ZeroMQ backend configured successfully.")
-                    mbackend = MediaBackend.ZEROMQ
-            case "gstreamer":
-                mbackend = MediaBackend.GSTREAMER
             case "default":
                 mbackend = MediaBackend.DEFAULT
             case "no_media":
@@ -236,15 +214,14 @@ class ReachyMini:
             case _:
                 raise ValueError(
                     f"Invalid media_backend '{media_backend}'. Supported values are "
-                    "'default', 'gstreamer', 'no_media', 'default_no_video', "
-                    "'webrtc', and 'zeromq'."
+                    "'default', 'no_media', and 'default_no_video'. "
+                    "For remote streaming, use ZeroMQReceiver directly."
                 )
 
         return MediaManager(
             use_sim=self.client.get_status()["simulation_enabled"],
             backend=mbackend,
             log_level=log_level,
-            signalling_host=self.client.get_status()["wlan_ip"],
         )
 
     def set_target(

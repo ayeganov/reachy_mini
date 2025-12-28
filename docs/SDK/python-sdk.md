@@ -29,7 +29,7 @@ Bypasses interpolation. Use this for high-frequency control (e.g., following a j
 ## Sensors & Media
 
 ### Camera 📷
-Get raw frames (OpenCV format) or use the GStreamer backend for low latency.
+Get raw frames (Picamera2 or OpenCV format) or use the GStreamer backend for low latency.
 
 ```python
 import cv2

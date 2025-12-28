@@ -17,14 +17,20 @@ import numpy as np
 import numpy.typing as npt
 import zmq
 
-from reachy_mini.media.publishers.zeromq_publisher import (
+from reachy_mini.media.capture import (
     AUDIO_TCP_PORT,
     AUDIO_TOPIC,
     VIDEO_TCP_PORT,
     VIDEO_TOPIC,
+    AudioMetadata,
     EncodedVideoMetadata,
-    NetworkAudioMetadata,
+    AUDIO_OUTPUT_TCP_PORT,
+    AUDIO_OUTPUT_TOPIC,
+    PLAY_SOUND_TOPIC,
 )
+from reachy_mini.media.publishers import GenericMediaPublisher
+from reachy_mini.media.sinks import ZeroMQClientSink
+from reachy_mini.media.sources import SinkableSource
 
 if TYPE_CHECKING:
     from zmq import Context, Socket
@@ -33,8 +39,8 @@ CONNECTION_TIMEOUT_SEC = 2.0
 
 
 @dataclass
-class ZeroMQReceiverConfig:
-    """Configuration for ZeroMQ receiver.
+class ZeroMQClientConfig:
+    """Configuration for ZeroMQ client.
 
     Attributes:
         host: Remote host address.
@@ -60,42 +66,42 @@ class ZeroMQReceiverConfig:
     log_level: str = "INFO"
 
 
-class ZeroMQReceiver:
-    """ZeroMQ TCP receiver for remote media.
+class ZeroMQClient:
+    """ZeroMQ TCP client for remote media.
 
     Connects to a remote ZeroMQ publisher, receives JPEG-encoded video
     and raw audio, decodes them, and provides access through the
-    MediaSource interface.
+    MediaClient interface.
 
     Example:
         config = ZeroMQReceiverConfig(host="192.168.1.100")
-        receiver = ZeroMQReceiver(config)
-        receiver.start()
+        client = ZeroMQClient(config)
+        client.start()
 
-        frame = receiver.get_frame()
+        frame = client.get_frame()
         if frame is not None:
             # Process BGR frame
             pass
 
-        receiver.close()
+        client.close()
 
     """
 
     def __init__(
         self,
-        config: Optional[ZeroMQReceiverConfig] = None,
+        config: Optional[ZeroMQClientConfig] = None,
         host: Optional[str] = None,
         log_level: str = "INFO",
     ) -> None:
-        """Initialize ZeroMQ receiver.
+        """Initialize ZeroMQ client.
 
         Args:
-            config: Receiver configuration.
+            config: Client configuration.
             host: Remote host address (overrides config if provided).
             log_level: Logging level string.
 
         """
-        self._config = config or ZeroMQReceiverConfig()
+        self._config = config or ZeroMQClientConfig()
         if host is not None:
             self._config.host = host
 
@@ -125,6 +131,19 @@ class ZeroMQReceiver:
         self._last_audio_receive_time: float = 0.0
         self._first_video_received: bool = False
         self._first_audio_received: bool = False
+
+        # For sending audio to the robot
+        self._audio_out_source = SinkableSource()
+        self._audio_out_sink = ZeroMQClientSink(
+            host=self._config.host, port=AUDIO_OUTPUT_TCP_PORT, log_level=log_level
+        )
+        self._audio_out_publisher = GenericMediaPublisher(
+            source=self._audio_out_source,
+            sink=self._audio_out_sink,
+            topic=AUDIO_OUTPUT_TOPIC,
+            name="AudioOutPublisher",
+            log_level=log_level,
+        )
 
     @property
     def is_connected(self) -> bool:
@@ -197,7 +216,7 @@ class ZeroMQReceiver:
             if self._config.video_enabled:
                 self._video_thread = threading.Thread(
                     target=self._video_receive_loop,
-                    name="ZeroMQReceiver_video",
+                    name="ZeroMQClient_video",
                     daemon=True,
                 )
                 self._video_thread.start()
@@ -206,18 +225,17 @@ class ZeroMQReceiver:
             if self._config.audio_enabled:
                 self._audio_thread = threading.Thread(
                     target=self._audio_receive_loop,
-                    name="ZeroMQReceiver_audio",
+                    name="ZeroMQClient_audio",
                     daemon=True,
                 )
                 self._audio_thread.start()
                 self._logger.debug("Audio receive thread started")
 
-            self._logger.info("ZeroMQ receiver started")
+            self._audio_out_publisher.start()
+            self._logger.info("ZeroMQ client started")
 
             if wait_timeout > 0:
-                self._logger.debug(
-                    "Waiting up to %ss for first data...", wait_timeout
-                )
+                self._logger.debug("Waiting up to %ss for first data...", wait_timeout)
                 if not self.wait_for_connection(wait_timeout):
                     self._logger.warning(
                         "No data received within %ss timeout", wait_timeout
@@ -256,24 +274,74 @@ class ZeroMQReceiver:
 
         return False
 
-    def play_sound(self, sound_file: str) -> None:
-        """Play a sound file (not supported over ZeroMQ).
+    def push_audio_sample(self, data: npt.NDArray[np.float32], sample_rate: int):
+        """Push a chunk of audio data to be sent to the robot.
 
         Args:
-            sound_file: Path to the sound file.
-
+            data (npt.NDArray[np.float32]): Numpy array of audio data.
+            sample_rate (int): The sample rate of the audio data.
         """
-        self._logger.warning(
-            "Cannot play sound '%s' over ZeroMQ. "
-            "Use daemon commands for remote audio playback.",
-            sound_file,
+        if data.ndim > 2 or data.shape[0] == 0:
+            self._logger.warning("Invalid audio data shape.")
+            return
+
+        num_samples = data.shape[0]
+        num_channels = data.shape[1] if data.ndim == 2 else 1
+
+        metadata = AudioMetadata(
+            ts=time.time(),
+            sample_rate=sample_rate,
+            channels=num_channels,
+            samples=num_samples,
+            dtype=str(data.dtype),
         )
+        # The SinkableSource's send method ignores the topic, so it can be empty.
+        self._audio_out_source.send(topic=b"", metadata=metadata, data=data)
+
+    def play_sound(self, asset_name: str) -> None:
+        """Send a command to the robot to play a pre-shipped audio asset.
+
+        Args:
+            asset_name (str): The filename of the asset on the robot (e.g. "go_sleep.wav").
+        """
+        self._logger.info("Requesting robot to play asset: %s", asset_name)
+        self._audio_out_sink.send_multipart(
+            [PLAY_SOUND_TOPIC, asset_name.encode("utf-8")]
+        )
+
+    def stream_sound(self, sound_file: str) -> None:
+        """Read a local audio file and stream its raw data to the robot.
+
+        This method reads the entire file into memory and pushes it to the
+        send queue for streaming.
+
+        Args:
+            sound_file (str): Path to the local audio file (e.g., WAV).
+        """
+        try:
+            import soundfile as sf
+        except ImportError:
+            self._logger.error(
+                "soundfile library is required to stream sounds from file. "
+                "Please install it (`pip install soundfile`)."
+            )
+            return
+
+        try:
+            audio_data, sample_rate = sf.read(sound_file, dtype="float32")
+            self.push_audio_sample(audio_data, sample_rate)
+            self._logger.info("Queued '%s' for streaming to robot.", sound_file)
+
+        except Exception as e:
+            self._logger.error(f"Failed to stream sound file {sound_file}: {e}")
 
     def close(self) -> None:
         """Stop receiving and release resources."""
         self._running = False
         self._first_video_received = False
         self._first_audio_received = False
+
+        self._audio_out_publisher.stop()
 
         if self._video_thread is not None:
             self._video_thread.join(timeout=2.0)
@@ -295,7 +363,7 @@ class ZeroMQReceiver:
             self._zmq_context.term()
             self._zmq_context = None
 
-        self._logger.info("ZeroMQ receiver closed")
+        self._logger.info("ZeroMQ client closed")
 
     def get_frame(self) -> Optional[npt.NDArray[np.uint8]]:
         """Return the latest available video frame.
@@ -358,7 +426,10 @@ class ZeroMQReceiver:
                 break
 
             try:
-                if self._video_socket.poll(timeout=self._config.receive_timeout_ms) == 0:
+                if (
+                    self._video_socket.poll(timeout=self._config.receive_timeout_ms)
+                    == 0
+                ):
                     continue
 
                 parts = self._video_socket.recv_multipart()
@@ -385,7 +456,8 @@ class ZeroMQReceiver:
                         self._first_video_received = True
                         self._logger.debug(
                             "First video frame received: %dx%d",
-                            metadata.width, metadata.height,
+                            metadata.width,
+                            metadata.height,
                         )
 
                 self._last_video_receive_time = time.monotonic()
@@ -403,7 +475,10 @@ class ZeroMQReceiver:
                 break
 
             try:
-                if self._audio_socket.poll(timeout=self._config.receive_timeout_ms) == 0:
+                if (
+                    self._audio_socket.poll(timeout=self._config.receive_timeout_ms)
+                    == 0
+                ):
                     continue
 
                 parts = self._audio_socket.recv_multipart()
@@ -411,7 +486,7 @@ class ZeroMQReceiver:
                     self._logger.warning("Invalid audio message: %d parts", len(parts))
                     continue
 
-                metadata = NetworkAudioMetadata.from_json(parts[1].decode("utf-8"))
+                metadata = AudioMetadata.from_json(parts[1].decode("utf-8"))
                 audio_bytes = parts[2]
 
                 audio = np.frombuffer(audio_bytes, dtype=np.dtype(metadata.dtype))
@@ -432,7 +507,8 @@ class ZeroMQReceiver:
                     self._first_audio_received = True
                     self._logger.debug(
                         "First audio sample received: %dHz, %dch",
-                        metadata.sample_rate, metadata.channels,
+                        metadata.sample_rate,
+                        metadata.channels,
                     )
 
                 self._last_audio_receive_time = time.monotonic()

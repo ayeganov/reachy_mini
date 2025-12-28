@@ -27,7 +27,7 @@ async def test_app() -> None:
 
     stop = Event()
 
-    with ReachyMini(media_backend="no_media") as mini:
+    with ReachyMini() as mini:
         app = MockApp()
         app.run(mini, stop)
 

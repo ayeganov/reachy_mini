@@ -195,26 +195,26 @@ class SoundDeviceAudio(AudioBase):
         """Handle audio output stream callback."""
         if status:
             self.logger.warning("SoundDevice output status: %s", status)
-        
+
         with self._output_lock:
             filled = 0
             while filled < frames and self._output_buffer:
                 chunk = self._output_buffer[0]
-                
+
                 needed = frames - filled
                 available = len(chunk)
                 take = min(needed, available)
-                
-                outdata[filled:filled + take] = chunk[:take]
+
+                outdata[filled : filled + take] = chunk[:take]
                 filled += take
-                
+
                 if take < available:
                     # Partial consumption, keep remainder
                     self._output_buffer[0] = chunk[take:]
                 else:
                     # Fully consumed this chunk
                     self._output_buffer.pop(0)
-            
+
             # Only pad with zeros if buffer is truly empty
             if filled < frames:
                 outdata[filled:] = 0
@@ -305,7 +305,8 @@ class SoundDeviceAudio(AudioBase):
         # Return default output device if not found
         self.logger.warning(
             "No %s device found containing '%s', using default.",
-            device_io_type, names_contains,
+            device_io_type,
+            names_contains,
         )
         return self._safe_query_device(device_io_type)
 

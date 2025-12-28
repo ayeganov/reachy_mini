@@ -273,7 +273,7 @@ def main() -> None:
         "--stream",
         action="store_true",
         default=default_args.stream,
-        help="Enable webrtc streaming. For wireless version only (default: False).",
+        help="Enable media streaming (video/audio via ZeroMQ). For wireless version only (default: False).",
     )
 
     parser.add_argument(

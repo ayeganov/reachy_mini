@@ -27,9 +27,20 @@ from reachy_mini.io import (
     AsyncWebSocketFrameSender,
     ZenohServer,
 )
-from reachy_mini.media.capture import CaptureConfig, MediaCapture
+from reachy_mini.media.capture import (
+    AUDIO_TCP_PORT,
+    AUDIO_TOPIC,
+    VIDEO_TCP_PORT,
+    VIDEO_TOPIC,
+    AudioOutput,
+    AudioOutputConfig,
+    CaptureConfig,
+    MediaCapture,
+)
 from reachy_mini.media.media_manager import MediaManager
-from reachy_mini.media.publishers import ZeroMQPublisher
+from reachy_mini.media.publishers.base import GenericMediaPublisher
+from reachy_mini.media.sinks.zeromq_sink import JPEGEncodedZMQSink, ZeroMQAudioSink
+from reachy_mini.media.sources import IPCAudioSource, IPCVideoSource
 
 from .backend.mujoco import MujocoBackend, MujocoBackendStatus
 from .backend.robot import RobotBackend, RobotBackendStatus
@@ -83,7 +94,9 @@ class Daemon:
         self._thread_event_publish_status = Event()
 
         self._media_capture: Optional[MediaCapture] = None
-        self._zeromq_publisher: Optional[ZeroMQPublisher] = None
+        self._video_publisher: Optional[GenericMediaPublisher] = None
+        self._audio_publisher: Optional[GenericMediaPublisher] = None
+        self._audio_output: Optional[AudioOutput] = None
         self._stream_enabled = stream
         if stream and not wireless_version:
             raise RuntimeError(
@@ -134,8 +147,15 @@ class Daemon:
             "Daemon start parameters: sim=%s, serialport=%s, scene=%s, localhost_only=%s, "
             "wake_up_on_start=%s, check_collision=%s, kinematics_engine=%s, headless=%s, "
             "hardware_config_filepath=%s",
-            sim, serialport, scene, localhost_only, wake_up_on_start, check_collision,
-            kinematics_engine, headless, hardware_config_filepath,
+            sim,
+            serialport,
+            scene,
+            localhost_only,
+            wake_up_on_start,
+            check_collision,
+            kinematics_engine,
+            headless,
+            hardware_config_filepath,
         )
 
         self._status.simulation_enabled = sim
@@ -329,8 +349,9 @@ class Daemon:
         """Start media capture and streaming publishers.
 
         Initialize MediaCapture to own camera/microphone hardware and
-        publish to IPC bus. Start ZeroMQ publisher to consume from IPC
-        and stream to clients over TCP.
+        publish to IPC bus. Start ZeroMQ publishers to consume from IPC
+        and stream to clients over TCP. Also start AudioOutput to receive
+        audio from clients and play through the speaker.
         """
         try:
             capture_config = CaptureConfig(log_level=self.log_level)
@@ -339,9 +360,56 @@ class Daemon:
                 self.logger.error("Failed to start MediaCapture")
                 return
 
-            self._zeromq_publisher = ZeroMQPublisher(log_level=self.log_level)
-            if not self._zeromq_publisher.start():
-                self.logger.error("Failed to start ZeroMQ publisher")
+            video_source = IPCVideoSource(log_level=self.log_level)
+            video_sink = JPEGEncodedZMQSink(
+                port=VIDEO_TCP_PORT, hwm=2, jpeg_quality=85, log_level=self.log_level
+            )
+
+            self._video_publisher = GenericMediaPublisher(
+                source=video_source,
+                sink=video_sink,
+                topic=VIDEO_TOPIC,
+                log_level=self.log_level,
+                name="VideoPublisher",
+            )
+
+            if not self._video_publisher.start():
+                self.logger.error("Failed to start video publisher")
+                self._media_capture.stop()
+                self._media_capture = None
+                return
+
+            audio_source = IPCAudioSource(log_level=self.log_level)
+            audio_sink = ZeroMQAudioSink(
+                port=AUDIO_TCP_PORT, hwm=10, log_level=self.log_level
+            )
+
+            self._audio_publisher = GenericMediaPublisher(
+                source=audio_source,
+                sink=audio_sink,
+                topic=AUDIO_TOPIC,
+                log_level=self.log_level,
+                name="AudioPublisher",
+            )
+
+            if not self._audio_publisher.start():
+                self.logger.error("Failed to start audio publisher")
+                self._video_publisher.stop()
+                self._video_publisher = None
+                self._media_capture.stop()
+                self._media_capture = None
+                return
+
+            audio_output_config = AudioOutputConfig(log_level=self.log_level)
+            self._audio_output = AudioOutput(
+                config=audio_output_config, log_level=self.log_level
+            )
+            if not self._audio_output.start():
+                self.logger.error("Failed to start AudioOutput")
+                self._audio_publisher.stop()
+                self._audio_publisher = None
+                self._video_publisher.stop()
+                self._video_publisher = None
                 self._media_capture.stop()
                 self._media_capture = None
                 return
@@ -354,9 +422,17 @@ class Daemon:
 
     def _stop_media_streaming(self) -> None:
         """Stop media capture and streaming publishers."""
-        if self._zeromq_publisher is not None:
-            self._zeromq_publisher.stop()
-            self._zeromq_publisher = None
+        if self._audio_output is not None:
+            self._audio_output.stop()
+            self._audio_output = None
+
+        if self._audio_publisher is not None:
+            self._audio_publisher.stop()
+            self._audio_publisher = None
+
+        if self._video_publisher is not None:
+            self._video_publisher.stop()
+            self._video_publisher = None
 
         if self._media_capture is not None:
             self._media_capture.stop()
@@ -652,7 +728,9 @@ class Daemon:
             self.logger.info(
                 "Creating RobotBackend with parameters: serialport=%s, "
                 "check_collision=%s, kinematics_engine=%s",
-                serialport, check_collision, kinematics_engine,
+                serialport,
+                check_collision,
+                kinematics_engine,
             )
             return RobotBackend(
                 serialport=serialport,

@@ -87,10 +87,7 @@ class Rerun:
 
         self.running = Event()
         self.thread_log_camera: Optional[Thread] = None
-        if (
-            reachymini.media.backend == MediaBackend.GSTREAMER
-            or reachymini.media.backend == MediaBackend.DEFAULT
-        ):
+        if reachymini.media.backend == MediaBackend.DEFAULT:
             self.thread_log_camera = Thread(target=self.log_camera, daemon=True)
         self.thread_log_movements = Thread(target=self.log_movements, daemon=True)
 

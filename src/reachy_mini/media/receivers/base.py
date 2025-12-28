@@ -13,14 +13,14 @@ import numpy.typing as npt
 
 
 @runtime_checkable
-class MediaSource(Protocol):
-    """Protocol defining the unified interface for media consumption.
+class MediaClient(Protocol):
+    """Protocol defining the unified interface for a high-level media client.
 
     This interface allows different receiver implementations (Local IPC,
     ZeroMQ TCP) to be swapped seamlessly in the client SDK.
 
     Example:
-        def process_media(source: MediaSource) -> None:
+        def process_media(source: MediaClient) -> None:
             source.start(wait_timeout=2.0)
 
             frame = source.get_frame()
@@ -35,68 +35,6 @@ class MediaSource(Protocol):
 
             source.close()
 
-    """
-
-    def start(self, wait_timeout: float = 0.0) -> bool:
-        """Start receiving media.
-
-        Args:
-            wait_timeout: If > 0, wait up to this many seconds for
-                the first data to arrive before returning.
-
-        Returns:
-            True if started successfully (and connected if wait_timeout > 0).
-
-        """
-        ...
-
-    def get_frame(self) -> Optional[npt.NDArray[np.uint8]]:
-        """Return the latest available video frame.
-
-        Returns:
-            BGR numpy array (H, W, 3) or None if no frame is available.
-
-        """
-        ...
-
-    def get_audio_sample(self) -> Optional[npt.NDArray[np.float32]]:
-        """Return the latest audio chunk.
-
-        Returns:
-            Audio samples as numpy array (samples, channels) or None
-            if no audio is available.
-
-        """
-        ...
-
-    def play_sound(self, sound_file: str) -> None:
-        """Play a sound file.
-
-        Note: Not all receivers support audio playback. Remote receivers
-        may log a warning instead.
-
-        Args:
-            sound_file: Path to the sound file to play.
-
-        """
-        ...
-
-    def close(self) -> None:
-        """Release resources and close connections."""
-        ...
-
-    @property
-    def is_connected(self) -> bool:
-        """Check if receiver is connected and receiving data."""
-        ...
-
-
-@runtime_checkable
-class MediaSourceWithMetadata(Protocol):
-    """Extended MediaSource protocol that also provides metadata.
-
-    Use this when you need access to timestamps and other metadata
-    alongside the raw media data.
     """
 
     def start(self, wait_timeout: float = 0.0) -> bool:
@@ -137,7 +75,8 @@ class MediaSourceWithMetadata(Protocol):
         """Return the latest audio chunk.
 
         Returns:
-            Audio samples as numpy array or None if no audio available.
+            Audio samples as numpy array (samples, channels) or None
+            if no audio is available.
 
         """
         ...
@@ -154,14 +93,15 @@ class MediaSourceWithMetadata(Protocol):
         """
         ...
 
-    def play_sound(self, sound_file: str) -> None:
-        """Play a sound file.
+    def play_sound(self, asset_file: str) -> None:
+        """
+        Play a sound file.
 
         Note: Not all receivers support audio playback. Remote receivers
         may log a warning instead.
 
         Args:
-            sound_file: Path to the sound file to play.
+            asset_file: Name of the asset file to play
 
         """
         ...
@@ -172,7 +112,7 @@ class MediaSourceWithMetadata(Protocol):
 
     @property
     def is_connected(self) -> bool:
-        """Check if the receiver is connected and receiving data."""
+        """Check if receiver is connected and receiving data."""
         ...
 
     @property

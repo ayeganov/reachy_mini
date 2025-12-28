@@ -114,52 +114,6 @@ def test_DoA() -> None:
     assert isinstance(doa[1], bool)
 
 
-'''
-@pytest.mark.audio_gstreamer
-def test_play_sound_gstreamer_backend() -> None:
-    """Test playing a sound with the GStreamer backend."""
-    media = MediaManager(backend=MediaBackend.GSTREAMER)
-    time.sleep(2)  # Give some time for the audio system to initialize
-    # Use a short sound file present in your assets directory
-    sound_file = "wake_up.wav"  # Change to a valid file if needed
-    media.play_sound(sound_file)
-    print("Playing sound with GStreamer backend...")
-    # Wait a bit to let the sound play (non-blocking backend)
-    time.sleep(2)
-    # No assertion: test passes if no exception is raised.
-    # Sound should be audible if the audio device is correctly set up.
-'''
-
-@pytest.mark.audio_gstreamer
-def test_record_audio_and_file_exists_gstreamer() -> None:
-    """Test recording audio and check that the file exists and is not empty."""
-    media = MediaManager(backend=MediaBackend.GSTREAMER)
-    DURATION = 2  # seconds
-    tmpfile = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-    tmpfile.close()
-    audio_samples = []
-    t0 = time.time()
-    media.start_recording()
-
-    while time.time() - t0 < DURATION:
-        sample = media.get_audio_sample()
-
-        if sample is not None:
-            audio_samples.append(sample)
-
-    media.stop_recording()
-    
-    assert len(audio_samples) > 0
-    audio_data = np.concatenate(audio_samples, axis=0)
-    assert audio_data.ndim == 2 and audio_data.shape[1] == 2
-    samplerate = media.get_input_audio_samplerate()
-    sf.write(tmpfile.name, audio_data, samplerate)
-    assert os.path.exists(tmpfile.name)
-    assert os.path.getsize(tmpfile.name) > 0
-    #os.remove(tmpfile.name)
-    print(f"Recorded audio saved to {tmpfile.name}")
-
-
 def test_no_media() -> None:
     """Test that methods handle uninitialized media gracefully."""
     media = MediaManager(backend=MediaBackend.NO_MEDIA)
