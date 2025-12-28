@@ -21,7 +21,6 @@ from scipy.spatial.transform import Rotation as R
 from urdf_parser_py import urdf
 
 from reachy_mini.kinematics.placo_kinematics import PlacoKinematics
-from reachy_mini.media.media_manager import MediaBackend
 from reachy_mini.reachy_mini import ReachyMini
 
 
@@ -87,7 +86,8 @@ class Rerun:
 
         self.running = Event()
         self.thread_log_camera: Optional[Thread] = None
-        if reachymini.media.backend == MediaBackend.DEFAULT:
+        # Enable camera logging if media is available and supports video
+        if reachymini.media is not None:
             self.thread_log_camera = Thread(target=self.log_camera, daemon=True)
         self.thread_log_movements = Thread(target=self.log_movements, daemon=True)
 
@@ -122,8 +122,8 @@ class Rerun:
 
     def log_camera(self) -> None:
         """Log the camera image to Rerun."""
-        if self._reachymini.media.camera is None:
-            self.logger.warning("Camera is not initialized.")
+        if self._reachymini.media is None:
+            self.logger.warning("Media is not initialized.")
             return
 
         self.logger.info("Starting camera logging to Rerun.")

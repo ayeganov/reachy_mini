@@ -34,9 +34,13 @@ from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
 import numpy as np
 import numpy.typing as npt
+import scipy.signal
+import sounddevice as sd
+import soundfile as sf
 import zmq
 
 from reachy_mini.media.audio_control_utils import ReSpeaker, init_respeaker_usb
+from reachy_mini.utils.constants import ASSETS_ROOT_PATH
 
 if TYPE_CHECKING:
     from zmq import Context, Socket
@@ -848,8 +852,6 @@ class AudioCapture:
 
         """
         try:
-            import sounddevice as sd
-
             self._device_id = self._find_respeaker_device()
 
             if self._device_id is not None:
@@ -867,9 +869,6 @@ class AudioCapture:
 
             return True
 
-        except ImportError:
-            self._logger.error("SoundDevice not available")
-            return False
         except Exception as e:
             self._logger.error("Failed to initialize audio capture: %s", e)
             return False
@@ -881,8 +880,6 @@ class AudioCapture:
             return
 
         try:
-            import sounddevice as sd
-
             self._stream = sd.InputStream(
                 device=self._device_id,
                 samplerate=self._sample_rate,
@@ -991,8 +988,6 @@ class AudioCapture:
 
         """
         try:
-            import sounddevice as sd
-
             devices = sd.query_devices()
             respeaker_names = ["Reachy Mini Audio", "respeaker", "ReSpeaker"]
 
@@ -1360,34 +1355,27 @@ class AudioOutput:
 
     def _init_sounddevice(self) -> None:
         """Initialize SoundDevice and find output device."""
-        try:
-            import sounddevice as sd
+        devices = sd.query_devices()
+        respeaker_names = ["Reachy Mini Audio", "respeaker", "ReSpeaker"]
 
-            devices = sd.query_devices()
-            respeaker_names = ["Reachy Mini Audio", "respeaker", "ReSpeaker"]
+        for idx, device in enumerate(devices):
+            for name in respeaker_names:
+                if (
+                    name.lower() in device["name"].lower()
+                    and device["max_output_channels"] > 0
+                ):
+                    self._output_device_id = idx
+                    self._config.sample_rate = int(device["default_samplerate"])
+                    self._config.channels = min(device["max_output_channels"], 2)
+                    self._logger.info(
+                        "Using output device %s: %dHz, %dch",
+                        device["name"],
+                        self._config.sample_rate,
+                        self._config.channels,
+                    )
+                    return
 
-            for idx, device in enumerate(devices):
-                for name in respeaker_names:
-                    if (
-                        name.lower() in device["name"].lower()
-                        and device["max_output_channels"] > 0
-                    ):
-                        self._output_device_id = idx
-                        self._config.sample_rate = int(device["default_samplerate"])
-                        self._config.channels = min(device["max_output_channels"], 2)
-                        self._logger.info(
-                            "Using output device %s: %dHz, %dch",
-                            device["name"],
-                            self._config.sample_rate,
-                            self._config.channels,
-                        )
-                        return
-
-            self._logger.warning("ReSpeaker not found, using default output device")
-
-        except ImportError:
-            self._logger.error("SoundDevice not available")
-            raise
+        self._logger.warning("ReSpeaker not found, using default output device")
 
     def _init_zmq(self) -> None:
         """Initialize ZMQ context and sockets."""
@@ -1404,8 +1392,6 @@ class AudioOutput:
     def _start_output_stream(self) -> None:
         """Start the SoundDevice output stream."""
         try:
-            import sounddevice as sd
-
             self._output_stream = sd.OutputStream(
                 device=self._output_device_id,
                 samplerate=self._config.sample_rate,
@@ -1480,19 +1466,8 @@ class AudioOutput:
         """Resample, remap channels, and queue audio data for playback."""
         # Resample if necessary
         if input_samplerate != self._config.sample_rate:
-            try:
-                import scipy.signal
-
-                num_samples = int(
-                    len(data) * self._config.sample_rate / input_samplerate
-                )
-                data = scipy.signal.resample(data, num_samples)
-            except ImportError:
-                self._logger.warning(
-                    "scipy not available, skipping resampling from %d to %d Hz",
-                    input_samplerate,
-                    self._config.sample_rate,
-                )
+            num_samples = int(len(data) * self._config.sample_rate / input_samplerate)
+            data = scipy.signal.resample(data, num_samples)
 
         # Ensure correct channel mapping
         if data.ndim == 1 and self._config.channels > 1:
@@ -1553,11 +1528,6 @@ class AudioOutput:
             self._process_and_queue_audio(data, samplerate_in)
             self._logger.info("Playing sound: %s", sound_file)
 
-        except ImportError:
-            self._logger.error(
-                "soundfile library is required to play local sounds. "
-                "Please install it (`pip install soundfile`)."
-            )
         except Exception as e:
             self._logger.error("Failed to play sound %s: %s", sound_file, e)
 

@@ -129,7 +129,7 @@ class ReachyMini:
         The client is disconnected explicitly to avoid a thread pending issue.
 
         """
-        if hasattr(self, 'client'):
+        if hasattr(self, "client"):
             self.client.disconnect()
 
     def __enter__(self) -> "ReachyMini":
@@ -382,7 +382,11 @@ class ReachyMini:
         time.sleep(2)
 
     def look_at_image(
-        self, u: int, v: int, duration: float = 1.0, perform_movement: bool = True
+        self,
+        u: int,
+        v: int,
+        duration: float = 1.0,
+        perform_movement: bool = True,
     ) -> npt.NDArray[np.float64]:
         """Make the robot head look at a point defined by a pixel position (u,v).
 
@@ -401,7 +405,7 @@ class ReachyMini:
             ValueError: If duration is negative.
 
         """
-        if self.media_manager.camera is None:
+        if self.media is None:
             raise RuntimeError("Camera is not initialized.")
 
         # TODO this is false for the raspicam for now

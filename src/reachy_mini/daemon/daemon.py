@@ -37,8 +37,8 @@ from reachy_mini.media.capture import (
     CaptureConfig,
     MediaCapture,
 )
-from reachy_mini.media.media_manager import MediaManager
 from reachy_mini.media.publishers.base import GenericMediaPublisher
+from reachy_mini.media.receivers.local_ipc_receiver import LocalIPCReceiver
 from reachy_mini.media.sinks.zeromq_sink import JPEGEncodedZMQSink, ZeroMQAudioSink
 from reachy_mini.media.sources import IPCAudioSource, IPCVideoSource
 
@@ -216,10 +216,15 @@ class Daemon:
         self._thread_event_publish_frames: Optional[Event] = None
         self.websocket_frame_sender: Optional[AsyncWebSocketFrameSender] = None
         self.websocket_audio_sender: Optional[AsyncWebSocketAudioStreamer] = None
+        self._ws_media_receiver: Optional[LocalIPCReceiver] = None
         if stream_media:
             if websocket_uri is None:
                 raise ValueError("WebSocket URI is required when streaming media.")
-            self.media_manager = MediaManager()
+            # Start MediaCapture and AudioOutput for IPC-based media
+            self._start_media_capture_and_output()
+            # Create LocalIPCReceiver to read from IPC bus
+            self._ws_media_receiver = LocalIPCReceiver()
+            self._ws_media_receiver.start()
             self.websocket_frame_sender = AsyncWebSocketFrameSender(
                 ws_uri=websocket_uri + "/video_stream"
             )
@@ -234,8 +239,6 @@ class Daemon:
             self._thread_publish_audio = Thread(target=self._publish_audio, daemon=True)
             self._thread_event_publish_audio = Event()
             self._thread_publish_audio.start()
-            self.media_manager.start_recording()
-            self.media_manager.start_playing()
 
         def backend_wrapped_run() -> None:
             assert self.backend is not None, (
@@ -288,6 +291,15 @@ class Daemon:
             self._status.error = self.backend.error
             return self._status.state
 
+        # Start MediaCapture/AudioOutput if ZeroMQ streaming is enabled
+        # (WebSocket streaming already started this in the stream_media block)
+        if self._stream_enabled and self._media_capture is None:
+            self._start_media_capture_and_output()
+
+        # Pass AudioOutput to Backend to avoid audio device conflicts
+        if self._audio_output is not None:
+            self.backend.set_audio_output(self._audio_output)
+
         if wake_up_on_start:
             try:
                 self.logger.info("Waking up Reachy Mini...")
@@ -303,11 +315,9 @@ class Daemon:
                 self._status.state = DaemonState.STOPPING
                 return self._status.state
 
+        # Start ZeroMQ publishers if streaming is enabled
         if self._stream_enabled:
-            await asyncio.sleep(
-                0.2
-            )  # Give some time for the backend to release the audio device
-            self._start_media_streaming()
+            self._start_zmq_publishers()
 
         self.logger.info("Daemon started successfully.")
         self._status.state = DaemonState.RUNNING
@@ -318,11 +328,12 @@ class Daemon:
         if (
             self._thread_event_publish_frames is None
             or self.websocket_frame_sender is None
+            or self._ws_media_receiver is None
         ):
             self.logger.warning("_publish_frames called but not properly initialized.")
             return
         while not self._thread_event_publish_frames.is_set():
-            frame = self.media_manager.get_frame()
+            frame = self._ws_media_receiver.get_frame()
             if frame is not None:
                 self.websocket_frame_sender.send_frame(frame)
             time.sleep(0.04)
@@ -332,27 +343,32 @@ class Daemon:
         if (
             self._thread_event_publish_audio is None
             or self.websocket_audio_sender is None
+            or self._ws_media_receiver is None
         ):
             self.logger.warning("_publish_audio called but not properly initialized.")
             return
 
         while not self._thread_event_publish_audio.is_set():
-            audio = self.media_manager.get_audio_sample()
+            audio = self._ws_media_receiver.get_audio_sample()
             if audio is not None:
                 self.websocket_audio_sender.send_audio_chunk(audio)
             received_audio = self.websocket_audio_sender.get_audio_chunk()
-            if received_audio is not None:
-                self.media_manager.push_audio_sample(received_audio)
+            if received_audio is not None and self._audio_output is not None:
+                # Get sample rate from receiver metadata or use default
+                sample_rate = self._ws_media_receiver.audio_sample_rate or 16000
+                self._audio_output._process_and_queue_audio(received_audio, sample_rate)
             time.sleep(0.05)
 
-    def _start_media_streaming(self) -> None:
-        """Start media capture and streaming publishers.
+    def _start_media_capture_and_output(self) -> None:
+        """Start MediaCapture and AudioOutput for IPC-based media access.
 
-        Initialize MediaCapture to own camera/microphone hardware and
-        publish to IPC bus. Start ZeroMQ publishers to consume from IPC
-        and stream to clients over TCP. Also start AudioOutput to receive
-        audio from clients and play through the speaker.
+        This is used by WebSocket streaming to access media via LocalIPCReceiver.
+        MediaCapture produces to IPC bus, AudioOutput handles speaker playback.
         """
+        if self._media_capture is not None:
+            self.logger.debug("MediaCapture already running")
+            return
+
         try:
             capture_config = CaptureConfig(log_level=self.log_level)
             self._media_capture = MediaCapture(config=capture_config)
@@ -360,6 +376,34 @@ class Daemon:
                 self.logger.error("Failed to start MediaCapture")
                 return
 
+            audio_output_config = AudioOutputConfig(log_level=self.log_level)
+            self._audio_output = AudioOutput(
+                config=audio_output_config, log_level=self.log_level
+            )
+            if not self._audio_output.start():
+                self.logger.error("Failed to start AudioOutput")
+                self._media_capture.stop()
+                self._media_capture = None
+                return
+
+            self.logger.info("MediaCapture and AudioOutput started for WebSocket streaming")
+
+        except Exception as e:
+            self.logger.error("Failed to start media capture/output: %s", e)
+            if self._media_capture is not None:
+                self._media_capture.stop()
+                self._media_capture = None
+
+    def _start_zmq_publishers(self) -> None:
+        """Start ZeroMQ publishers for video and audio streaming.
+
+        Requires MediaCapture and AudioOutput to be running (from _start_media_capture_and_output).
+        """
+        if self._media_capture is None:
+            self.logger.error("Cannot start ZMQ publishers: MediaCapture not running")
+            return
+
+        try:
             video_source = IPCVideoSource(log_level=self.log_level)
             video_sink = JPEGEncodedZMQSink(
                 port=VIDEO_TCP_PORT, hwm=2, jpeg_quality=85, log_level=self.log_level
@@ -375,8 +419,6 @@ class Daemon:
 
             if not self._video_publisher.start():
                 self.logger.error("Failed to start video publisher")
-                self._media_capture.stop()
-                self._media_capture = None
                 return
 
             audio_source = IPCAudioSource(log_level=self.log_level)
@@ -396,32 +438,33 @@ class Daemon:
                 self.logger.error("Failed to start audio publisher")
                 self._video_publisher.stop()
                 self._video_publisher = None
-                self._media_capture.stop()
-                self._media_capture = None
                 return
 
-            audio_output_config = AudioOutputConfig(log_level=self.log_level)
-            self._audio_output = AudioOutput(
-                config=audio_output_config, log_level=self.log_level
-            )
-            if not self._audio_output.start():
-                self.logger.error("Failed to start AudioOutput")
-                self._audio_publisher.stop()
-                self._audio_publisher = None
-                self._video_publisher.stop()
-                self._video_publisher = None
-                self._media_capture.stop()
-                self._media_capture = None
-                return
-
-            self.logger.info("Media streaming started successfully")
+            self.logger.info("ZeroMQ publishers started successfully")
 
         except Exception as e:
-            self.logger.error("Failed to start media streaming: %s", e)
-            self._stop_media_streaming()
+            self.logger.error("Failed to start ZMQ publishers: %s", e)
+            if self._video_publisher is not None:
+                self._video_publisher.stop()
+                self._video_publisher = None
+
+    def _start_media_streaming(self) -> None:
+        """Start media capture and streaming publishers.
+
+        Initialize MediaCapture to own camera/microphone hardware and
+        publish to IPC bus. Start ZeroMQ publishers to consume from IPC
+        and stream to clients over TCP. Also start AudioOutput to receive
+        audio from clients and play through the speaker.
+        """
+        self._start_media_capture_and_output()
+        self._start_zmq_publishers()
 
     def _stop_media_streaming(self) -> None:
         """Stop media capture and streaming publishers."""
+        if self._ws_media_receiver is not None:
+            self._ws_media_receiver.close()
+            self._ws_media_receiver = None
+
         if self._audio_output is not None:
             self._audio_output.stop()
             self._audio_output = None
