@@ -520,6 +520,8 @@ class ZeroMQClient:
                         "sample_rate": metadata.sample_rate,
                         "channels": metadata.channels,
                         "samples": metadata.samples,
+                        "doa_rad": metadata.doa_rad,
+                        "doa_is_speech": metadata.doa_is_speech,
                     }
                     self._audio_sample_rate = metadata.sample_rate
 

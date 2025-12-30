@@ -19,6 +19,13 @@ import numpy as np
 import numpy.typing as npt
 from reachy_mini_motor_controller import ReachyMiniPyControlLoop
 
+from reachy_mini.media.camera_constants import CameraResolution
+from reachy_mini.media.capture import (
+    AudioCapture,
+    AudioCaptureProtocol,
+    OpenCVCapture,
+    VideoCaptureProtocol,
+)
 from reachy_mini.utils.hardware_config.parser import parse_yaml_config
 
 from ..abstract import Backend, MotorControlMode
@@ -109,6 +116,11 @@ class RobotBackend(Backend):
         self.target_head_joint_current = None  # Placeholder for head joint torque
 
         self.hardware_error_check_frequency = hardware_error_check_frequency  # seconds
+
+        # Cache for video/audio captures
+        self._video_capture: VideoCaptureProtocol | None = None
+        self._audio_capture: AudioCaptureProtocol | None = None
+        self._log_level = log_level
 
     def run(self) -> None:
         """Run the control loop for the robot backend.
@@ -584,6 +596,80 @@ class RobotBackend(Backend):
                     errors[name] = err
 
         return errors
+
+    def get_video_capture(self) -> VideoCaptureProtocol:
+        """Return video capture for real robot hardware.
+
+        Tries Picamera2 first, falls back to OpenCV.
+
+        Returns:
+            VideoCaptureProtocol implementation.
+
+        Raises:
+            RuntimeError: If no video capture available.
+
+        """
+        if self._video_capture is not None:
+            return self._video_capture
+
+        # Try Picamera2 first (Raspberry Pi)
+        try:
+            from reachy_mini.media.capture import Picamera2Capture
+
+            self._video_capture = Picamera2Capture(
+                resolution=CameraResolution.R1920x1080at60fps,
+                log_level=self._log_level,
+            )
+            self.logger.info("Using Picamera2 capture")
+            if not self._video_capture.open():
+                raise RuntimeError("Failed to open Picamera2 capture")
+            return self._video_capture
+        except Exception as e:
+            self.logger.info("Picamera2 not available: %s", e)
+
+        # Fallback to OpenCV
+        try:
+            self._video_capture = OpenCVCapture(
+                resolution=CameraResolution.R1280x720at30fps,
+                log_level=self._log_level,
+            )
+            self.logger.info("Using OpenCV capture")
+            if not self._video_capture.open():
+                raise RuntimeError("Failed to open OpenCV capture")
+            return self._video_capture
+        except Exception as e:
+            self.logger.error("OpenCV capture failed: %s", e)
+
+        raise RuntimeError(
+            "No video capture available - Picamera2 and OpenCV both failed"
+        )
+
+    def get_audio_capture(self) -> AudioCaptureProtocol:
+        """Return audio capture for real robot hardware.
+
+        Uses ReSpeaker or SoundDevice based on configuration.
+
+        Returns:
+            AudioCaptureProtocol implementation.
+
+        Raises:
+            RuntimeError: If audio initialization fails.
+
+        """
+        if self._audio_capture is not None:
+            return self._audio_capture
+
+        self._audio_capture = AudioCapture(
+            sample_rate=16000,
+            channels=2,
+            log_level=self._log_level,
+        )
+
+        if not self._audio_capture.open():
+            raise RuntimeError("Failed to initialize audio capture")
+
+        self.logger.info("Using AudioCapture (ReSpeaker/SoundDevice)")
+        return self._audio_capture
 
 
 @dataclass

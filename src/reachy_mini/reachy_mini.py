@@ -383,12 +383,8 @@ class ReachyMini:
             raise RuntimeError("Camera resolution not available.")
 
         # TODO this is false for the raspicam for now
-        assert 0 < u < resolution[0], (
-            f"u must be in [0, {resolution[0]}], got {u}."
-        )
-        assert 0 < v < resolution[1], (
-            f"v must be in [0, {resolution[1]}], got {v}."
-        )
+        assert 0 < u < resolution[0], f"u must be in [0, {resolution[0]}], got {u}."
+        assert 0 < v < resolution[1], f"v must be in [0, {resolution[1]}], got {v}."
 
         if duration < 0:
             raise ValueError("Duration can't be negative.")

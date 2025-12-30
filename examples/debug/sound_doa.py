@@ -20,7 +20,9 @@ def main() -> None:
         level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s"
     )
 
-    with ReachyMini(log_level="DEBUG", automatic_body_yaw=True) as mini:
+    with ReachyMini(
+        localhost_only=False, log_level="DEBUG", automatic_body_yaw=True
+    ) as mini:
         last_doa = -1
         THRESHOLD = 0.004  # ~2 degrees
         while True:

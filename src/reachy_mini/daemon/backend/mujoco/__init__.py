@@ -2,12 +2,18 @@
 
 from dataclasses import dataclass
 
+from reachy_mini.daemon.backend.mujoco.audio_capture import NullAudioCapture
+
 try:
     import mujoco  # noqa: F401
 
     from reachy_mini.daemon.backend.mujoco.backend import (
         MujocoBackend,
         MujocoBackendStatus,
+    )
+    from reachy_mini.daemon.backend.mujoco.video_capture import (
+        MujocoCamera,
+        MujocoVideoCapture,
     )
 
 except ImportError:
@@ -32,5 +38,13 @@ except ImportError:
         pass
 
     MujocoBackendStatus = MujocoMockupBackendStatus  # type: ignore[assignment, misc]
+    MujocoVideoCapture = MujocoMockupBackend  # type: ignore[assignment, misc]
+    MujocoCamera = MujocoMockupBackend  # type: ignore[assignment, misc]
 
-__all__ = ["MujocoBackend", "MujocoBackendStatus"]
+__all__ = [
+    "MujocoBackend",
+    "MujocoBackendStatus",
+    "MujocoVideoCapture",
+    "MujocoCamera",
+    "NullAudioCapture",
+]

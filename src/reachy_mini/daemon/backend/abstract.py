@@ -28,7 +28,12 @@ if typing.TYPE_CHECKING:
     from reachy_mini.daemon.backend.mujoco.backend import MujocoBackendStatus
     from reachy_mini.daemon.backend.robot.backend import RobotBackendStatus
     from reachy_mini.kinematics import AnyKinematics
-    from reachy_mini.media.capture import AudioOutput, MediaCapture
+    from reachy_mini.media.capture import (
+        AudioCaptureProtocol,
+        AudioOutput,
+        MediaCapture,
+        VideoCaptureProtocol,
+    )
 
 from reachy_mini.media.audio_sounddevice import SoundDeviceAudio
 from reachy_mini.media.camera_constants import CameraResolution
@@ -722,6 +727,33 @@ class Backend:
         if self._local_audio is not None:
             self._local_audio.stop_playing()
         # AudioOutput doesn't need explicit stop - it manages its own stream
+
+    # Abstract media capture methods
+    @abstractmethod
+    def get_video_capture(self) -> "VideoCaptureProtocol":
+        """Return video capture for this backend.
+
+        Each backend must provide its own video capture implementation.
+        Raises exception if initialization fails.
+
+        Returns:
+            VideoCaptureProtocol: Video capture implementation for this backend.
+
+        """
+        ...
+
+    @abstractmethod
+    def get_audio_capture(self) -> "AudioCaptureProtocol":
+        """Return audio capture for this backend.
+
+        Each backend must provide its own audio capture implementation.
+        Raises exception if initialization fails.
+
+        Returns:
+            AudioCaptureProtocol: Audio capture implementation for this backend.
+
+        """
+        ...
 
     # Basic move definitions
     INIT_HEAD_POSE = np.eye(4)

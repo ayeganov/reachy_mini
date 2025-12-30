@@ -44,6 +44,7 @@ from reachy_mini.media.sinks.zeromq_sink import JPEGEncodedZMQSink, ZeroMQAudioS
 from reachy_mini.media.sources import IPCAudioSource, IPCVideoSource
 
 from .backend.mujoco import MujocoBackend, MujocoBackendStatus
+from .backend.mujoco.audio_capture import NullAudioCapture
 from .backend.robot import RobotBackend, RobotBackendStatus
 
 
@@ -369,30 +370,58 @@ class Daemon:
 
         This is used by WebSocket streaming to access media via LocalIPCReceiver.
         MediaCapture produces to IPC bus, AudioOutput handles speaker playback.
+        Gets video/audio captures from the backend.
         """
         if self._media_capture is not None:
             self.logger.debug("MediaCapture already running")
             return
 
+        assert self.backend is not None, (
+            "Backend must be initialized before starting media capture"
+        )
+
         try:
+            # Get captures from backend (non-optional, will raise if failed)
+            video_capture = self.backend.get_video_capture()
+            audio_capture = self.backend.get_audio_capture()
+
+            self.logger.info(
+                "Using backend-provided video capture: %s",
+                type(video_capture).__name__,
+            )
+            self.logger.info(
+                "Using backend-provided audio capture: %s",
+                type(audio_capture).__name__,
+            )
+
             capture_config = CaptureConfig(log_level=self.log_level)
-            self._media_capture = MediaCapture(config=capture_config)
+            self._media_capture = MediaCapture(
+                config=capture_config,
+                video_capture=video_capture,
+                audio_capture=audio_capture,
+            )
             if not self._media_capture.start():
                 self.logger.error("Failed to start MediaCapture")
                 return
 
-            audio_output_config = AudioOutputConfig(log_level=self.log_level)
-            self._audio_output = AudioOutput(
-                config=audio_output_config, log_level=self.log_level
-            )
-            if not self._audio_output.start():
-                self.logger.error("Failed to start AudioOutput")
-                self._media_capture.stop()
-                self._media_capture = None
-                return
+            # AudioOutput is only needed for real robot (speaker playback)
+            # Skip for MuJoCo since it has no audio output
+            if not isinstance(audio_capture, NullAudioCapture):
+                audio_output_config = AudioOutputConfig(log_level=self.log_level)
+                self._audio_output = AudioOutput(
+                    config=audio_output_config, log_level=self.log_level
+                )
+                if not self._audio_output.start():
+                    self.logger.error("Failed to start AudioOutput")
+                    self._media_capture.stop()
+                    self._media_capture = None
+                    return
+            else:
+                self.logger.info("Skipping AudioOutput (backend has no audio)")
+                self._audio_output = None
 
             self.logger.info(
-                "MediaCapture and AudioOutput started for WebSocket streaming"
+                "MediaCapture and AudioOutput started for streaming"
             )
 
         except Exception as e:

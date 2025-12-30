@@ -1222,66 +1222,38 @@ class MediaCapture:
             self._logger.info("Audio IPC bound to %s", self._config.audio_ipc_endpoint)
 
     def _init_video(self) -> None:
-        """Initialize video capture if enabled."""
+        """Initialize video capture if enabled.
+
+        Requires video_capture to be provided during construction.
+        """
         if not self._config.video_enabled:
             return
 
         if self._video_capture is None:
-            self._video_capture = self._create_video_capture()
+            self._logger.warning(
+                "Video capture not provided - video will be disabled"
+            )
+            return
 
-        if self._video_capture is not None:
-            if self._video_socket is not None:
-                self._video_capture.set_zmq_socket(self._video_socket)
-            if not self._video_capture.open():
-                self._logger.error("Failed to open video capture")
-                self._video_capture = None
+        if self._video_socket is not None:
+            self._video_capture.set_zmq_socket(self._video_socket)
 
     def _init_audio(self) -> None:
-        """Initialize audio capture if enabled."""
+        """Initialize audio capture if enabled.
+
+        Requires audio_capture to be provided during construction.
+        """
         if not self._config.audio_enabled:
             return
 
         if self._audio_capture is None:
-            self._audio_capture = AudioCapture(
-                sample_rate=self._config.audio_sample_rate,
-                channels=self._config.audio_channels,
-                log_level=self._config.log_level,
+            self._logger.warning(
+                "Audio capture not provided - audio will be disabled"
             )
+            return
 
-        if self._audio_capture is not None:
-            if self._audio_socket is not None:
-                self._audio_capture.set_zmq_socket(self._audio_socket)
-            if not self._audio_capture.open():
-                self._logger.error("Failed to open audio capture")
-                self._audio_capture = None
-
-    def _create_video_capture(self) -> Optional[VideoCaptureProtocol]:
-        """Create appropriate video capture based on platform.
-
-        Returns:
-            VideoCaptureProtocol instance or None if creation fails.
-
-        """
-        try:
-            picam = Picamera2Capture(
-                resolution=self._config.video_resolution,
-                log_level=self._config.log_level,
-            )
-            self._logger.info("Using Picamera2 capture")
-            return picam
-        except Exception:
-            self._logger.info("Picamera2 not available, trying OpenCV")
-
-        try:
-            opencv_cap = OpenCVCapture(
-                resolution=self._config.video_resolution,
-                log_level=self._config.log_level,
-            )
-            self._logger.info("Using OpenCV capture")
-            return opencv_cap
-        except Exception as e:
-            self._logger.error("Failed to create video capture: %s", e)
-            return None
+        if self._audio_socket is not None:
+            self._audio_capture.set_zmq_socket(self._audio_socket)
 
     def _cleanup_zmq(self) -> None:
         """Clean up ZMQ sockets and context."""
