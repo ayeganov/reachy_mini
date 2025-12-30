@@ -7,7 +7,6 @@ look_at_image method to make the robot look at the specified point.
 Note: The daemon must be running before executing this script.
 """
 
-import argparse
 import time
 
 import cv2
@@ -15,9 +14,9 @@ import cv2
 from reachy_mini import ReachyMini
 
 
-def main(backend: str) -> None:
+def main() -> None:
     """Get a frame and take a picture."""
-    with ReachyMini(media_backend=backend) as reachy_mini:
+    with ReachyMini() as reachy_mini:
         frame = reachy_mini.media.get_frame()
         start_time = time.time()
         while frame is None:
@@ -33,16 +32,4 @@ def main(backend: str) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Display Reachy Mini's camera feed and make it look at clicked points."
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["default", "gstreamer", "webrtc"],
-        default="default",
-        help="Media backend to use.",
-    )
-
-    args = parser.parse_args()
-    main(backend=args.backend)
+    main()

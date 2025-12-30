@@ -66,7 +66,7 @@ class OpenCVCamera(CameraBase):
         """Read a frame from the camera.
 
         Returns:
-            The frame as a uint8 numpy array, or None if no frame could be read.
+            The frame as a RGB uint8 numpy array, or None if no frame could be read.
 
         Raises:
             RuntimeError: If the camera is not opened.
@@ -80,6 +80,8 @@ class OpenCVCamera(CameraBase):
         # Ensure uint8 dtype
         if frame.dtype != np.uint8:
             frame = frame.astype(np.uint8, copy=False)
+        # Convert BGR (OpenCV default) to RGB
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         return cast(npt.NDArray[np.uint8], frame)
 
     def close(self) -> None:

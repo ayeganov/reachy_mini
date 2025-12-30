@@ -32,12 +32,12 @@ Bypasses interpolation. Use this for high-frequency control (e.g., following a j
 
 ### Camera 📷
 
-The frames of the camera can be accessed as follows :
+Get camera frames from the real robot (Picamera2 or OpenCV) or from simulation (Mujoco rendering). Frames are streamed via ZMQ.
 
 ```python
 from reachy_mini import ReachyMini
 
-with ReachyMini(media_backend="default") as mini:
+with ReachyMini() as mini:
     frame = mini.media.get_frame()
 ```
 The returned frame is a numpy array with shape `(height, width, 3)` and data type `uint8`.
@@ -52,7 +52,7 @@ from reachy_mini import ReachyMini
 from scipy.signal import resample
 import time
 
-with ReachyMini(media_backend="default") as mini:
+with ReachyMini() as mini:
     # Initialization - After this point, both audio devices (input/output) will be seen as busy by other applications!
     mini.media.start_recording()
     mini.media.start_playing()
@@ -79,20 +79,6 @@ with ReachyMini(media_backend="default") as mini:
 In both cases, the channels and samplerate information can be reliably retrieved with `get_input/output_audio_samplerate()` and `get_input/output_channels()`.
 
 > **⚠️ Note:** `push_audio_sample()` is non-blocking, meaning it returns immediately while audio plays in the background. If you need to wait for playback completion, calculate the duration based on sample length and sample rate.
-
-## Media Backend Options
-
-Choose the appropriate media backend based on your Reachy Mini version and requirements:
-
-**Reachy Mini Lite:**
-- `media_backend="default"` - Uses OpenCV for camera and Sounddevice for audio (recommended for most users)
-- `media_backend="gstreamer"` - Uses GStreamer for both camera and audio ([installation required](gstreamer-installation.md))
-
-**Reachy Mini Wireless:**
-- **Local execution** (running on the robot with SSH): Automatically uses `"gstreamer"`
-- **Remote execution** (controlling from your computer): Automatically uses `"webrtc"`. With this backend, GStreamer runs locally on the Raspberry Pi, and streams both audio and video on the remote computer using WebRTC.
-
-> **💡 Tip:** For wireless setups, the backend is automatically selected based on whether you're running locally or remotely. No need to specify the `media_backend` value !
 
 ## Recording Moves
 You can record a motion by moving the robot (compliant mode) or sending commands, and save it for later replay.

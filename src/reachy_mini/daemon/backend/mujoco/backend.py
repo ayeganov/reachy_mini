@@ -10,10 +10,8 @@ import json
 import time
 from dataclasses import dataclass
 from importlib.resources import files
-from threading import Thread
-from typing import Annotated, Any, Optional
+from typing import Annotated, Optional
 
-import cv2
 import log_throttling
 import mujoco
 import mujoco.viewer
@@ -21,19 +19,15 @@ import numpy as np
 import numpy.typing as npt
 
 import reachy_mini
-from reachy_mini.io.video_ws import AsyncWebSocketFrameSender
 
 from ..abstract import Backend, MotorControlMode
+from .audio_capture import NullAudioCapture
 from .utils import (
     get_actuator_names,
     get_joint_addr_from_name,
     get_joint_id_from_name,
 )
-from .video_udp import UDPJPEGFrameSender
-
-CAMERA_REACHY = "eye_camera"
-CAMERA_STUDIO_CLOSE = "studio_close"
-CAMERA_SIZES = {CAMERA_REACHY: (1280, 720), CAMERA_STUDIO_CLOSE: (640, 640)}
+from .video_capture import CAMERA_REACHY, MujocoVideoCapture
 
 
 class MujocoBackend(Backend):
@@ -68,6 +62,10 @@ class MujocoBackend(Backend):
         self.headless = headless
         self.websocket_uri = websocket_uri
 
+        # Cache for video/audio captures
+        self._video_capture: Optional[MujocoVideoCapture] = None
+        self._audio_capture: Optional[NullAudioCapture] = None
+
         from reachy_mini.reachy_mini import (
             SLEEP_ANTENNAS_JOINT_POSITIONS,
             SLEEP_HEAD_JOINT_POSITIONS,
@@ -89,8 +87,6 @@ class MujocoBackend(Backend):
         self.data = mujoco.MjData(self.model)
         self.model.opt.timestep = 0.002  # s, simulation timestep, 500hz
         self.decimation = 10  # -> 50hz control loop
-        self.rendering_timestep = 0.04  # s, rendering loop # 25Hz
-        self.streaming_timestep = 0.04  # s, streaming loop # 25Hz
 
         self.head_site_id = mujoco.mj_name2id(
             self.model,
@@ -121,62 +117,41 @@ class MujocoBackend(Backend):
                     self.model.geom_contype[i] = 0
                     self.model.geom_conaffinity[i] = 0
 
-    def _get_camera_id(self, camera_name: str) -> Any:
-        """Get the id of the virtual camera."""
-        return mujoco.mj_name2id(
-            self.model,
-            mujoco.mjtObj.mjOBJ_CAMERA,
-            camera_name,
-        )
+    def get_video_capture(self) -> MujocoVideoCapture:
+        """Return MuJoCo video capture for MediaCapture pipeline.
 
-    def _get_renderer(self, camera_name: str) -> mujoco.Renderer:
-        """Get the renderer for the virtual camera."""
-        camera_size = CAMERA_SIZES[camera_name]
-        return mujoco.Renderer(self.model, height=camera_size[1], width=camera_size[0])
+        Returns:
+            MujocoVideoCapture instance that renders from the simulation.
 
-    def streaming_loop(self, camera_name: str, ws_uri: str) -> None:
-        """Streaming loop for the Mujoco simulation over WebSocket.
+        Raises:
+            RuntimeError: If video capture initialization fails.
 
-        Capture the image from the virtual camera and send it over WebSocket to the ws_uri.
         """
-        streamer = AsyncWebSocketFrameSender(ws_uri=ws_uri + "/video_stream")
-        offscreen_renderer = self._get_renderer(camera_name)
-        camera_id = self._get_camera_id(camera_name)
+        if self._video_capture is None:
+            self._video_capture = MujocoVideoCapture(
+                model=self.model,
+                data=self.data,
+                camera_name=CAMERA_REACHY,
+            )
+            if not self._video_capture.open():
+                raise RuntimeError("Failed to initialize MuJoCo video capture")
+        return self._video_capture
 
-        while not self.should_stop.is_set():
-            start_t = time.time()
-            offscreen_renderer.update_scene(self.data, camera_id)
+    def get_audio_capture(self) -> NullAudioCapture:
+        """Return null audio capture (MuJoCo doesn't simulate audio).
 
-            # OPTIMIZATION: Disable expensive rendering effects on the scene
-            offscreen_renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0
-            offscreen_renderer.scene.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 0
+        Returns:
+            NullAudioCapture stub implementation.
 
-            im = offscreen_renderer.render()
+        Raises:
+            RuntimeError: If audio capture initialization fails.
 
-            im = cv2.cvtColor(im, cv2.COLOR_RGB2BGR)
-            streamer.send_frame(im)
-
-            took = time.time() - start_t
-            time.sleep(max(0, self.streaming_timestep - took))
-
-    def rendering_loop(self, camera_name: str, port: int) -> None:
-        """Offline Rendering loop for the Mujoco simulation.
-
-        Capture the image from the virtual camera_name and send it over UDP to the port or over WebSocket to the ws_uri.
         """
-        streamer = UDPJPEGFrameSender(dest_port=port)
-        offscreen_renderer = self._get_renderer(camera_name)
-        camera_id = self._get_camera_id(camera_name)
-
-        while not self.should_stop.is_set():
-            start_t = time.time()
-            offscreen_renderer.update_scene(self.data, camera_id)
-
-            im = offscreen_renderer.render()
-            streamer.send_frame(im)
-
-            took = time.time() - start_t
-            time.sleep(max(0, self.rendering_timestep - took))
+        if self._audio_capture is None:
+            self._audio_capture = NullAudioCapture()
+            if not self._audio_capture.open():
+                raise RuntimeError("Failed to initialize NullAudioCapture")
+        return self._audio_capture
 
     def run(self) -> None:
         """Run the Mujoco simulation with a viewer.
@@ -185,13 +160,6 @@ class MujocoBackend(Backend):
         It updates the joint positions at a rate and publishes the joint positions.
         """
         step = 1
-        if self.websocket_uri:
-            robot_view_streaming_thread = Thread(
-                target=self.streaming_loop,
-                args=(CAMERA_STUDIO_CLOSE, self.websocket_uri),
-                daemon=True,
-            )
-            robot_view_streaming_thread.start()
 
         if not self.headless:
             viewer = mujoco.viewer.launch_passive(
@@ -236,11 +204,6 @@ class MujocoBackend(Backend):
         mujoco.mj_step(self.model, self.data)
         if not self.headless:
             viewer.sync()
-
-            rendering_thread = Thread(
-                target=self.rendering_loop, args=(CAMERA_REACHY, 5005), daemon=True
-            )
-            rendering_thread.start()
 
         # Update the internal states of the IK and FK to the current configuration
         # This is important to avoid jumps when starting the robot (beore wake-up)
@@ -319,9 +282,6 @@ class MujocoBackend(Backend):
 
         if not self.headless:
             viewer.close()
-            rendering_thread.join()
-        if self.websocket_uri:
-            robot_view_streaming_thread.join()
 
     def get_mj_present_head_pose(self) -> Annotated[npt.NDArray[np.float64], (4, 4)]:
         """Get the current head pose from the Mujoco simulation.

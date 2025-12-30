@@ -5,7 +5,6 @@ conditions output from a microphone or a text-to-speech engine would be
  pushed to the speaker instead.
 """
 
-import argparse
 import logging
 import os
 import time
@@ -20,13 +19,13 @@ from reachy_mini.utils.constants import ASSETS_ROOT_PATH
 INPUT_FILE = os.path.join(ASSETS_ROOT_PATH, "wake_up.wav")
 
 
-def main(backend: str) -> None:
+def main() -> None:
     """Play a wav file by pushing samples to the audio device."""
     logging.basicConfig(
         level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s"
     )
 
-    with ReachyMini(log_level="DEBUG", media_backend=backend) as mini:
+    with ReachyMini(log_level="DEBUG") as mini:
         data, samplerate_in = sf.read(INPUT_FILE, dtype="float32")
 
         if samplerate_in != mini.media.get_output_audio_samplerate():
@@ -54,16 +53,4 @@ def main(backend: str) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Plays a wav file on Reachy Mini's speaker."
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["default", "gstreamer", "webrtc"],
-        default="default",
-        help="Media backend to use.",
-    )
-
-    args = parser.parse_args()
-    main(backend=args.backend)
+    main()

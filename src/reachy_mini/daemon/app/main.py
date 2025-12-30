@@ -121,7 +121,7 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
                 logging.info("Shutting down app manager...")
                 await app.state.app_manager.close()
             except Exception as e:
-                logging.exception(f"Error closing app manager: {e}")
+                logging.exception("Error closing app manager: %s", e)
 
             try:
                 logging.info("Shutting down daemon...")
@@ -129,7 +129,7 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
                     goto_sleep_on_stop=args.goto_sleep_on_stop,
                 )
             except Exception as e:
-                logging.exception(f"Error stopping daemon: {e}")
+                logging.exception("Error stopping daemon: %s", e)
 
     app = FastAPI(
         lifespan=lifespan,
@@ -319,7 +319,7 @@ def run_app(args: Args) -> None:
     except KeyboardInterrupt:
         logging.info("Shutdown complete.")
     except Exception as e:
-        logging.exception(f"Error during shutdown: {e}")
+        logging.exception("Error during shutdown: %s", e)
         sys.stderr.flush()
         raise
 

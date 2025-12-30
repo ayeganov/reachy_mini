@@ -538,10 +538,10 @@ async def install_package(
                 if ret != 0:
                     return ret
 
-                # On wireless, pre-install reachy-mini with gstreamer support
+                # On wireless, pre-install reachy-mini with zeromq support
                 if wireless_version and not desktop_app_daemon:
                     logger.info(
-                        "Pre-installing reachy-mini with gstreamer support in apps_venv"
+                        "Pre-installing reachy-mini with zeromq support in apps_venv"
                     )
                     python_path = _get_app_python(
                         app_name, wireless_version, desktop_app_daemon
@@ -554,7 +554,7 @@ async def install_package(
                             "install",
                             "--python",
                             str(python_path),
-                            "reachy-mini[gstreamer]",
+                            "reachy-mini[zeromq]",
                         ]
                     else:
                         install_cmd = [
@@ -562,7 +562,7 @@ async def install_package(
                             "-m",
                             "pip",
                             "install",
-                            "reachy-mini[gstreamer]",
+                            "reachy-mini[zeromq]",
                         ]
 
                     ret = await running_command(install_cmd, logger=logger)

@@ -507,7 +507,7 @@ pip install -U reachy-mini
 <details>
 <summary><strong>Is there a Simulation mode?</strong></summary>
 
-Yes, via MuJoCo. It is still a work in progress, but you can run code with the `--sim` flag or `ReachyMini(media_backend="no_media")` if just testing logic without physics.
+Yes, via MuJoCo. It is still a work in progress, but you can run code with the `--sim` flag or `ReachyMini(media_enabled=False)` if just testing logic without physics.
 
 </details>
 
@@ -663,7 +663,7 @@ Then restart the daemon.
 <summary><strong>Warning: "Circular buffer overrun" (Simulation/Mujoco)</strong></summary>
 
 This appears if you connect to the robot but don't consume the video frames, causing the buffer to fill up.
-* **Fix:** If you don't need video, initialize with `ReachyMini(media_backend="no_media")`.
+* **Fix:** If you don't need video, initialize with `ReachyMini(media_enabled=False)`.
 
 </details>
 

@@ -106,14 +106,15 @@ class ReachyMiniWirelessCamSpecs(ReachyMiniLiteCamSpecs):
 
     name = "wireless"
     available_resolutions = [
-        CameraResolution.R1920x1080at30fps,
+        CameraResolution.R1536x864at40fps,
+        CameraResolution.R1920x1080at60fps,
         CameraResolution.R1280x720at60fps,
         CameraResolution.R3840x2592at10fps,
         CameraResolution.R3840x2160at10fps,
         CameraResolution.R3264x2448at10fps,
         CameraResolution.R3072x1728at10fps,
     ]
-    default_resolution = CameraResolution.R1920x1080at30fps
+    default_resolution = CameraResolution.R1536x864at40fps
 
 
 @dataclass

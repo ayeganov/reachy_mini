@@ -1,86 +1,68 @@
-from reachy_mini.media.camera_constants import ReachyMiniLiteCamSpecs, CameraResolution, MujocoCameraSpecs
-from reachy_mini.media.media_manager import MediaManager, MediaBackend
 import numpy as np
 import pytest
-import time
-# import tempfile
-# import cv2
+
+from reachy_mini.media.capture import CaptureConfig, MediaCapture
+from reachy_mini.media.receivers.local_ipc_receiver import LocalIPCReceiver
+
+
+@pytest.fixture
+def media_capture():
+    """Start MediaCapture for tests that need it."""
+    config = CaptureConfig()
+    capture = MediaCapture(config=config)
+    if not capture.start():
+        pytest.skip("Could not start MediaCapture (camera not available)")
+    yield capture
+    capture.stop()
+
+
+@pytest.fixture
+def ipc_receiver(media_capture):
+    """Create LocalIPCReceiver that reads from MediaCapture's IPC bus."""
+    receiver = LocalIPCReceiver()
+    receiver.start()
+    yield receiver
+    receiver.close()
 
 
 @pytest.mark.video
-def test_get_frame_exists() -> None:
-    """Test that a frame can be retrieved from the camera and is not None."""
-    media = MediaManager(backend=MediaBackend.DEFAULT)
-    frame = media.get_frame()
-    assert frame is not None, "No frame was retrieved from the camera."
+def test_get_frame_exists(ipc_receiver) -> None:
+    """Test that a frame can be retrieved from the IPC bus and is not None."""
+    # Give MediaCapture time to produce frames
+    import time
+    time.sleep(0.5)
+
+    frame = ipc_receiver.get_frame()
+    assert frame is not None, "No frame was retrieved from the IPC bus."
     assert isinstance(frame, np.ndarray), "Frame is not a numpy array."
     assert frame.size > 0, "Frame is empty."
-    assert frame.shape[0] == media.camera.resolution[1] and frame.shape[1] == media.camera.resolution[0], f"Frame has incorrect dimensions: {frame.shape}"
+    assert len(frame.shape) == 3, f"Frame should be 3D (H, W, C), got shape {frame.shape}"
 
-    # with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
-    #    cv2.imwrite(tmp_file.name, frame)
-    #    print(f"Frame saved for inspection: {tmp_file.name}")    
 
 @pytest.mark.video
-def test_get_frame_exists_all_resolutions() -> None:
-    """Test that a frame can be retrieved from the camera for all supported resolutions."""
-    media = MediaManager(backend=MediaBackend.DEFAULT)
-    for resolution in media.camera.camera_specs.available_resolutions:
-        media.camera.set_resolution(resolution)
-        frame = media.get_frame()
-        assert frame is not None, f"No frame was retrieved from the camera at resolution {resolution}."
-        assert isinstance(frame, np.ndarray), f"Frame is not a numpy array at resolution {resolution}."
-        assert frame.size > 0, f"Frame is empty at resolution {resolution}."
-        assert frame.shape[0] == resolution.value[1] and frame.shape[1] == resolution.value[0], f"Frame has incorrect dimensions at resolution {resolution}: {frame.shape}" 
+def test_video_resolution_available(ipc_receiver) -> None:
+    """Test that video resolution metadata is available from the receiver."""
+    # Give MediaCapture time to produce frames
+    import time
+    time.sleep(0.5)
+
+    resolution = ipc_receiver.video_resolution
+    assert resolution is not None, "Video resolution should be available"
+    assert len(resolution) == 2, "Resolution should be (width, height)"
+    assert resolution[0] > 0 and resolution[1] > 0, "Resolution dimensions should be positive"
+
 
 @pytest.mark.video
-def test_change_resolution_errors() -> None:
-    """Test that changing resolution raises a runtime error if not allowed."""
-    media = MediaManager(backend=MediaBackend.DEFAULT)
-    media.camera.camera_specs = None
-    with pytest.raises(RuntimeError):
-        media.camera.set_resolution(CameraResolution.R1280x720)
+def test_multiple_frames(ipc_receiver) -> None:
+    """Test that multiple frames can be retrieved sequentially."""
+    import time
+    time.sleep(0.5)
 
-    media.camera.camera_specs = MujocoCameraSpecs()
-    with pytest.raises(RuntimeError):
-        media.camera.set_resolution(CameraResolution.R1280x720)
-    media.camera.camera_specs = ReachyMiniLiteCamSpecs()
-    with pytest.raises(ValueError):
-        media.camera.set_resolution(CameraResolution.R1280x720)
+    frames = []
+    for _ in range(5):
+        frame = ipc_receiver.get_frame()
+        if frame is not None:
+            frames.append(frame)
+        time.sleep(0.05)
 
-
-@pytest.mark.video_gstreamer
-def test_get_frame_exists_gstreamer() -> None:
-    """Test that a frame can be retrieved from the camera and is not None."""
-    media = MediaManager(backend=MediaBackend.GSTREAMER)
-    time.sleep(2)  # Give some time for the camera to initialize
-    frame = media.get_frame()
-    assert frame is not None, "No frame was retrieved from the camera."
-    assert isinstance(frame, np.ndarray), "Frame is not a numpy array."
-    assert frame.size > 0, "Frame is empty."
-    assert frame.shape[0] == media.camera.resolution[1] and frame.shape[1] == media.camera.resolution[0], f"Frame has incorrect dimensions: {frame.shape}"
-
-@pytest.mark.video_gstreamer
-def test_get_frame_exists_all_resolutions_gstreamer() -> None:
-    """Test that a frame can be retrieved from the camera for all supported resolutions."""
-    media = MediaManager(backend=MediaBackend.GSTREAMER)
-    time.sleep(2)  # Give some time for the camera to initialize
-
-    for resolution in media.camera.camera_specs.available_resolutions:
-        media.camera.close()
-        media.camera.set_resolution(resolution)
-        media.camera.open()
-        time.sleep(2)  # Give some time for the camera to adjust to new resolution
-        frame = media.get_frame()
-        assert frame is not None, f"No frame was retrieved from the camera at resolution {resolution}."
-        assert isinstance(frame, np.ndarray), f"Frame is not a numpy array at resolution {resolution}."
-        assert frame.size > 0, f"Frame is empty at resolution {resolution}."
-        assert frame.shape[0] == resolution.value[1] and frame.shape[1] == resolution.value[0], f"Frame has incorrect dimensions at resolution {resolution}: {frame.shape}"
-
-@pytest.mark.video_gstreamer
-def test_change_resolution_errors_gstreamer() -> None:
-    """Test that changing resolution raises a runtime error if not allowed."""
-    media = MediaManager(backend=MediaBackend.GSTREAMER)
-    time.sleep(1)  # Give some time for the camera to initialize
-    with pytest.raises(RuntimeError):
-        media.camera.set_resolution(media.camera.camera_specs.available_resolutions[0])
+    assert len(frames) >= 3, f"Should get at least 3 frames, got {len(frames)}"

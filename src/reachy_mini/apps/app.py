@@ -29,7 +29,7 @@ class ReachyMiniApp(ABC):
 
     custom_app_url: str | None = None
     dont_start_webserver: bool = False
-    request_media_backend: str | None = None
+    request_media_enabled: bool | None = None
 
     def __init__(self, running_on_wireless: bool = False) -> None:
         """Initialize the Reachy Mini app."""
@@ -42,11 +42,14 @@ class ReachyMiniApp(ABC):
         self.daemon_on_localhost = self._check_daemon_on_localhost()
         self.logger.info(f"Daemon on localhost: {self.daemon_on_localhost}")
 
-        # Media backend is now auto-detected by ReachyMini, just use "default"
-        self.media_backend = (
-            self.request_media_backend
-            if self.request_media_backend is not None
-            else "default"
+        # Determine media and connection settings
+        # If running on wireless, force localhost_only=False
+        # Otherwise, auto-detect based on daemon location
+        self.localhost_only = False if running_on_wireless else self.daemon_on_localhost
+        self.media_enabled = (
+            self.request_media_enabled
+            if self.request_media_enabled is not None
+            else True
         )
 
         self.settings_app: FastAPI | None = None
@@ -117,16 +120,12 @@ class ReachyMiniApp(ABC):
 
         try:
             self.logger.info("Starting Reachy Mini app...")
-            self.logger.info(f"Using media backend: {self.media_backend}")
-            self.logger.info(f"Daemon on localhost: {self.daemon_on_localhost}")
-
-            # If daemon is on localhost, use localhost_only=True
-            # Otherwise use multicast scouting to find remote daemon
-            localhost_only = self.daemon_on_localhost
-
+            self.logger.info(
+                f"localhost_only={self.localhost_only}, media_enabled={self.media_enabled}"
+            )
             with ReachyMini(
-                media_backend=self.media_backend,
-                localhost_only=localhost_only,
+                localhost_only=self.localhost_only,
+                media_enabled=self.media_enabled,
                 *args,
                 **kwargs,  # type: ignore
             ) as reachy_mini:

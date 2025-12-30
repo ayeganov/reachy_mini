@@ -60,6 +60,7 @@ class CameraBase(ABC):
 
     def set_resolution(self, resolution: CameraResolution) -> None:
         """Set the camera resolution."""
+        self.logger.info("Setting resolution to %s", resolution)
         if self.camera_specs is None:
             raise RuntimeError(
                 "Camera specs not set. Open the camera before setting the resolution."

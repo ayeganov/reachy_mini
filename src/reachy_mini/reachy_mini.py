@@ -21,7 +21,11 @@ from scipy.spatial.transform import Rotation as R
 from reachy_mini.daemon.utils import daemon_check, is_local_camera_available
 from reachy_mini.io.protocol import GotoTaskRequest
 from reachy_mini.io.zenoh_client import ZenohClient
-from reachy_mini.media.media_manager import MediaBackend, MediaManager
+from reachy_mini.media.camera_constants import CameraResolution
+from reachy_mini.media.publishers.base import GenericMediaPublisher
+from reachy_mini.media.receivers import ZeroMQClient
+from reachy_mini.media.receivers.base import MediaClient
+from reachy_mini.media.receivers.local_ipc_receiver import LocalIPCReceiver
 from reachy_mini.motion.move import Move
 from reachy_mini.utils.interpolation import InterpolationTechnique, minimum_jerk
 
@@ -69,7 +73,7 @@ class ReachyMini:
         timeout: float = 5.0,
         automatic_body_yaw: bool = True,
         log_level: str = "INFO",
-        media_backend: str = "default",
+        media_enabled: bool = True,
     ) -> None:
         """Initialize the Reachy Mini robot.
 
@@ -81,15 +85,14 @@ class ReachyMini:
             timeout (float): Timeout for the client connection, defaults to 5.0 seconds.
             automatic_body_yaw (bool): If True, the body yaw will be used to compute the IK and FK. Default is False.
             log_level (str): Logging level, defaults to "INFO".
-            media_backend (str): Use "no_media" to disable media entirely. Any other value
-                triggers auto-detection: Lite uses OpenCV, Wireless uses GStreamer (local)
-                or WebRTC (remote) based on environment.
+            media_enabled (bool): If True, initialize media (video/audio). Defaults to True.
 
         It will try to connect to the daemon, and if it fails, it will raise an exception.
 
         """
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(log_level)
+        self._log_level = log_level
         self.robot_name = robot_name
         daemon_check(spawn_daemon, use_sim)
         self.client = ZenohClient(robot_name, localhost_only)
@@ -108,7 +111,17 @@ class ReachyMini:
             ]
         )
 
-        self.media_manager = self._configure_mediamanager(media_backend, log_level)
+        # Initialize media source based on connection type
+        self._media_source: Optional[MediaClient] = None
+        self._mic_publisher: Optional[GenericMediaPublisher] = None
+
+        if media_enabled:
+            if not localhost_only:
+                # Remote connection - use ZeroMQ receiver
+                self._init_remote_media(log_level)
+            else:
+                # Local connection - use LocalIPCReceiver
+                self._init_local_media(log_level)
 
     def __del__(self) -> None:
         """Destroy the Reachy Mini instance.
@@ -125,61 +138,54 @@ class ReachyMini:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:  # type: ignore [no-untyped-def]
         """Context manager exit point for Reachy Mini."""
-        self.media_manager.close()
+        if self._media_source is not None:
+            self._media_source.close()
+        if self._mic_publisher is not None:
+            self._mic_publisher.stop()
         self.client.disconnect()
 
     @property
-    def media(self) -> MediaManager:
-        """Expose the MediaManager instance used by ReachyMini."""
-        return self.media_manager
+    def media(self) -> Optional[MediaClient]:
+        """Expose the media source used by ReachyMini.
 
-    def _configure_mediamanager(
-        self, media_backend: str, log_level: str
-    ) -> MediaManager:
+        Returns:
+            MediaClient for getting frames/audio, or None if media is disabled.
+
+        """
+        return self._media_source
+
+    def _init_remote_media(self, log_level: str) -> None:
+        """Initialize media for remote connections using ZeroMQ."""
         daemon_status = self.client.get_status()
-        is_wireless = daemon_status.get("wireless_version", False)
 
-        # If no_media is requested, skip all media initialization
-        if media_backend.lower() == "no_media":
-            self.logger.info("No media backend requested.")
-            mbackend = MediaBackend.NO_MEDIA
+        wlan_ip = daemon_status.get("wlan_ip")
+        if not wlan_ip:
+            self.logger.warning(
+                "Could not determine daemon IP address for media streaming"
+            )
+            return
+
+        self.logger.info("Connecting to media stream at %s...", wlan_ip)
+        self._media_source = ZeroMQClient(host=wlan_ip, log_level=log_level)
+
+        if not self._media_source.start(wait_timeout=3.0):
+            self.logger.warning(
+                "Failed to connect to media stream at %s. Media will be unavailable.",
+                wlan_ip,
+            )
+            self._media_source.close()
+            self._media_source = None
         else:
-            # Auto-detect the optimal backend based on environment
-            # Any explicit backend value (other than no_media) is ignored
-            if media_backend.lower() not in ("default", "auto"):
-                self.logger.debug(
-                    f"media_backend='{media_backend}' ignored, using auto-detection."
-                )
+            self.logger.info("Media stream connected to %s", wlan_ip)
 
-            if is_wireless:
-                if is_local_camera_available():
-                    # Local client on CM4: use GStreamer to read from unix socket
-                    # This avoids WebRTC encode/decode overhead
-                    self.logger.info(
-                        "Auto-detected: Wireless + local camera socket. "
-                        "Using GStreamer backend (no WebRTC overhead)."
-                    )
-                    mbackend = MediaBackend.GSTREAMER
-                else:
-                    # Remote client: use WebRTC for streaming
-                    self.logger.info(
-                        "Auto-detected: Wireless + remote client. "
-                        "Using WebRTC backend for streaming."
-                    )
-                    mbackend = MediaBackend.WEBRTC
-            else:
-                # Lite version: use default OpenCV backend
-                self.logger.info(
-                    "Auto-detected: Lite version. Using default (OpenCV) backend."
-                )
-                mbackend = MediaBackend.DEFAULT
-
-        return MediaManager(
-            use_sim=self.client.get_status()["simulation_enabled"],
-            backend=mbackend,
-            log_level=log_level,
-            signalling_host=self.client.get_status()["wlan_ip"],
-        )
+    def _init_local_media(self, log_level: str) -> None:
+        """Initialize media for local connections using LocalIPCReceiver."""
+        self._media_source = LocalIPCReceiver(log_level=log_level)
+        if not self._media_source.start():
+            self.logger.warning("Failed to connect to local media stream.")
+            self._media_source = None
+        else:
+            self.logger.info("Local media stream connected.")
 
     def set_target(
         self,
@@ -339,7 +345,11 @@ class ReachyMini:
         time.sleep(2)
 
     def look_at_image(
-        self, u: int, v: int, duration: float = 1.0, perform_movement: bool = True
+        self,
+        u: int,
+        v: int,
+        duration: float = 1.0,
+        perform_movement: bool = True,
     ) -> npt.NDArray[np.float64]:
         """Make the robot head look at a point defined by a pixel position (u,v).
 
@@ -358,28 +368,28 @@ class ReachyMini:
             ValueError: If duration is negative.
 
         """
-        if self.media_manager.camera is None:
+        if self.media is None:
             raise RuntimeError("Camera is not initialized.")
 
+        resolution = self.media.video_resolution
+        if resolution is None:
+            raise RuntimeError("Camera resolution not available.")
+
         # TODO this is false for the raspicam for now
-        assert 0 < u < self.media_manager.camera.resolution[0], (
-            f"u must be in [0, {self.media_manager.camera.resolution[0]}], got {u}."
-        )
-        assert 0 < v < self.media_manager.camera.resolution[1], (
-            f"v must be in [0, {self.media_manager.camera.resolution[1]}], got {v}."
-        )
+        assert 0 < u < resolution[0], f"u must be in [0, {resolution[0]}], got {u}."
+        assert 0 < v < resolution[1], f"v must be in [0, {resolution[1]}], got {v}."
 
         if duration < 0:
             raise ValueError("Duration can't be negative.")
 
-        if self.media.camera is None or self.media.camera.camera_specs is None:
-            raise RuntimeError("Camera specs not set.")
+        if self.media.K is None or self.media.D is None:
+            raise RuntimeError("Camera intrinsics not available.")
 
         points = np.array([[[u, v]]], dtype=np.float32)
         x_n, y_n = cv2.undistortPoints(
             points,
-            self.media.camera.K,  # type: ignore
-            self.media.camera.D,  # type: ignore
+            self.media.K,
+            self.media.D,
         )[0, 0]
 
         ray_cam = np.array([x_n, y_n, 1.0])
@@ -712,6 +722,18 @@ class ReachyMini:
         """
         self.client.send_command(json.dumps({"automatic_body_yaw": body_yaw}))
 
+    def set_resolution(self, resolution: CameraResolution) -> None:
+        """Set the video capture resolution on the robot.
+
+        This sends a command to the robot daemon to change the camera resolution.
+        The change takes effect asynchronously (fire-and-forget).
+
+        Args:
+            resolution: The CameraResolution to set.
+
+        """
+        self.client.send_command(json.dumps({"set_resolution": resolution.name}))
+
     async def async_play_move(
         self,
         move: Move,
@@ -742,7 +764,7 @@ class ReachyMini:
         sleep_period = 1.0 / play_frequency
 
         if move.sound_path is not None and sound:
-            self.media_manager.play_sound(str(move.sound_path))
+            self.media.play_sound(str(move.sound_path))
 
         t0 = time.time()
         while time.time() - t0 < move.duration:

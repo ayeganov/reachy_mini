@@ -8,6 +8,7 @@ from cv2_enumerate_cameras import enumerate_cameras
 
 from reachy_mini.media.camera_constants import (
     ArducamSpecs,
+    CameraResolution,
     CameraSpecs,
     OlderRPiCamSpecs,
     ReachyMiniLiteCamSpecs,
@@ -92,8 +93,6 @@ def find_camera_by_vid_pid(
 
 
 if __name__ == "__main__":
-    from reachy_mini.media.camera_constants import CameraResolution
-
     cam, _ = find_camera()
     if cam is None:
         exit("Camera not found")

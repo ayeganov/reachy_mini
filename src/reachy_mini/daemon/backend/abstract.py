@@ -28,7 +28,15 @@ if typing.TYPE_CHECKING:
     from reachy_mini.daemon.backend.mujoco.backend import MujocoBackendStatus
     from reachy_mini.daemon.backend.robot.backend import RobotBackendStatus
     from reachy_mini.kinematics import AnyKinematics
-from reachy_mini.media.media_manager import MediaBackend, MediaManager
+    from reachy_mini.media.capture import (
+        AudioCaptureProtocol,
+        AudioOutput,
+        MediaCapture,
+        VideoCaptureProtocol,
+    )
+
+from reachy_mini.media.audio_sounddevice import SoundDeviceAudio
+from reachy_mini.media.camera_constants import CameraResolution
 from reachy_mini.motion.goto import GotoMove
 from reachy_mini.motion.move import Move
 from reachy_mini.utils.constants import MODELS_ROOT_PATH, URDF_ROOT_PATH
@@ -72,7 +80,7 @@ class Backend:
         )
         self.kinematics_engine = kinematics_engine
 
-        self.logger.info(f"Using {self.kinematics_engine} kinematics engine")
+        self.logger.info("Using %s kinematics engine", self.kinematics_engine)
 
         if self.check_collision:
             assert self.kinematics_engine == "Placo", (
@@ -163,26 +171,21 @@ class Backend:
         # Recording lock to guard buffer swaps and appends
         self._rec_lock = threading.Lock()
 
-        self.audio: Optional[MediaManager] = None
+        # Audio playback - either local SoundDeviceAudio or remote AudioOutput
+        self._local_audio: Optional[SoundDeviceAudio] = None
+        self._audio_output: Optional["AudioOutput"] = None
         if self.use_audio:
-            if wireless_version:
-                self.logger.debug(
-                    "Initializing daemon audio backend for wireless version."
-                )
-                self.audio = MediaManager(
-                    backend=MediaBackend.GSTREAMER_NO_VIDEO, log_level=log_level
-                )
-            else:
-                self.logger.debug(
-                    "Initializing daemon audio backend for non-wireless version."
-                )
-                self.audio = MediaManager(
-                    backend=MediaBackend.DEFAULT_NO_VIDEO, log_level=log_level
-                )
+            self.logger.debug("Initializing daemon audio backend.")
+            self._local_audio = SoundDeviceAudio(log_level=log_level)
+
+        # Media capture reference for resolution control
+        self._media_capture: Optional[MediaCapture] = None
 
         # Guard to ensure only one play_move/goto is executed at a time (goto itself uses play_move, so we need an RLock)
         self._play_move_lock = threading.RLock()
-        self._active_move_depth = 0  # Tracks nested acquisitions within the owning thread
+        self._active_move_depth = (
+            0  # Tracks nested acquisitions within the owning thread
+        )
 
     # Life cycle methods
     def wrapped_run(self) -> None:
@@ -388,8 +391,8 @@ class Backend:
 
         try:
             if initial_goto_duration > 0.0:
-                start_head_pose, start_antennas_positions, start_body_yaw = move.evaluate(
-                    0.0
+                start_head_pose, start_antennas_positions, start_body_yaw = (
+                    move.evaluate(0.0)
                 )
                 await self.goto_target(
                     head=start_head_pose,
@@ -399,7 +402,7 @@ class Backend:
                 )
             sleep_period = 1.0 / play_frequency
 
-            if move.sound_path is not None and self.audio is not None:
+            if move.sound_path is not None and self._has_audio:
                 self.play_sound(str(move.sound_path))
 
             t0 = time.time()
@@ -420,9 +423,9 @@ class Backend:
                 else:
                     await asyncio.sleep(0.001)
         finally:
-            if move.sound_path is not None and self.audio is not None:
+            if move.sound_path is not None and self._has_audio:
                 # release audio resources after playing the move sound
-                self.audio.stop_playing()
+                self._stop_audio_playback()
             self._end_move()
 
     async def goto_target(
@@ -657,6 +660,46 @@ class Backend:
             return f.read()
 
     # Multimedia methods
+    def set_audio_output(self, audio_output: "AudioOutput") -> None:
+        """Set AudioOutput for streaming mode audio playback.
+
+        When AudioOutput is set, it takes over audio playback from local SoundDeviceAudio
+        to avoid device conflicts.
+
+        Args:
+            audio_output: The AudioOutput instance from MediaCapture streaming.
+
+        """
+        self._audio_output = audio_output
+        # Close local audio to avoid device conflict
+        if self._local_audio is not None:
+            self._local_audio.stop_playing()
+            self._local_audio = None
+            self.logger.info("Switched audio playback to AudioOutput (streaming mode)")
+
+    def set_media_capture(self, media_capture: "MediaCapture") -> None:
+        """Set MediaCapture instance for video resolution control.
+
+        Args:
+            media_capture: The MediaCapture instance from the daemon.
+
+        """
+        self._media_capture = media_capture
+        self.logger.info("MediaCapture reference set on backend")
+
+    def set_video_resolution(self, resolution: CameraResolution) -> None:
+        """Set the video capture resolution.
+
+        Args:
+            resolution: The CameraResolution to set.
+
+        """
+        if self._media_capture is not None:
+            self._media_capture.set_resolution(resolution)
+            self.logger.info("Video resolution changed to %s", resolution.name)
+        else:
+            self.logger.warning("Cannot set resolution: no MediaCapture available")
+
     def play_sound(self, sound_file: str) -> None:
         """Play a sound file from the assets directory.
 
@@ -666,9 +709,51 @@ class Backend:
             sound_file (str): The name of the sound file to play (e.g., "wake_up.wav").
 
         """
-        if self.audio:
-            self.audio.start_playing()
-            self.audio.play_sound(sound_file)
+        if self._audio_output is not None:
+            # Streaming mode: use AudioOutput's internal playback
+            self._audio_output._play_sound_file(sound_file)
+        elif self._local_audio is not None:
+            # Local mode: use SoundDeviceAudio directly
+            self._local_audio.start_playing()
+            self._local_audio.play_sound(sound_file)
+
+    @property
+    def _has_audio(self) -> bool:
+        """Check if audio playback is available."""
+        return self._audio_output is not None or self._local_audio is not None
+
+    def _stop_audio_playback(self) -> None:
+        """Stop audio playback on whichever audio backend is active."""
+        if self._local_audio is not None:
+            self._local_audio.stop_playing()
+        # AudioOutput doesn't need explicit stop - it manages its own stream
+
+    # Abstract media capture methods
+    @abstractmethod
+    def get_video_capture(self) -> "VideoCaptureProtocol":
+        """Return video capture for this backend.
+
+        Each backend must provide its own video capture implementation.
+        Raises exception if initialization fails.
+
+        Returns:
+            VideoCaptureProtocol: Video capture implementation for this backend.
+
+        """
+        ...
+
+    @abstractmethod
+    def get_audio_capture(self) -> "AudioCaptureProtocol":
+        """Return audio capture for this backend.
+
+        Each backend must provide its own audio capture implementation.
+        Raises exception if initialization fails.
+
+        Returns:
+            AudioCaptureProtocol: Audio capture implementation for this backend.
+
+        """
+        ...
 
     # Basic move definitions
     INIT_HEAD_POSE = np.eye(4)
@@ -718,8 +803,8 @@ class Backend:
 
         # Go back to the initial position
         await self.goto_target(self.INIT_HEAD_POSE, duration=0.2)
-        if self.audio:
-            self.audio.stop_playing()
+        if self._has_audio:
+            self._stop_audio_playback()
 
     async def goto_sleep(self) -> None:
         """Put the robot to sleep by moving the head and antennas to a predefined sleep position.
@@ -762,8 +847,8 @@ class Backend:
 
         self._last_head_pose = self.SLEEP_HEAD_POSE
         await asyncio.sleep(sleep_time)
-        if self.audio:
-            self.audio.stop_playing()
+        if self._has_audio:
+            self._stop_audio_playback()
 
     # Motor control modes
     @abstractmethod

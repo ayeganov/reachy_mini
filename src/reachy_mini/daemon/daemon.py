@@ -5,7 +5,6 @@ It includes methods to start, stop, and restart the daemon, as well as to check 
 It also provides a command-line interface for easy interaction.
 """
 
-import asyncio
 import json
 import logging
 import time
@@ -27,10 +26,26 @@ from reachy_mini.io import (
     AsyncWebSocketFrameSender,
     ZenohServer,
 )
-from reachy_mini.media.media_manager import MediaManager
+from reachy_mini.media.capture import (
+    AudioOutput,
+    AudioOutputConfig,
+    CaptureConfig,
+    MediaCapture,
+)
+from reachy_mini.media.media_constants import (
+    AUDIO_TCP_PORT,
+    AUDIO_TOPIC,
+    VIDEO_TCP_PORT,
+    VIDEO_TOPIC,
+)
+from reachy_mini.media.publishers.base import GenericMediaPublisher
+from reachy_mini.media.receivers.local_ipc_receiver import LocalIPCReceiver
+from reachy_mini.media.sinks.zeromq_sink import JPEGEncodedZMQSink, ZeroMQAudioSink
+from reachy_mini.media.sources import IPCAudioSource, IPCVideoSource
 from reachy_mini.tools.reflash_motors import reflash_motors
 
 from .backend.mujoco import MujocoBackend, MujocoBackendStatus
+from .backend.mujoco.audio_capture import NullAudioCapture
 from .backend.robot import RobotBackend, RobotBackendStatus
 
 
@@ -61,7 +76,7 @@ class Daemon:
         # Get package version
         try:
             package_version = version("reachy_mini")
-            self.logger.info(f"Daemon version: {package_version}")
+            self.logger.info("Daemon version: %s", package_version)
         except PackageNotFoundError:
             package_version = None
             self.logger.warning("Could not determine daemon version")
@@ -79,17 +94,10 @@ class Daemon:
         )
         self._thread_event_publish_status = Event()
 
-        self._webrtc: Optional[Any] = (
-            None  # type GstWebRTC imported for wireless version only
-        )
-        if wireless_version:
-            from reachy_mini.media.webrtc_daemon import GstWebRTC
-
-            try:
-                self._webrtc = GstWebRTC(log_level)
-            except Exception as e:
-                self.logger.error(f"Failed to initialize WebRTC: {e}")
-                self._webrtc = None
+        self._media_capture: Optional[MediaCapture] = None
+        self._video_publisher: Optional[GenericMediaPublisher] = None
+        self._audio_publisher: Optional[GenericMediaPublisher] = None
+        self._audio_output: Optional[AudioOutput] = None
 
     async def start(
         self,
@@ -131,7 +139,18 @@ class Daemon:
             return self._status.state
 
         self.logger.info(
-            f"Daemon start parameters: sim={sim}, serialport={serialport}, scene={scene}, localhost_only={localhost_only}, wake_up_on_start={wake_up_on_start}, check_collision={check_collision}, kinematics_engine={kinematics_engine}, headless={headless}, hardware_config_filepath={hardware_config_filepath}"
+            "Daemon start parameters: sim=%s, serialport=%s, scene=%s, localhost_only=%s, "
+            "wake_up_on_start=%s, check_collision=%s, kinematics_engine=%s, headless=%s, "
+            "hardware_config_filepath=%s",
+            sim,
+            serialport,
+            scene,
+            localhost_only,
+            wake_up_on_start,
+            check_collision,
+            kinematics_engine,
+            headless,
+            hardware_config_filepath,
         )
 
         self._status.simulation_enabled = sim
@@ -192,10 +211,15 @@ class Daemon:
         self._thread_event_publish_frames: Optional[Event] = None
         self.websocket_frame_sender: Optional[AsyncWebSocketFrameSender] = None
         self.websocket_audio_sender: Optional[AsyncWebSocketAudioStreamer] = None
+        self._ws_media_receiver: Optional[LocalIPCReceiver] = None
         if stream_media:
             if websocket_uri is None:
                 raise ValueError("WebSocket URI is required when streaming media.")
-            self.media_manager = MediaManager()
+            # Start MediaCapture and AudioOutput for IPC-based media
+            self._start_media_capture_and_output()
+            # Create LocalIPCReceiver to read from IPC bus
+            self._ws_media_receiver = LocalIPCReceiver()
+            self._ws_media_receiver.start()
             self.websocket_frame_sender = AsyncWebSocketFrameSender(
                 ws_uri=websocket_uri + "/video_stream"
             )
@@ -210,8 +234,6 @@ class Daemon:
             self._thread_publish_audio = Thread(target=self._publish_audio, daemon=True)
             self._thread_event_publish_audio = Event()
             self._thread_publish_audio.start()
-            self.media_manager.start_recording()
-            self.media_manager.start_playing()
 
         def backend_wrapped_run() -> None:
             assert self.backend is not None, (
@@ -221,7 +243,7 @@ class Daemon:
             try:
                 self.backend.wrapped_run()
             except Exception as e:
-                self.logger.error(f"Backend encountered an error: {e}")
+                self.logger.error("Backend encountered an error: %s", e)
                 self._status.state = DaemonState.ERROR
                 self._status.error = str(e)
                 self.zenoh_server.stop()
@@ -264,13 +286,24 @@ class Daemon:
             self._status.error = self.backend.error
             return self._status.state
 
+        # Start MediaCapture, AudioOutput, and ZMQ publishers
+        self._start_media_capture_and_output()
+
+        # Pass AudioOutput to Backend to avoid audio device conflicts
+        if self._audio_output is not None:
+            self.backend.set_audio_output(self._audio_output)
+
+        # Pass MediaCapture to Backend for resolution control
+        if self._media_capture is not None:
+            self.backend.set_media_capture(self._media_capture)
+
         if wake_up_on_start:
             try:
                 self.logger.info("Waking up Reachy Mini...")
                 self.backend.set_motor_control_mode(MotorControlMode.Enabled)
                 await self.backend.wake_up()
             except Exception as e:
-                self.logger.error(f"Error while waking up Reachy Mini: {e}")
+                self.logger.error("Error while waking up Reachy Mini: %s", e)
                 self._status.state = DaemonState.ERROR
                 self._status.error = str(e)
                 return self._status.state
@@ -278,12 +311,6 @@ class Daemon:
                 self.logger.warning("Wake up interrupted by user.")
                 self._status.state = DaemonState.STOPPING
                 return self._status.state
-
-        if self._webrtc:
-            await asyncio.sleep(
-                0.2
-            )  # Give some time for the backend to release the audio device
-            self._webrtc.start()
 
         self.logger.info("Daemon started successfully.")
         self._status.state = DaemonState.RUNNING
@@ -294,11 +321,12 @@ class Daemon:
         if (
             self._thread_event_publish_frames is None
             or self.websocket_frame_sender is None
+            or self._ws_media_receiver is None
         ):
             self.logger.warning("_publish_frames called but not properly initialized.")
             return
-        while self._thread_event_publish_frames.is_set() is False:
-            frame = self.media_manager.get_frame()
+        while not self._thread_event_publish_frames.is_set():
+            frame = self._ws_media_receiver.get_frame()
             if frame is not None:
                 self.websocket_frame_sender.send_frame(frame)
             time.sleep(0.04)
@@ -308,18 +336,163 @@ class Daemon:
         if (
             self._thread_event_publish_audio is None
             or self.websocket_audio_sender is None
+            or self._ws_media_receiver is None
         ):
             self.logger.warning("_publish_audio called but not properly initialized.")
             return
 
-        while self._thread_event_publish_audio.is_set() is False:
-            audio = self.media_manager.get_audio_sample()
+        while not self._thread_event_publish_audio.is_set():
+            audio = self._ws_media_receiver.get_audio_sample()
             if audio is not None:
                 self.websocket_audio_sender.send_audio_chunk(audio)
             received_audio = self.websocket_audio_sender.get_audio_chunk()
-            if received_audio is not None:
-                self.media_manager.push_audio_sample(received_audio)
+            if received_audio is not None and self._audio_output is not None:
+                # Get sample rate from receiver metadata or use default
+                sample_rate = self._ws_media_receiver.audio_sample_rate or 16000
+                self._audio_output._process_and_queue_audio(received_audio, sample_rate)
             time.sleep(0.05)
+
+    def _start_media_capture_and_output(self) -> None:
+        """Start MediaCapture and AudioOutput for IPC-based media access.
+
+        This is used by WebSocket streaming to access media via LocalIPCReceiver.
+        MediaCapture produces to IPC bus, AudioOutput handles speaker playback.
+        Gets video/audio captures from the backend.
+        """
+        if self._media_capture is not None:
+            self.logger.debug("MediaCapture already running")
+            return
+
+        assert self.backend is not None, (
+            "Backend must be initialized before starting media capture"
+        )
+
+        try:
+            # Get captures from backend (non-optional, will raise if failed)
+            video_capture = self.backend.get_video_capture()
+            audio_capture = self.backend.get_audio_capture()
+
+            self.logger.info(
+                "Using backend-provided video capture: %s",
+                type(video_capture).__name__,
+            )
+            self.logger.info(
+                "Using backend-provided audio capture: %s",
+                type(audio_capture).__name__,
+            )
+
+            capture_config = CaptureConfig(log_level=self.log_level)
+            self._media_capture = MediaCapture(
+                config=capture_config,
+                video_capture=video_capture,
+                audio_capture=audio_capture,
+            )
+            if not self._media_capture.start():
+                self.logger.error("Failed to start MediaCapture")
+                return
+
+            # AudioOutput is only needed for real robot (speaker playback)
+            # Skip for MuJoCo since it has no audio output
+            if not isinstance(audio_capture, NullAudioCapture):
+                audio_output_config = AudioOutputConfig(log_level=self.log_level)
+                self._audio_output = AudioOutput(
+                    config=audio_output_config, log_level=self.log_level
+                )
+                if not self._audio_output.start():
+                    self.logger.error("Failed to start AudioOutput")
+                    self._media_capture.stop()
+                    self._media_capture = None
+                    return
+            else:
+                self.logger.info("Skipping AudioOutput (backend has no audio)")
+                self._audio_output = None
+
+            self.logger.info(
+                "MediaCapture and AudioOutput started for streaming"
+            )
+
+            # Start ZeroMQ publishers for video and audio streaming
+            self._start_zmq_publishers()
+
+        except Exception as e:
+            self.logger.error("Failed to start media capture/output: %s", e)
+            if self._media_capture is not None:
+                self._media_capture.stop()
+                self._media_capture = None
+
+    def _start_zmq_publishers(self) -> None:
+        """Start ZeroMQ publishers for video and audio streaming.
+
+        Requires MediaCapture to be running.
+        """
+        try:
+            video_source = IPCVideoSource(log_level=self.log_level)
+            video_sink = JPEGEncodedZMQSink(
+                port=VIDEO_TCP_PORT, hwm=2, jpeg_quality=85, log_level=self.log_level
+            )
+
+            self._video_publisher = GenericMediaPublisher(
+                source=video_source,
+                sink=video_sink,
+                topic=VIDEO_TOPIC,
+                log_level=self.log_level,
+                name="VideoPublisher",
+            )
+
+            if not self._video_publisher.start():
+                self.logger.error("Failed to start video publisher")
+                return
+
+            audio_source = IPCAudioSource(log_level=self.log_level)
+            audio_sink = ZeroMQAudioSink(
+                port=AUDIO_TCP_PORT, hwm=10, log_level=self.log_level
+            )
+
+            self._audio_publisher = GenericMediaPublisher(
+                source=audio_source,
+                sink=audio_sink,
+                topic=AUDIO_TOPIC,
+                log_level=self.log_level,
+                name="AudioPublisher",
+            )
+
+            if not self._audio_publisher.start():
+                self.logger.error("Failed to start audio publisher")
+                self._video_publisher.stop()
+                self._video_publisher = None
+                return
+
+            self.logger.info("ZeroMQ publishers started successfully")
+
+        except Exception as e:
+            self.logger.error("Failed to start ZMQ publishers: %s", e)
+            if self._video_publisher is not None:
+                self._video_publisher.stop()
+                self._video_publisher = None
+
+    def _stop_media_streaming(self) -> None:
+        """Stop media capture and streaming publishers."""
+        if self._ws_media_receiver is not None:
+            self._ws_media_receiver.close()
+            self._ws_media_receiver = None
+
+        if self._audio_output is not None:
+            self._audio_output.stop()
+            self._audio_output = None
+
+        if self._audio_publisher is not None:
+            self._audio_publisher.stop()
+            self._audio_publisher = None
+
+        if self._video_publisher is not None:
+            self._video_publisher.stop()
+            self._video_publisher = None
+
+        if self._media_capture is not None:
+            self._media_capture.stop()
+            self._media_capture = None
+
+        self.logger.info("Media streaming stopped")
 
     async def stop(self, goto_sleep_on_stop: bool = True) -> "DaemonState":
         """Stop the Reachy Mini daemon.
@@ -352,10 +525,6 @@ class Daemon:
             if self.websocket_server is not None:
                 self.websocket_server.stop()
 
-            if self._webrtc:
-                # We use pause() instead of stop() to keep the signalling server running and the producer registered, allowing proper restart.
-                self._webrtc.pause()
-
             if goto_sleep_on_stop:
                 try:
                     self.logger.info("Putting Reachy Mini to sleep...")
@@ -363,12 +532,14 @@ class Daemon:
                     await self.backend.goto_sleep()
                     self.backend.set_motor_control_mode(MotorControlMode.Disabled)
                 except Exception as e:
-                    self.logger.error(f"Error while putting Reachy Mini to sleep: {e}")
+                    self.logger.error("Error while putting Reachy Mini to sleep: %s", e)
                     self._status.state = DaemonState.ERROR
                     self._status.error = str(e)
                 except KeyboardInterrupt:
                     self.logger.warning("Sleep interrupted by user.")
                     self._status.state = DaemonState.STOPPING
+
+            self._stop_media_streaming()
 
             self.backend.should_stop.set()
             self.backend_run_thread.join(timeout=5.0)
@@ -383,7 +554,7 @@ class Daemon:
                 self.logger.info("Daemon stopped successfully.")
                 self._status.state = DaemonState.STOPPED
         except Exception as e:
-            self.logger.error(f"Error while stopping the daemon: {e}")
+            self.logger.error("Error while stopping the daemon: %s", e)
             self._status.state = DaemonState.ERROR
             self._status.error = str(e)
         except KeyboardInterrupt:
@@ -492,7 +663,7 @@ class Daemon:
 
     def _publish_status(self) -> None:
         self._thread_event_publish_status.clear()
-        while self._thread_event_publish_status.is_set() is False:
+        while not self._thread_event_publish_status.is_set():
             json_str = json.dumps(
                 asdict(self.status(), dict_factory=convert_enum_to_dict)
             )
@@ -551,7 +722,7 @@ class Daemon:
             try:
                 self.logger.info("Daemon is running. Press Ctrl+C to stop.")
                 while self.backend_run_thread.is_alive():
-                    self.logger.info(f"Daemon status: {self.status()}")
+                    self.logger.info("Daemon status: %s", self.status())
                     for _ in range(10):
                         self.backend_run_thread.join(timeout=1.0)
                 else:
@@ -560,7 +731,7 @@ class Daemon:
             except KeyboardInterrupt:
                 self.logger.warning("Daemon interrupted by user.")
             except Exception as e:
-                self.logger.error(f"An error occurred: {e}")
+                self.logger.error("An error occurred: %s", e)
                 self._status.state = DaemonState.ERROR
                 self._status.error = str(e)
 
@@ -593,7 +764,7 @@ class Daemon:
             if serialport == "auto":
                 ports = find_serial_port(wireless_version=wireless_version)
 
-                if len(ports) == 0:
+                if not ports:
                     raise RuntimeError(
                         "No Reachy Mini serial port found. "
                         "Check USB connection and permissions. "
@@ -606,10 +777,14 @@ class Daemon:
                     )
 
                 serialport = ports[0]
-                self.logger.info(f"Found Reachy Mini serial port: {serialport}")
+                self.logger.info("Found Reachy Mini serial port: %s", serialport)
 
             self.logger.info(
-                f"Creating RobotBackend with parameters: serialport={serialport}, check_collision={check_collision}, kinematics_engine={kinematics_engine}"
+                "Creating RobotBackend with parameters: serialport=%s, "
+                "check_collision=%s, kinematics_engine=%s",
+                serialport,
+                check_collision,
+                kinematics_engine,
             )
 
             if reflash_motors_on_start:

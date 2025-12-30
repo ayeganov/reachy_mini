@@ -43,7 +43,7 @@ async def test_daemon_client_disconnection() -> None:
     client_connected = asyncio.Event()
 
     async def simple_client() -> None:
-        with ReachyMini(media_backend="no_media") as mini:
+        with ReachyMini(media_enabled=False) as mini:
             status = mini.client.get_status()
             assert status['state'] == "running"
             assert status['simulation_enabled']
@@ -72,7 +72,7 @@ async def test_daemon_early_stop() -> None:
     daemon_stopped = asyncio.Event()
 
     async def client_bg() -> None:
-        with ReachyMini(media_backend="no_media") as reachy:
+        with ReachyMini(media_enabled=False) as reachy:
             client_connected.set()
             await daemon_stopped.wait()
 

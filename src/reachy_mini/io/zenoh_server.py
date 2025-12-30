@@ -23,6 +23,7 @@ from reachy_mini.io.protocol import (
     TaskProgress,
     TaskRequest,
 )
+from reachy_mini.media.camera_constants import CameraResolution
 
 
 class ZenohServer(AbstractServer):
@@ -186,6 +187,14 @@ class ZenohServer(AbstractServer):
                 self.backend.start_recording()
             if "stop_recording" in command:
                 self.backend.stop_recording()
+            if "set_resolution" in command:
+                try:
+                    resolution = CameraResolution[command["set_resolution"]]
+                    self.backend.set_video_resolution(resolution)
+                except KeyError:
+                    self.backend.logger.error(
+                        "Invalid resolution: %s", command["set_resolution"]
+                    )
         self._cmd_event.set()
 
     def _handle_task_request(self, sample: zenoh.Sample) -> None:

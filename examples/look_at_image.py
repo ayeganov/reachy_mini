@@ -31,10 +31,10 @@ def main(backend: str) -> None:
 
     print("Click on the image to make ReachyMini look at that point.")
     print("Press 'q' to quit the camera feed.")
-    with ReachyMini(media_backend=backend) as reachy_mini:
+    with ReachyMini(localhost_only=True) as reachy_mini:
         try:
             while True:
-                frame = reachy_mini.media.get_frame()
+                frame = reachy_mini.media.get_frame() if reachy_mini.media else None
 
                 if frame is None:
                     print("Failed to grab frame.")
