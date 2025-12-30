@@ -18,7 +18,7 @@ import numpy.typing as npt
 from asgiref.sync import async_to_sync
 from scipy.spatial.transform import Rotation as R
 
-from reachy_mini.daemon.utils import daemon_check
+from reachy_mini.daemon.utils import daemon_check, is_local_camera_available
 from reachy_mini.io.protocol import GotoTaskRequest
 from reachy_mini.io.zenoh_client import ZenohClient
 from reachy_mini.media.camera_constants import CameraResolution
@@ -158,13 +158,6 @@ class ReachyMini:
         """Initialize media for remote connections using ZeroMQ."""
         daemon_status = self.client.get_status()
 
-        if not daemon_status.get("stream_enabled"):
-            self.logger.info(
-                "Remote connection detected but streaming not enabled on daemon. "
-                "Start daemon with '--stream' flag to enable media."
-            )
-            return
-
         wlan_ip = daemon_status.get("wlan_ip")
         if not wlan_ip:
             self.logger.warning(
@@ -172,18 +165,18 @@ class ReachyMini:
             )
             return
 
-        self.logger.info(f"Connecting to media stream at {wlan_ip}...")
+        self.logger.info("Connecting to media stream at %s...", wlan_ip)
         self._media_source = ZeroMQClient(host=wlan_ip, log_level=log_level)
 
         if not self._media_source.start(wait_timeout=3.0):
             self.logger.warning(
-                f"Failed to connect to media stream at {wlan_ip}. "
-                "Media will be unavailable."
+                "Failed to connect to media stream at %s. Media will be unavailable.",
+                wlan_ip,
             )
             self._media_source.close()
             self._media_source = None
         else:
-            self.logger.info(f"Media stream connected to {wlan_ip}")
+            self.logger.info("Media stream connected to %s", wlan_ip)
 
     def _init_local_media(self, log_level: str) -> None:
         """Initialize media for local connections using LocalIPCReceiver."""
@@ -692,6 +685,8 @@ class ReachyMini:
 
         Args:
             ids (List[str] | None): List of motor names to enable. If None, all motors will be enabled.
+                Valid names match `src/reachy_mini/assets/config/hardware_config.yaml`:
+                `body_rotation`, `stewart_1` … `stewart_6`, `right_antenna`, `left_antenna`.
 
         """
         self._set_torque(True, ids=ids)
@@ -701,6 +696,8 @@ class ReachyMini:
 
         Args:
             ids (List[str] | None): List of motor names to disable. If None, all motors will be disabled.
+                Valid names match `src/reachy_mini/assets/config/hardware_config.yaml`:
+                `body_rotation`, `stewart_1` … `stewart_6`, `right_antenna`, `left_antenna`.
 
         """
         self._set_torque(False, ids=ids)

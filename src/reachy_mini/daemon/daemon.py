@@ -42,6 +42,7 @@ from reachy_mini.media.publishers.base import GenericMediaPublisher
 from reachy_mini.media.receivers.local_ipc_receiver import LocalIPCReceiver
 from reachy_mini.media.sinks.zeromq_sink import JPEGEncodedZMQSink, ZeroMQAudioSink
 from reachy_mini.media.sources import IPCAudioSource, IPCVideoSource
+from reachy_mini.tools.reflash_motors import reflash_motors
 
 from .backend.mujoco import MujocoBackend, MujocoBackendStatus
 from .backend.mujoco.audio_capture import NullAudioCapture
@@ -59,7 +60,6 @@ class Daemon:
         log_level: str = "INFO",
         robot_name: str = "reachy_mini",
         wireless_version: bool = False,
-        stream: bool = False,
         desktop_app_daemon: bool = False,
     ) -> None:
         """Initialize the Reachy Mini daemon."""
@@ -86,7 +86,6 @@ class Daemon:
             state=DaemonState.NOT_INITIALIZED,
             wireless_version=wireless_version,
             desktop_app_daemon=desktop_app_daemon,
-            stream_enabled=stream,
             simulation_enabled=None,
             backend_status=None,
             error=None,
@@ -99,12 +98,6 @@ class Daemon:
         self._video_publisher: Optional[GenericMediaPublisher] = None
         self._audio_publisher: Optional[GenericMediaPublisher] = None
         self._audio_output: Optional[AudioOutput] = None
-        self._stream_enabled = stream
-        if stream and not wireless_version:
-            raise RuntimeError(
-                "Media streaming is only supported for wireless version. "
-                "Use --wireless-version flag."
-            )
 
     async def start(
         self,
@@ -293,10 +286,8 @@ class Daemon:
             self._status.error = self.backend.error
             return self._status.state
 
-        # Start MediaCapture/AudioOutput if ZeroMQ streaming is enabled
-        # (WebSocket streaming already started this in the stream_media block)
-        if self._stream_enabled and self._media_capture is None:
-            self._start_media_capture_and_output()
+        # Start MediaCapture, AudioOutput, and ZMQ publishers
+        self._start_media_capture_and_output()
 
         # Pass AudioOutput to Backend to avoid audio device conflicts
         if self._audio_output is not None:
@@ -320,10 +311,6 @@ class Daemon:
                 self.logger.warning("Wake up interrupted by user.")
                 self._status.state = DaemonState.STOPPING
                 return self._status.state
-
-        # Start ZeroMQ publishers if streaming is enabled
-        if self._stream_enabled:
-            self._start_zmq_publishers()
 
         self.logger.info("Daemon started successfully.")
         self._status.state = DaemonState.RUNNING
@@ -424,6 +411,9 @@ class Daemon:
                 "MediaCapture and AudioOutput started for streaming"
             )
 
+            # Start ZeroMQ publishers for video and audio streaming
+            self._start_zmq_publishers()
+
         except Exception as e:
             self.logger.error("Failed to start media capture/output: %s", e)
             if self._media_capture is not None:
@@ -433,12 +423,8 @@ class Daemon:
     def _start_zmq_publishers(self) -> None:
         """Start ZeroMQ publishers for video and audio streaming.
 
-        Requires MediaCapture and AudioOutput to be running (from _start_media_capture_and_output).
+        Requires MediaCapture to be running.
         """
-        if self._media_capture is None:
-            self.logger.error("Cannot start ZMQ publishers: MediaCapture not running")
-            return
-
         try:
             video_source = IPCVideoSource(log_level=self.log_level)
             video_sink = JPEGEncodedZMQSink(
@@ -483,17 +469,6 @@ class Daemon:
             if self._video_publisher is not None:
                 self._video_publisher.stop()
                 self._video_publisher = None
-
-    def _start_media_streaming(self) -> None:
-        """Start media capture and streaming publishers.
-
-        Initialize MediaCapture to own camera/microphone hardware and
-        publish to IPC bus. Start ZeroMQ publishers to consume from IPC
-        and stream to clients over TCP. Also start AudioOutput to receive
-        audio from clients and play through the speaker.
-        """
-        self._start_media_capture_and_output()
-        self._start_zmq_publishers()
 
     def _stop_media_streaming(self) -> None:
         """Stop media capture and streaming publishers."""
@@ -564,8 +539,7 @@ class Daemon:
                     self.logger.warning("Sleep interrupted by user.")
                     self._status.state = DaemonState.STOPPING
 
-            if self._stream_enabled:
-                self._stop_media_streaming()
+            self._stop_media_streaming()
 
             self.backend.should_stop.set()
             self.backend_run_thread.join(timeout=5.0)
@@ -775,6 +749,7 @@ class Daemon:
         use_audio: bool,
         websocket_uri: Optional[str],
         hardware_config_filepath: str | None = None,
+        reflash_motors_on_start: bool = True,
     ) -> "RobotBackend | MujocoBackend":
         if sim:
             return MujocoBackend(
@@ -811,6 +786,10 @@ class Daemon:
                 check_collision,
                 kinematics_engine,
             )
+
+            if reflash_motors_on_start:
+                reflash_motors(serialport, dont_light_up=True)
+
             return RobotBackend(
                 serialport=serialport,
                 log_level=self.log_level,
@@ -841,7 +820,6 @@ class DaemonStatus:
     state: DaemonState
     wireless_version: bool
     desktop_app_daemon: bool
-    stream_enabled: bool
     simulation_enabled: Optional[bool]
     backend_status: Optional[RobotBackendStatus | MujocoBackendStatus]
     error: Optional[str] = None
