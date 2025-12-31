@@ -613,7 +613,7 @@ class RobotBackend(Backend):
             return self._video_capture
 
         self._video_capture = Picamera2H264Capture(
-            resolution=CameraResolution.R1920x1080at60fps,
+            resolution=CameraResolution.R1280x720at30fps,
             log_level=self._log_level,
         )
         self.logger.info("Using Picamera2 H.264 hardware encoding")
