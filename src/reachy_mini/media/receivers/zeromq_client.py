@@ -10,8 +10,9 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
+import av
 import cv2
 import numpy as np
 import numpy.typing as npt
@@ -35,6 +36,50 @@ if TYPE_CHECKING:
     from zmq import Context, Socket
 
 CONNECTION_TIMEOUT_SEC = 2.0
+
+
+class H264Decoder:
+    """H.264 decoder using PyAV.
+
+    Decodes H.264 NAL units to BGR frames for OpenCV compatibility.
+    """
+
+    def __init__(self, log_level: str = "INFO") -> None:
+        """Initialize H.264 decoder.
+
+        Args:
+            log_level: Logging level string.
+
+        """
+        self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        self._logger.setLevel(log_level)
+
+        self._codec: Any = av.CodecContext.create("h264", "r")
+        self._codec.options = {"flags": "low_delay"}
+        self._logger.debug("H.264 decoder initialized")
+
+    def decode(self, data: bytes) -> Optional[npt.NDArray[np.uint8]]:
+        """Decode H.264 data and return BGR frame.
+
+        Args:
+            data: H.264 encoded frame bytes.
+
+        Returns:
+            BGR numpy array (H, W, 3) or None if decoding fails.
+
+        """
+        try:
+            packet = av.Packet(data)
+            frames = self._codec.decode(packet)
+            for frame in frames:
+                return frame.to_ndarray(format="bgr24")
+        except Exception as e:
+            self._logger.debug("H.264 decode error: %s", e)
+        return None
+
+    def close(self) -> None:
+        """Release decoder resources."""
+        self._codec = None
 
 
 @dataclass
@@ -120,6 +165,7 @@ class ZeroMQClient:
 
         self._latest_frame: Optional[npt.NDArray[np.uint8]] = None
         self._latest_frame_metadata: Optional[dict[str, object]] = None
+        self._latest_encoding: str = "jpeg"
         self._latest_audio: Optional[npt.NDArray[np.float32]] = None
         self._latest_audio_metadata: Optional[dict[str, object]] = None
 
@@ -134,6 +180,10 @@ class ZeroMQClient:
         # Camera intrinsics from video stream
         self._K: Optional[npt.NDArray[np.float64]] = None
         self._D: Optional[npt.NDArray[np.float64]] = None
+
+        # H.264 decoder (lazily initialized)
+        self._h264_decoder: Optional[H264Decoder] = None
+        self._log_level = log_level
 
         # For sending audio to the robot
         self._audio_out_source = SinkableSource()
@@ -293,6 +343,7 @@ class ZeroMQClient:
         Args:
             data (npt.NDArray[np.float32]): Numpy array of audio data.
             sample_rate (int): The sample rate of the audio data.
+
         """
         if data.ndim > 2 or data.shape[0] == 0:
             self._logger.warning("Invalid audio data shape.")
@@ -316,6 +367,7 @@ class ZeroMQClient:
 
         Args:
             asset_name (str): The filename of the asset on the robot (e.g. "go_sleep.wav").
+
         """
         self._logger.info("Requesting robot to play asset: %s", asset_name)
         self._audio_out_sink.send_multipart(
@@ -330,6 +382,7 @@ class ZeroMQClient:
 
         Args:
             sound_file (str): Path to the local audio file (e.g., WAV).
+
         """
         try:
             import soundfile as sf
@@ -375,6 +428,10 @@ class ZeroMQClient:
         if self._zmq_context is not None:
             self._zmq_context.term()
             self._zmq_context = None
+
+        if self._h264_decoder is not None:
+            self._h264_decoder.close()
+            self._h264_decoder = None
 
         self._logger.info("ZeroMQ client closed")
 
@@ -439,48 +496,45 @@ class ZeroMQClient:
                 break
 
             try:
-                if (
-                    self._video_socket.poll(timeout=self._config.receive_timeout_ms)
-                    == 0
-                ):
-                    continue
-
                 parts = self._video_socket.recv_multipart()
                 if len(parts) != 3:
                     self._logger.warning("Invalid video message: %d parts", len(parts))
                     continue
 
                 metadata = EncodedVideoMetadata.from_json(parts[1].decode("utf-8"))
-                jpeg_bytes = parts[2]
+                raw_data = parts[2]
 
-                frame = self._decode_jpeg(jpeg_bytes)
-                receive_time = time.monotonic()
-                if frame is not None:
-                    with self._video_lock:
-                        self._latest_frame = frame
-                        self._latest_frame_metadata = {
-                            "ts": metadata.ts,
-                            "receive_ts": receive_time,
-                            "width": metadata.width,
-                            "height": metadata.height,
-                            "encoding": metadata.encoding,
-                        }
-                        self._video_resolution = (metadata.width, metadata.height)
-                        # Update camera intrinsics from metadata
-                        if metadata.K is not None:
-                            self._K = np.array(metadata.K, dtype=np.float64)
-                        if metadata.D is not None:
-                            self._D = np.array(metadata.D, dtype=np.float64)
+                with self._video_lock:
+                    if metadata.encoding == "h264":
+                        # H.264: decode immediately
+                        self._latest_frame = self._decode_h264(raw_data)
+                    else:
+                        # JPEG: lazy decode - store bytes, decode on demand
+                        self._latest_frame = self._decode_jpeg(raw_data)
 
-                    if not self._first_video_received:
-                        self._first_video_received = True
-                        self._logger.debug(
-                            "First video frame received: %dx%d",
-                            metadata.width,
-                            metadata.height,
-                        )
+                    self._latest_encoding = metadata.encoding
+                    self._latest_frame_metadata = {
+                        "ts": metadata.ts,
+                        "width": metadata.width,
+                        "height": metadata.height,
+                        "encoding": metadata.encoding,
+                    }
+                    self._video_resolution = (metadata.width, metadata.height)
 
-                self._last_video_receive_time = receive_time
+                    if metadata.K is not None:
+                        self._K = np.array(metadata.K, dtype=np.float64)
+                    if metadata.D is not None:
+                        self._D = np.array(metadata.D, dtype=np.float64)
+
+                self._last_video_receive_time = time.monotonic()
+
+                if not self._first_video_received:
+                    self._first_video_received = True
+                    self._logger.debug(
+                        "First video frame received: %dx%d",
+                        metadata.width,
+                        metadata.height,
+                    )
 
             except zmq.ZMQError as e:
                 if self._running:
@@ -495,12 +549,6 @@ class ZeroMQClient:
                 break
 
             try:
-                if (
-                    self._audio_socket.poll(timeout=self._config.receive_timeout_ms)
-                    == 0
-                ):
-                    continue
-
                 parts = self._audio_socket.recv_multipart()
                 if len(parts) != 3:
                     self._logger.warning("Invalid audio message: %d parts", len(parts))
@@ -558,3 +606,21 @@ class ZeroMQClient:
         except Exception as e:
             self._logger.error("Failed to decode JPEG: %s", e)
             return None
+
+    def _decode_h264(self, h264_bytes: bytes) -> Optional[npt.NDArray[np.uint8]]:
+        """Decode H.264 bytes to numpy array.
+
+        Lazily initializes the H.264 decoder on first use.
+
+        Args:
+            h264_bytes: H.264 encoded frame data.
+
+        Returns:
+            BGR numpy array or None on error.
+
+        """
+        if self._h264_decoder is None:
+            self._h264_decoder = H264Decoder(log_level=self._log_level)
+            self._logger.info("H.264 decoder initialized")
+
+        return self._h264_decoder.decode(h264_bytes)

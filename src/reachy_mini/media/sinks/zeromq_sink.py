@@ -9,12 +9,11 @@ import logging
 from typing import TYPE_CHECKING, Optional, Union
 
 import cv2
-import zmq
 import numpy as np
-import numpy.typing as npt
+import zmq
 
-from reachy_mini.media.capture import EncodedVideoMetadata, VideoMetadata, AudioMetadata
-from reachy_mini.media.publishers.base import MediaSinkProtocol, VideoData, AudioData
+from reachy_mini.media.capture import AudioMetadata, EncodedVideoMetadata, VideoMetadata
+from reachy_mini.media.publishers.base import AudioData, MediaSinkProtocol, VideoData
 
 if TYPE_CHECKING:
     from zmq import Context, Socket
@@ -113,6 +112,7 @@ class JPEGEncodedZMQSink(
             topic: ZMQ topic.
             metadata: VideoMetadata object.
             data: Video frame (numpy array).
+
         """
         try:
             encode_params = [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality]
@@ -142,6 +142,38 @@ class JPEGEncodedZMQSink(
             self._logger.error("Error encoding/sending video: %s", e)
 
 
+class H264PassthroughZMQSink(
+    BaseZeroMQServerSink, MediaSinkProtocol[EncodedVideoMetadata, bytes]
+):
+    """Sink that passes through H.264 encoded data without re-encoding.
+
+    Used for the Picamera2 H.264 hardware encoding path where frames
+    arrive already encoded from the GPU.
+    """
+
+    def send(
+        self, topic: bytes, metadata: EncodedVideoMetadata, data: bytes
+    ) -> None:
+        """Send pre-encoded H.264 video data.
+
+        Args:
+            topic: ZMQ topic.
+            metadata: EncodedVideoMetadata object.
+            data: H.264 encoded frame bytes.
+
+        """
+        try:
+            self._send_multipart(
+                [
+                    topic,
+                    metadata.to_json().encode("utf-8"),
+                    data,
+                ]
+            )
+        except Exception as e:
+            self._logger.error("Error sending H.264 video: %s", e)
+
+
 class ZeroMQAudioSink(
     BaseZeroMQServerSink, MediaSinkProtocol[AudioMetadata, AudioData]
 ):
@@ -154,6 +186,7 @@ class ZeroMQAudioSink(
             topic: ZMQ topic.
             metadata: AudioMetadata object.
             data: Audio chunk (numpy array).
+
         """
         match metadata:
             case AudioMetadata():

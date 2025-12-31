@@ -31,6 +31,7 @@ from reachy_mini.media.capture import (
     AudioOutputConfig,
     CaptureConfig,
     MediaCapture,
+    Picamera2H264Capture,
 )
 from reachy_mini.media.media_constants import (
     AUDIO_TCP_PORT,
@@ -40,8 +41,12 @@ from reachy_mini.media.media_constants import (
 )
 from reachy_mini.media.publishers.base import GenericMediaPublisher
 from reachy_mini.media.receivers.local_ipc_receiver import LocalIPCReceiver
-from reachy_mini.media.sinks.zeromq_sink import JPEGEncodedZMQSink, ZeroMQAudioSink
-from reachy_mini.media.sources import IPCAudioSource, IPCVideoSource
+from reachy_mini.media.sinks.zeromq_sink import (
+    H264PassthroughZMQSink,
+    JPEGEncodedZMQSink,
+    ZeroMQAudioSink,
+)
+from reachy_mini.media.sources import IPCAudioSource, IPCH264VideoSource, IPCVideoSource
 from reachy_mini.tools.reflash_motors import reflash_motors
 
 from .backend.mujoco import MujocoBackend, MujocoBackendStatus
@@ -407,9 +412,7 @@ class Daemon:
                 self.logger.info("Skipping AudioOutput (backend has no audio)")
                 self._audio_output = None
 
-            self.logger.info(
-                "MediaCapture and AudioOutput started for streaming"
-            )
+            self.logger.info("MediaCapture and AudioOutput started for streaming")
 
             # Start ZeroMQ publishers for video and audio streaming
             self._start_zmq_publishers()
@@ -423,13 +426,34 @@ class Daemon:
     def _start_zmq_publishers(self) -> None:
         """Start ZeroMQ publishers for video and audio streaming.
 
+        Dynamically selects H.264 passthrough for robot or JPEG encoding for MuJoCo.
         Requires MediaCapture to be running.
         """
         try:
-            video_source = IPCVideoSource(log_level=self.log_level)
-            video_sink = JPEGEncodedZMQSink(
-                port=VIDEO_TCP_PORT, hwm=2, jpeg_quality=85, log_level=self.log_level
+            video_capture = (
+                self._media_capture.video_capture
+                if self._media_capture is not None
+                else None
             )
+
+            if isinstance(video_capture, Picamera2H264Capture):
+                self.logger.info("Using H.264 passthrough pipeline (hardware encoding)")
+                video_source = IPCH264VideoSource(log_level=self.log_level)
+                video_sink = H264PassthroughZMQSink(
+                    port=VIDEO_TCP_PORT,
+                    hwm=2,
+                    log_level=self.log_level,
+                )
+            else:
+                # JPEG path (MuJoCo simulation or fallback)
+                self.logger.info("Using JPEG encoding pipeline (software encoding)")
+                video_source = IPCVideoSource(log_level=self.log_level)
+                video_sink = JPEGEncodedZMQSink(
+                    port=VIDEO_TCP_PORT,
+                    hwm=2,
+                    jpeg_quality=85,
+                    log_level=self.log_level,
+                )
 
             self._video_publisher = GenericMediaPublisher(
                 source=video_source,

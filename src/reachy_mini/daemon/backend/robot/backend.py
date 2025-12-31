@@ -23,7 +23,7 @@ from reachy_mini.media.camera_constants import CameraResolution
 from reachy_mini.media.capture import (
     AudioCapture,
     AudioCaptureProtocol,
-    OpenCVCapture,
+    Picamera2H264Capture,
     VideoCaptureProtocol,
 )
 from reachy_mini.utils.hardware_config.parser import parse_yaml_config
@@ -598,51 +598,28 @@ class RobotBackend(Backend):
         return errors
 
     def get_video_capture(self) -> VideoCaptureProtocol:
-        """Return video capture for real robot hardware.
+        """Return video capture for real robot hardware using H.264 encoding.
 
-        Tries Picamera2 first, falls back to OpenCV.
+        Uses Picamera2 with hardware H.264 encoding for efficient streaming.
 
         Returns:
             VideoCaptureProtocol implementation.
 
         Raises:
-            RuntimeError: If no video capture available.
+            RuntimeError: If Picamera2 H.264 capture is not available.
 
         """
         if self._video_capture is not None:
             return self._video_capture
 
-        # Try Picamera2 first (Raspberry Pi)
-        try:
-            from reachy_mini.media.capture import Picamera2Capture
-
-            self._video_capture = Picamera2Capture(
-                resolution=CameraResolution.R1920x1080at60fps,
-                log_level=self._log_level,
-            )
-            self.logger.info("Using Picamera2 capture")
-            if not self._video_capture.open():
-                raise RuntimeError("Failed to open Picamera2 capture")
-            return self._video_capture
-        except Exception as e:
-            self.logger.info("Picamera2 not available: %s", e)
-
-        # Fallback to OpenCV
-        try:
-            self._video_capture = OpenCVCapture(
-                resolution=CameraResolution.R1280x720at30fps,
-                log_level=self._log_level,
-            )
-            self.logger.info("Using OpenCV capture")
-            if not self._video_capture.open():
-                raise RuntimeError("Failed to open OpenCV capture")
-            return self._video_capture
-        except Exception as e:
-            self.logger.error("OpenCV capture failed: %s", e)
-
-        raise RuntimeError(
-            "No video capture available - Picamera2 and OpenCV both failed"
+        self._video_capture = Picamera2H264Capture(
+            resolution=CameraResolution.R1920x1080at60fps,
+            log_level=self._log_level,
         )
+        self.logger.info("Using Picamera2 H.264 hardware encoding")
+        if not self._video_capture.open():
+            raise RuntimeError("Failed to open Picamera2 H.264 capture")
+        return self._video_capture
 
     def get_audio_capture(self) -> AudioCaptureProtocol:
         """Return audio capture for real robot hardware.

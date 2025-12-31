@@ -16,7 +16,8 @@ try:
         MujocoVideoCapture,
     )
 
-except ImportError:
+except ImportError as error:
+    print(error)
 
     class MujocoMockupBackend:
         """Mockup class to avoid import errors when MuJoCo is not installed."""

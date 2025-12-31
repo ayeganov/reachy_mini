@@ -36,7 +36,8 @@ dependencies = [
     "websockets>=12,<16",
     "toml",
     "rustypot",
-    "pyzmq>=25.0.0"
+    "pyzmq>=25.0.0",
+    "av>=14.0.0"
 ]
 
 

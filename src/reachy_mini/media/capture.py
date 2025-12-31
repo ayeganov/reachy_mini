@@ -40,15 +40,15 @@ import soundfile as sf
 import zmq
 
 from reachy_mini.media.audio_control_utils import ReSpeaker, init_respeaker_usb
-from reachy_mini.media.camera_base import CameraBase
 from reachy_mini.media.camera_constants import CameraResolution, CameraSpecs
-from reachy_mini.media.camera_opencv import OpenCVCamera
 from reachy_mini.media.media_constants import (
     AUDIO_IPC_ENDPOINT,
     AUDIO_OUTPUT_TCP_PORT,
     AUDIO_OUTPUT_TOPIC,
     PLAY_SOUND_TOPIC,
     VIDEO_IPC_ENDPOINT,
+    VIDEO_TCP_PORT,
+    VIDEO_TOPIC,
 )
 from reachy_mini.utils.constants import ASSETS_ROOT_PATH
 
@@ -132,14 +132,15 @@ class VideoMetadata:
 
 @dataclass
 class EncodedVideoMetadata:
-    """Metadata for encoded video frames (e.g. JPEG).
+    """Metadata for encoded video frames (e.g. JPEG, H.264).
 
     Attributes:
         ts: Timestamp in seconds (monotonic clock).
         width: Frame width in pixels.
         height: Frame height in pixels.
-        encoding: Encoding format (e.g., 'jpeg').
-        quality: Encoding quality.
+        encoding: Encoding format (e.g., 'jpeg', 'h264').
+        quality: Encoding quality (for JPEG).
+        bitrate: Encoding bitrate in bits/second (for H.264).
         K: Camera intrinsic matrix (3x3) for current resolution.
         D: Camera distortion coefficients (5 values).
 
@@ -150,6 +151,7 @@ class EncodedVideoMetadata:
     height: int
     encoding: str = "jpeg"
     quality: int = 85
+    bitrate: int = 0
     K: Optional[list[list[float]]] = None
     D: Optional[list[float]] = None
 
@@ -161,6 +163,7 @@ class EncodedVideoMetadata:
             "height": self.height,
             "encoding": self.encoding,
             "quality": self.quality,
+            "bitrate": self.bitrate,
         }
         if self.K is not None:
             data["K"] = self.K
@@ -186,6 +189,7 @@ class EncodedVideoMetadata:
             height=parsed["height"],
             encoding=parsed.get("encoding", "jpeg"),
             quality=parsed.get("quality", 85),
+            bitrate=parsed.get("bitrate", 0),
             K=parsed.get("K"),
             D=parsed.get("D"),
         )
@@ -262,6 +266,7 @@ class CaptureConfig:
         video_ipc_endpoint: ZMQ IPC endpoint for video.
         audio_ipc_endpoint: ZMQ IPC endpoint for audio.
         video_resolution: Camera resolution to use.
+        video_bitrate: H.264 encoding bitrate in bits/second.
         audio_sample_rate: Audio sample rate in Hz.
         audio_channels: Number of audio channels.
         log_level: Logging level string.
@@ -273,6 +278,7 @@ class CaptureConfig:
     video_ipc_endpoint: str = VIDEO_IPC_ENDPOINT
     audio_ipc_endpoint: str = AUDIO_IPC_ENDPOINT
     video_resolution: CameraResolution = CameraResolution.R1920x1080at60fps
+    video_bitrate: int = 10_000_000
     audio_sample_rate: int = 16000
     audio_channels: int = 2
     log_level: str = "INFO"
@@ -436,401 +442,362 @@ class AudioCaptureProtocol(Protocol):
         ...
 
 
-class VideoCaptureBase:
-    """Base implementation for video capture with threading and IPC publishing.
+# Import Output base class for DirectZMQOutput (only available on Pi with picamera2)
+try:
+    from picamera2.outputs import Output as Picamera2Output
+except ImportError:
+    # Provide a dummy base class for systems without picamera2
+    Picamera2Output = object  # type: ignore[misc]
 
-    Provides common functionality for all video capture implementations.
-    Subclasses must implement open(), read_frame(), and close().
+
+class DirectZMQOutput(Picamera2Output):
+    """Custom output that pushes H.264 frames to a queue.
+
+    This class implements the picamera2 Output interface to receive encoded
+    H.264 frames directly from the hardware encoder and push them to a
+    queue for processing by a separate thread. This minimizes time spent
+    in the callback to avoid frame drops.
     """
 
-    def __init__(
+    def __init__(self, frame_queue: Queue) -> None:
+        """Initialize DirectZMQOutput.
+
+        Args:
+            frame_queue: Queue to store encoded frames.
+
+        """
+        super().__init__()
+        self._queue = frame_queue
+
+    def outputframe(
         self,
-        zmq_socket: Optional[Socket] = None,
-        log_level: str = "INFO",
+        frame: bytes,
+        keyframe: bool = True,
+        timestamp: Optional[int] = None,
+        packet: Optional[object] = None,
+        audio: Optional[object] = None,
     ) -> None:
-        """Initialize video capture base.
+        """Push encoded frame to queue.
+
+        Called by the picamera2 encoder for each encoded frame.
+        We strictly do MINIMAL work here to return control to the ISP.
 
         Args:
-            zmq_socket: ZMQ PUB socket for broadcasting frames.
-            log_level: Logging level string.
+            frame: H.264 encoded frame bytes.
+            keyframe: Whether this is a keyframe (unused).
+            timestamp: Frame timestamp (unused).
+            packet: Packet object (unused).
+            audio: Audio data (unused).
 
         """
-        self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-        self._logger.setLevel(log_level)
-
-        self._zmq_socket = zmq_socket
-        self._running = False
-        self._capture_thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
-
-        self._width: int = 0
-        self._height: int = 0
-        self._fps: int = 30
-        self._channels: int = 3
-        self._format: VideoFormat = VideoFormat.BGR
-
-        self._frame_count: int = 0
-        self._last_fps_time: float = 0.0
-        self._measured_fps: float = 0.0
-
-        # Camera intrinsics
-        self._camera_specs: Optional[CameraSpecs] = None
-        self._resized_K: Optional[npt.NDArray[np.float64]] = None
-
-    @property
-    def camera(self) -> CameraBase:
-        """Get underlying camera supplying frame data."""
-        raise NotImplementedError("Subclasses must implement this property")
-
-    @property
-    def width(self) -> int:
-        """Get current frame width."""
-        return self._width
-
-    @property
-    def height(self) -> int:
-        """Get current frame height."""
-        return self._height
-
-    @property
-    def fps(self) -> int:
-        """Get target frames per second."""
-        return self._fps
-
-    @property
-    def channels(self) -> int:
-        """Get number of color channels."""
-        return self._channels
-
-    @property
-    def format(self) -> VideoFormat:
-        """Get pixel format."""
-        return self._format
-
-    @property
-    def is_running(self) -> bool:
-        """Check if capture is running."""
-        return self._running
-
-    @property
-    def measured_fps(self) -> float:
-        """Get measured frames per second."""
-        return self._measured_fps
-
-    def open(self) -> bool:
-        """Open the video capture device.
-
-        Returns:
-            True if successful, False otherwise.
-
-        """
-        raise NotImplementedError("Subclasses must implement open()")
-
-    def read_frame(self) -> Optional[npt.NDArray[np.uint8]]:
-        """Read a single frame from the capture device.
-
-        Returns:
-            Frame as numpy array (H, W, C) or None on error.
-
-        """
-        raise NotImplementedError("Subclasses must implement read_frame()")
-
-    def close(self) -> None:
-        """Close the video capture device and release resources."""
-        raise NotImplementedError("Subclasses must implement close()")
-
-    def set_zmq_socket(self, socket: Socket) -> None:
-        """Set the ZMQ socket for IPC publishing.
-
-        Args:
-            socket: ZMQ PUB socket.
-
-        """
-        self._zmq_socket = socket
-
-    def start(self) -> None:
-        """Start the capture thread."""
-        if self._running:
-            self._logger.warning("Capture already running")
-            return
-
-        self._running = True
-        self._frame_count = 0
-        self._last_fps_time = time.monotonic()
-        self._capture_thread = threading.Thread(
-            target=self._capture_loop,
-            name=f"{self.__class__.__name__}_capture",
-            daemon=True,
-        )
-        self._capture_thread.start()
-        self._logger.info("Video capture started")
-
-    def stop(self) -> None:
-        """Stop the capture thread."""
-        self._running = False
-        if self._capture_thread is not None:
-            self._capture_thread.join(timeout=2.0)
-            self._capture_thread = None
-        self._logger.info("Video capture stopped")
-
-    def set_resolution(self, resolution: CameraResolution) -> None:
-        """Set the camera resolution.
-
-        Args:
-            resolution: The CameraResolution to set.
-
-        """
-        raise NotImplementedError("Subclasses must implement set_resolution()")
-
-    def _capture_loop(self) -> None:
-        """Run the main capture loop in a separate thread."""
-        while self._running:
-            loop_start = time.monotonic()
-
-            frame = self.read_frame()
-            if frame is not None:
-                self._publish_frame(frame)
-                self._update_fps_stats()
-
-            # Recalculate target frame time each iteration to pick up resolution changes
-            target_frame_time = 1.0 / self._fps if self._fps > 0 else 0.033
-            elapsed = time.monotonic() - loop_start
-            sleep_time = target_frame_time - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
-    def _publish_frame(self, frame: npt.NDArray[np.uint8]) -> None:
-        """Publish frame to ZMQ IPC socket.
-
-        Args:
-            frame: Frame as numpy array (H, W, C).
-
-        """
-        if self._zmq_socket is None:
-            return
-
-        K = self.camera.K.tolist() if self.camera.K is not None else None
-        D = self.camera.D.tolist() if self.camera.D is not None else None
-        metadata = VideoMetadata(
-            ts=time.monotonic(),
-            width=frame.shape[1],
-            height=frame.shape[0],
-            channels=frame.shape[2] if frame.ndim == 3 else 1,
-            format=self._format,
-            dtype=str(frame.dtype),
-            K=K,
-            D=D,
-        )
-
         try:
-            self._zmq_socket.send_multipart(
-                [metadata.to_json().encode("utf-8"), frame.tobytes()],
-                copy=False,
-            )
-        except Exception as e:
-            self._logger.error("Failed to publish frame: %s", e)
-
-    def _update_fps_stats(self) -> None:
-        """Update FPS measurement statistics."""
-        self._frame_count += 1
-        now = time.monotonic()
-        elapsed = now - self._last_fps_time
-
-        if elapsed >= 1.0:
-            self._measured_fps = self._frame_count / elapsed
-            self._frame_count = 0
-            self._last_fps_time = now
+            # We must convert to bytes to ensure we own the data,
+            # as the underlying buffer might be reused by picamera2.
+            self._queue.put_nowait(bytes(frame))
+        except Full:
+            # If the publisher thread is too slow, we drop the frame here
+            # to preserve the latest data flow rather than blocking.
+            pass
 
 
-class OpenCVCapture(VideoCaptureBase):
-    """Video capture implementation using OpenCV.
+class Picamera2H264Capture:
+    """Video capture using Picamera2 hardware H.264 encoder.
 
-    Delegates to OpenCVCamera for camera operations and intrinsics.
-    """
-
-    def __init__(
-        self,
-        resolution: CameraResolution = CameraResolution.R1280x720at30fps,
-        udp_camera: Optional[str] = None,
-        zmq_socket: Optional[Socket] = None,
-        log_level: str = "INFO",
-    ) -> None:
-        """Initialize OpenCV capture.
-
-        Args:
-            resolution: Camera resolution to use.
-            udp_camera: Optional UDP stream URL (for Mujoco simulation).
-            zmq_socket: ZMQ PUB socket for broadcasting.
-            log_level: Logging level string.
-
-        """
-        super().__init__(zmq_socket=zmq_socket, log_level=log_level)
-        self._resolution = resolution
-        self._udp_camera = udp_camera
-        self._format = VideoFormat.RGB
-        self._camera = OpenCVCamera(log_level=log_level)
-
-    @property
-    def camera(self) -> CameraBase:
-        """Underlying camera implementation."""
-        return self._camera
-
-    @property
-    def K(self) -> npt.NDArray[np.float64]:
-        """Get camera intrinsic matrix for current resolution."""
-        return self._camera.K
-
-    @property
-    def D(self) -> npt.NDArray[np.float64]:
-        """Get camera distortion coefficients."""
-        return self._camera.D
-
-    @property
-    def camera_specs(self) -> CameraSpecs:
-        """Get camera specifications."""
-        return self._camera.camera_specs
-
-    def open(self) -> bool:
-        """Open OpenCV video capture device."""
-        try:
-            self._camera.open(udp_camera=self._udp_camera)
-            self._camera.set_resolution(self._resolution)
-
-            self._width, self._height = self._camera.resolution
-            self._fps = self._camera.framerate
-
-            self._logger.info(
-                "OpenCV capture opened: %dx%d@%dfps",
-                self._width,
-                self._height,
-                self._fps,
-            )
-            return True
-
-        except Exception as e:
-            self._logger.error("Failed to open OpenCV capture: %s", e)
-            return False
-
-    def read_frame(self) -> Optional[npt.NDArray[np.uint8]]:
-        """Read a frame from OpenCV capture."""
-        try:
-            return self._camera.read()
-        except Exception as e:
-            self._logger.error("Failed to capture frame: %s", e)
-            return None
-
-    def close(self) -> None:
-        """Close OpenCV capture and release resources."""
-        try:
-            self._camera.close()
-            self._logger.info("OpenCV capture closed")
-        except Exception as e:
-            self._logger.warning("Error closing OpenCV: %s", e)
-
-    def set_resolution(self, resolution: CameraResolution) -> None:
-        """Set the camera resolution."""
-        self._camera.set_resolution(resolution)
-        self._width, self._height = self._camera.resolution
-        self._fps = resolution.value[2]
-        self._logger.info(
-            "OpenCV resolution changed to: %dx%d@%dfps",
-            self._width,
-            self._height,
-            self._fps,
-        )
-
-
-class Picamera2Capture(VideoCaptureBase):
-    """Video capture implementation using Picamera2.
-
-    Delegates to Picamera2Camera for camera operations and intrinsics.
+    Uses Picamera2's hardware H.264 encoder for efficient encoding directly
+    on the GPU/VPU. Frames are buffered in a queue and published to ZMQ
+    via a dedicated background thread to avoid blocking the encoder.
     """
 
     def __init__(
         self,
         resolution: CameraResolution = CameraResolution.R1920x1080at60fps,
+        bitrate: int = 10_000_000,
         zmq_socket: Optional[Socket] = None,
         log_level: str = "INFO",
     ) -> None:
-        """Initialize Picamera2 capture.
+        """Initialize Picamera2 H.264 capture.
 
         Args:
             resolution: Camera resolution to use.
+            bitrate: H.264 encoding bitrate in bits/second.
             zmq_socket: ZMQ PUB socket for broadcasting.
             log_level: Logging level string.
-
         """
-        super().__init__(zmq_socket=zmq_socket, log_level=log_level)
-        self._resolution = resolution
-        self._format = VideoFormat.RGB
-        from reachy_mini.media.camera_picamera2 import Picamera2Camera
+        self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        self._logger.setLevel(log_level)
 
-        self._camera = Picamera2Camera(log_level=log_level)
+        self._resolution = resolution
+        self._bitrate = bitrate
+        self._zmq_socket = zmq_socket
+        self._log_level = log_level
+
+        self._width: int = 0
+        self._height: int = 0
+        self._fps: int = 30
+        self._encoding: str = "h264"
+
+        self._running = False
+
+        # Frame buffering and publishing
+        self._frame_queue: Queue[bytes] = Queue(maxsize=10)
+        self._publish_thread: Optional[threading.Thread] = None
+
+        self._frame_count: int = 0
+        self._last_fps_time: float = 0.0
+        self._measured_fps: float = 0.0
+
+        # Picamera2 components
+        self._camera: Any = None
+        self._encoder: Any = None
+        self._output: Any = None
+        self._picam2: Any = None
 
     @property
-    def camera(self) -> CameraBase:
-        """Underlying camera implementation."""
-        return self._camera
+    def width(self) -> int:
+        return self._width
+
+    @property
+    def height(self) -> int:
+        return self._height
+
+    @property
+    def fps(self) -> int:
+        return self._fps
+
+    @property
+    def encoding(self) -> str:
+        return self._encoding
+
+    @property
+    def bitrate(self) -> int:
+        return self._bitrate
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def measured_fps(self) -> float:
+        return self._measured_fps
 
     @property
     def K(self) -> npt.NDArray[np.float64]:
-        """Get camera intrinsic matrix for current resolution."""
+        if self._camera is None:
+            return np.eye(3, dtype=np.float64)
         return self._camera.K
 
     @property
     def D(self) -> npt.NDArray[np.float64]:
-        """Get camera distortion coefficients."""
+        if self._camera is None:
+            return np.zeros(5, dtype=np.float64)
         return self._camera.D
 
     @property
     def camera_specs(self) -> CameraSpecs:
-        """Get camera specifications."""
+        if self._camera is None:
+            raise RuntimeError("Camera not initialized")
         return self._camera.camera_specs
 
     def open(self) -> bool:
-        """Open Picamera2 capture device."""
+        """Open Picamera2 H.264 capture device."""
         try:
-            self._camera.open()
-            self._camera.set_resolution(self._resolution)
+            from reachy_mini.media.camera_picamera2 import Picamera2Camera
 
-            self._width, self._height = self._camera.resolution
-            self._fps = self._camera.framerate
+            self._camera = Picamera2Camera(log_level=self._log_level)
+            self._camera.open()
+
+            self._width, self._height = (
+                self._resolution.value[0],
+                self._resolution.value[1],
+            )
+            self._fps = self._resolution.value[2]
 
             self._logger.info(
-                "Picamera2 capture opened: %dx%d@%dfps",
+                "Picamera2 H.264 capture opened: %dx%d@%dfps, bitrate=%d",
                 self._width,
                 self._height,
                 self._fps,
+                self._bitrate,
             )
             return True
 
         except Exception as e:
-            self._logger.error("Failed to open Picamera2 capture: %s", e)
+            self._logger.error("Failed to open Picamera2 H.264 capture: %s", e)
             return False
 
-    def read_frame(self) -> Optional[npt.NDArray[np.uint8]]:
-        """Read a frame from Picamera2."""
+    def set_zmq_socket(self, socket: Socket) -> None:
+        self._zmq_socket = socket
+
+    def start(self) -> None:
+        """Start the H.264 encoder and frame publishing."""
+        if self._running:
+            self._logger.warning("H.264 capture already running")
+            return
+
+        if self._camera is None or self._camera.picam2 is None:
+            self._logger.error("Camera not opened")
+            return
+
+        if self._zmq_socket is None:
+            self._logger.error("ZMQ socket not set")
+            return
+
         try:
-            return self._camera.read()
+            from picamera2.encoders import H264Encoder
+
+            self._picam2 = self._camera.picam2
+
+            # Initialize the output with our queue
+            # We clear the queue first to ensure we don't start with stale frames
+            while not self._frame_queue.empty():
+                try:
+                    self._frame_queue.get_nowait()
+                except Empty:
+                    break
+
+            self._output = DirectZMQOutput(frame_queue=self._frame_queue)
+
+            if self._camera._started:
+                self._picam2.stop()
+                self._camera._started = False
+
+            frame_duration_us = int(1_000_000 / self._fps)
+            config = self._picam2.create_video_configuration(
+                main={
+                    "size": (self._width, self._height),
+                    "format": "RGB888",
+                },
+                controls={
+                    "FrameDurationLimits": (frame_duration_us, frame_duration_us),
+                    "NoiseReductionMode": 0,
+                },
+                buffer_count=6,
+            )
+            self._picam2.configure(config)
+            self._picam2.start()
+            self._camera._started = True
+
+            self._encoder = H264Encoder(bitrate=self._bitrate)
+            self._picam2.start_encoder(self._encoder, self._output)
+
+            # Start the publishing thread
+            self._running = True
+            self._publish_thread = threading.Thread(
+                target=self._publish_loop, name="VideoPublish", daemon=True
+            )
+            self._publish_thread.start()
+
+            self._frame_count = 0
+            self._last_fps_time = time.monotonic()
+            self._logger.info("Picamera2 H.264 capture started")
+
         except Exception as e:
-            self._logger.error("Failed to capture frame: %s", e)
-            return None
+            self._logger.error("Failed to start H.264 encoder: %s", e)
+            self._running = False
+
+    def _publish_loop(self) -> None:
+        """Consumer loop: Pulls frames from queue and publishes to ZMQ.
+
+        This runs in a separate thread to isolate the camera callback from
+        ZMQ/JSON overhead and GIL contention.
+        """
+        while self._running:
+            try:
+                # Get frame from queue (blocking with short timeout to check running flag)
+                frame_bytes = self._frame_queue.get(timeout=0.1)
+
+                # Perform heavy lifting here: metadata creation + serialization
+                # This happens outside the camera callback
+                metadata = EncodedVideoMetadata(
+                    ts=time.monotonic(),
+                    width=self._width,
+                    height=self._height,
+                    encoding="h264",
+                    quality=0,
+                    bitrate=self._bitrate,
+                    K=self.K.tolist() if self.K is not None else None,
+                    D=self.D.tolist() if self.D is not None else None,
+                )
+
+                if self._zmq_socket:
+                    self._zmq_socket.send_multipart(
+                        [metadata.to_json().encode("utf-8"), frame_bytes],
+                        copy=False,
+                    )
+
+                # Update FPS stats
+                self._frame_count += 1
+                now = time.monotonic()
+                elapsed = now - self._last_fps_time
+                if elapsed >= 1.0:
+                    self._measured_fps = self._frame_count / elapsed
+                    self._frame_count = 0
+                    self._last_fps_time = now
+                    # Log infrequently to avoid spam
+                    if self._measured_fps < self._fps * 0.8:
+                        self._logger.warning(
+                            "Low publish FPS: %.2f (target: %d)",
+                            self._measured_fps,
+                            self._fps,
+                        )
+
+            except Empty:
+                continue
+            except Exception as e:
+                self._logger.error("Error in video publish loop: %s", e)
+
+    def stop(self) -> None:
+        """Stop the H.264 encoder and publisher."""
+        self._running = False
+
+        # Stop publisher thread first
+        if self._publish_thread is not None:
+            self._publish_thread.join(timeout=2.0)
+            self._publish_thread = None
+
+        if self._picam2 is not None:
+            try:
+                if self._encoder is not None:
+                    self._picam2.stop_encoder()
+                    self._encoder = None
+                self._picam2.stop()
+            except Exception as e:
+                self._logger.warning("Error stopping encoder: %s", e)
+
+        self._output = None
+        self._logger.info("Picamera2 H.264 capture stopped")
 
     def close(self) -> None:
         """Close Picamera2 and release resources."""
-        try:
-            self._camera.close()
-            self._logger.info("Picamera2 capture closed")
-        except Exception as e:
-            self._logger.warning("Error closing Picamera2: %s", e)
+        self.stop()
+        if self._camera is not None:
+            try:
+                self._camera.close()
+            except Exception as e:
+                self._logger.warning("Error closing Picamera2: %s", e)
+            self._camera = None
+        self._picam2 = None
+        self._logger.info("Picamera2 H.264 capture closed")
 
     def set_resolution(self, resolution: CameraResolution) -> None:
         """Set the camera resolution."""
-        self._camera.set_resolution(resolution)
-        self._width, self._height = self._camera.resolution
+        was_running = self._running
+        if was_running:
+            self.stop()
+
+        self._resolution = resolution
+        self._width = resolution.value[0]
+        self._height = resolution.value[1]
         self._fps = resolution.value[2]
+
+        if self._camera is not None:
+            self._camera.set_resolution(resolution)
+
+        if was_running:
+            self.start()
+
         self._logger.info(
-            "Picamera2 resolution changed to: %dx%d@%dfps",
+            "Picamera2 H.264 resolution changed to: %dx%d@%dfps",
             self._width,
             self._height,
             self._fps,
@@ -1230,9 +1197,7 @@ class MediaCapture:
             return
 
         if self._video_capture is None:
-            self._logger.warning(
-                "Video capture not provided - video will be disabled"
-            )
+            self._logger.warning("Video capture not provided - video will be disabled")
             return
 
         if self._video_socket is not None:
@@ -1247,9 +1212,7 @@ class MediaCapture:
             return
 
         if self._audio_capture is None:
-            self._logger.warning(
-                "Audio capture not provided - audio will be disabled"
-            )
+            self._logger.warning("Audio capture not provided - audio will be disabled")
             return
 
         if self._audio_socket is not None:

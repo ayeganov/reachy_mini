@@ -4,6 +4,9 @@ This module provides a VideoCaptureProtocol implementation that renders
 frames from MuJoCo simulation and publishes them to ZMQ IPC.
 """
 
+import logging
+import threading
+import time
 from typing import Optional
 
 import cv2
@@ -18,7 +21,7 @@ from reachy_mini.media.camera_constants import (
     CameraSpecs,
     MujocoCameraSpecs,
 )
-from reachy_mini.media.capture import VideoCaptureBase, VideoFormat
+from reachy_mini.media.capture import VideoFormat, VideoMetadata
 
 CAMERA_REACHY = "eye_camera"
 CAMERA_STUDIO_CLOSE = "studio_close"
@@ -137,11 +140,11 @@ class MujocoCamera(CameraBase):
         self.logger.info("MuJoCo camera '%s' closed", self._camera_name)
 
 
-class MujocoVideoCapture(VideoCaptureBase):
+class MujocoVideoCapture:
     """Video capture implementation that renders from MuJoCo simulation.
 
     Implements VideoCaptureProtocol for use with MediaCapture pipeline.
-    Frames are rendered from MuJoCo's virtual camera and published to ZMQ.
+    Frames are rendered from MuJoCo's virtual camera and published to ZMQ IPC.
     """
 
     def __init__(
@@ -162,7 +165,8 @@ class MujocoVideoCapture(VideoCaptureBase):
             log_level: Logging level.
 
         """
-        super().__init__(zmq_socket=zmq_socket, log_level=log_level)
+        self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        self._logger.setLevel(log_level)
 
         self._mujoco_camera = MujocoCamera(
             model=model,
@@ -171,12 +175,58 @@ class MujocoVideoCapture(VideoCaptureBase):
             log_level=log_level,
         )
 
-        self._format = VideoFormat.BGR  # MuJoCo renders RGB, converted to BGR
+        self._zmq_socket = zmq_socket
+        self._format = VideoFormat.BGR
+
+        # Capture state
+        self._width: int = 0
+        self._height: int = 0
+        self._fps: int = 30
+        self._channels: int = 3
+        self._running = False
+
+        # Capture thread
+        self._capture_thread: Optional[threading.Thread] = None
+
+        # FPS measurement
+        self._frame_count: int = 0
+        self._last_fps_time: float = 0.0
+        self._measured_fps: float = 0.0
 
     @property
-    def camera(self) -> CameraBase:
-        """Get underlying MuJoCo camera."""
-        return self._mujoco_camera
+    def width(self) -> int:
+        """Get current frame width."""
+        return self._width
+
+    @property
+    def height(self) -> int:
+        """Get current frame height."""
+        return self._height
+
+    @property
+    def fps(self) -> int:
+        """Get target frames per second."""
+        return self._fps
+
+    @property
+    def channels(self) -> int:
+        """Get number of color channels."""
+        return self._channels
+
+    @property
+    def format(self) -> VideoFormat:
+        """Get pixel format."""
+        return self._format
+
+    @property
+    def is_running(self) -> bool:
+        """Check if capture is running."""
+        return self._running
+
+    @property
+    def measured_fps(self) -> float:
+        """Get measured frames per second."""
+        return self._measured_fps
 
     @property
     def K(self) -> npt.NDArray[np.float64]:
@@ -198,6 +248,15 @@ class MujocoVideoCapture(VideoCaptureBase):
         if self._mujoco_camera.camera_specs is not None:
             return self._mujoco_camera.camera_specs
         return MujocoCameraSpecs()
+
+    def set_zmq_socket(self, socket: Socket) -> None:
+        """Set the ZMQ socket for IPC publishing.
+
+        Args:
+            socket: ZMQ PUB socket.
+
+        """
+        self._zmq_socket = socket
 
     def open(self) -> bool:
         """Open MuJoCo virtual camera.
@@ -230,8 +289,37 @@ class MujocoVideoCapture(VideoCaptureBase):
         """Read a frame from MuJoCo renderer."""
         return self._mujoco_camera.read()
 
+    def start(self) -> None:
+        """Start the capture thread."""
+        if self._running:
+            self._logger.warning("Capture already running")
+            return
+
+        self._running = True
+        self._frame_count = 0
+        self._last_fps_time = time.monotonic()
+
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop,
+            name="MujocoVideoCapture",
+            daemon=True,
+        )
+        self._capture_thread.start()
+        self._logger.info("MuJoCo capture thread started")
+
+    def stop(self) -> None:
+        """Stop the capture thread."""
+        self._running = False
+
+        if self._capture_thread is not None:
+            self._capture_thread.join(timeout=2.0)
+            self._capture_thread = None
+
+        self._logger.info("MuJoCo capture thread stopped")
+
     def close(self) -> None:
         """Close MuJoCo capture."""
+        self.stop()
         self._mujoco_camera.close()
         self._logger.info("MuJoCo capture closed")
 
@@ -252,3 +340,62 @@ class MujocoVideoCapture(VideoCaptureBase):
                 resolution.name,
                 current.name if current else "default",
             )
+
+    def _capture_loop(self) -> None:
+        """Capture loop that reads frames and publishes to ZMQ IPC."""
+        target_interval = 1.0 / self._fps if self._fps > 0 else 1.0 / 30.0
+
+        while self._running:
+            loop_start = time.monotonic()
+
+            frame = self.read_frame()
+            if frame is not None and self._zmq_socket is not None:
+                self._publish_frame(frame)
+
+            # Update FPS measurement
+            self._frame_count += 1
+            now = time.monotonic()
+            elapsed = now - self._last_fps_time
+            if elapsed >= 1.0:
+                self._measured_fps = self._frame_count / elapsed
+                self._frame_count = 0
+                self._last_fps_time = now
+
+            # Sleep to maintain target FPS
+            loop_duration = time.monotonic() - loop_start
+            sleep_time = target_interval - loop_duration
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def _publish_frame(self, frame: npt.NDArray[np.uint8]) -> None:
+        """Publish frame to ZMQ IPC socket.
+
+        Args:
+            frame: BGR frame to publish.
+
+        """
+        if self._zmq_socket is None:
+            return
+
+        try:
+            K_list = self.K.tolist() if self.K is not None else None
+            D_list = self.D.tolist() if self.D is not None else None
+
+            metadata = VideoMetadata(
+                ts=time.monotonic(),
+                width=frame.shape[1],
+                height=frame.shape[0],
+                channels=frame.shape[2] if frame.ndim > 2 else 1,
+                format=self._format,
+                dtype=str(frame.dtype),
+                K=K_list,
+                D=D_list,
+            )
+
+            self._zmq_socket.send_multipart(
+                [metadata.to_json().encode("utf-8"), frame.tobytes()],
+                copy=False,
+            )
+
+        except Exception as e:
+            self._logger.error("Failed to publish frame: %s", e)
