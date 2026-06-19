@@ -9,11 +9,29 @@ from reachy_mini.daemon.app import bg_job_register
 
 from ...daemon import Daemon, DaemonStatus
 from ..dependencies import get_daemon
+from . import tracking
 
 router = APIRouter(
     prefix="/daemon",
 )
 busy_lock = threading.Lock()
+
+
+def _start_wireless_visual_servo(
+    request: Request,
+    daemon: Daemon,
+    logger: logging.Logger,
+) -> None:
+    """Start tracking after daemon startup when wireless mode owns it."""
+    if not request.app.state.args.wireless_version:
+        return
+
+    backend = daemon.backend
+    if backend is None:
+        logger.warning("Visual tracking was not started: backend is not running.")
+        return
+
+    tracking.start_visual_servo(request.app.state, backend)
 
 
 @router.post("/start")
@@ -42,6 +60,7 @@ async def start_daemon(
                 use_audio=request.app.state.args.use_audio,
                 hardware_config_filepath=request.app.state.args.hardware_config_filepath,
             )
+            _start_wireless_visual_servo(request, daemon, logger)
 
     job_id = bg_job_register.run_command("daemon-start", start)
     return {"job_id": job_id}
@@ -49,7 +68,9 @@ async def start_daemon(
 
 @router.post("/stop")
 async def stop_daemon(
-    goto_sleep: bool, daemon: Daemon = Depends(get_daemon)
+    request: Request,
+    goto_sleep: bool,
+    daemon: Daemon = Depends(get_daemon),
 ) -> dict[str, str]:
     """Stop the daemon, optionally putting the robot to sleep."""
     if busy_lock.locked():
@@ -57,6 +78,7 @@ async def stop_daemon(
 
     async def stop(logger: logging.Logger) -> None:
         with busy_lock:
+            tracking.stop_visual_servo(request.app.state)
             await daemon.stop(goto_sleep_on_stop=goto_sleep)
 
     job_id = bg_job_register.run_command("daemon-stop", stop)
@@ -73,7 +95,9 @@ async def restart_daemon(
 
     async def restart(logger: logging.Logger) -> None:
         with busy_lock:
+            tracking.stop_visual_servo(request.app.state)
             await daemon.restart()
+            _start_wireless_visual_servo(request, daemon, logger)
 
     job_id = bg_job_register.run_command("daemon-restart", restart)
     return {"job_id": job_id}

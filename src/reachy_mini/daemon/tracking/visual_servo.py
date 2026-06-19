@@ -10,14 +10,15 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import numpy.typing as npt
 from scipy.spatial.transform import Rotation as R
 
-if False:  # pragma: no cover
+if TYPE_CHECKING:
     from reachy_mini.daemon.backend.abstract import Backend
 
 
@@ -202,12 +203,16 @@ class JointCommandLimiter:
         config: VisualServoConfig | None = None,
     ) -> None:
         """Initialize the limiter."""
-        if limits.shape != (7, 2) and limits.shape[1] != 2:
+        if len(limits.shape) != 2 or limits.shape[1] != 2:
             raise ValueError("limits must have shape (n, 2)")
         self.limits = limits.astype(np.float64)
         self.config = config or VisualServoConfig()
-        self._velocity = np.zeros(self.limits.shape[0], dtype=np.float64)
-        self._acceleration = np.zeros(self.limits.shape[0], dtype=np.float64)
+        self._velocity: npt.NDArray[np.float64] = np.zeros(
+            self.limits.shape[0], dtype=np.float64
+        )
+        self._acceleration: npt.NDArray[np.float64] = np.zeros(
+            self.limits.shape[0], dtype=np.float64
+        )
         self._last_command: npt.NDArray[np.float64] | None = None
 
     def reset(self, command: npt.NDArray[np.float64] | None = None) -> None:
@@ -238,8 +243,8 @@ class JointCommandLimiter:
 
         if self._last_command is None:
             self._last_command = current.copy()
-            self._velocity = np.zeros_like(current)
-            self._acceleration = np.zeros_like(current)
+            self._velocity = np.zeros(self.limits.shape[0], dtype=np.float64)
+            self._acceleration = np.zeros(self.limits.shape[0], dtype=np.float64)
 
         reference = self._last_command
         error = desired - reference
@@ -275,9 +280,15 @@ class JointCommandLimiter:
         crossing_target = np.sign(desired - command) != np.sign(error)
         close_to_target = np.abs(error) < 1e-6
         should_snap = crossing_target | close_to_target
-        command = np.where(should_snap, desired, command)
-        velocity = np.where(should_snap, 0.0, velocity)
-        acceleration = np.where(should_snap, 0.0, acceleration)
+        command = cast(npt.NDArray[np.float64], np.where(should_snap, desired, command))
+        velocity = cast(
+            npt.NDArray[np.float64],
+            np.where(should_snap, 0.0, velocity).astype(np.float64),
+        )
+        acceleration = cast(
+            npt.NDArray[np.float64],
+            np.where(should_snap, 0.0, acceleration).astype(np.float64),
+        )
         command = self.clamp(command)
         self._last_command = command.copy()
         self._velocity = velocity
@@ -304,7 +315,6 @@ class VisualServoController:
         self.logger = logger or logging.getLogger(__name__)
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._lock = threading.Lock()
         self._last_command: npt.NDArray[np.float64] | None = None
         self._last_reason = "not_started"
         self._last_detection_time: float | None = None
@@ -312,6 +322,7 @@ class VisualServoController:
         self._command_count = 0
         self._error: str | None = None
         self._look_at_reference_pose: npt.NDArray[np.float64] | None = None
+        self._previous_automatic_body_yaw: bool | None = None
 
     @property
     def running(self) -> bool:
@@ -337,6 +348,10 @@ class VisualServoController:
         if self.config.automatic_body_yaw and hasattr(
             self.backend.head_kinematics, "set_automatic_body_yaw"
         ):
+            previous = getattr(self.backend.head_kinematics, "automatic_body_yaw", None)
+            self._previous_automatic_body_yaw = (
+                bool(previous) if isinstance(previous, bool) else None
+            )
             self.backend.head_kinematics.set_automatic_body_yaw(True)
         self._thread = threading.Thread(
             target=self._run_loop,
@@ -348,11 +363,28 @@ class VisualServoController:
     def stop(self) -> None:
         """Stop the local servo loop."""
         self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                self._last_reason = "stop_timeout"
+                self._error = "Visual servo thread did not stop within 2.0s."
+                return
         self._thread = None
         self._look_at_reference_pose = None
+        self._restore_automatic_body_yaw()
         self._last_reason = "stopped"
+        self._error = None
+
+    def _restore_automatic_body_yaw(self) -> None:
+        """Restore the kinematics yaw mode owned by this controller."""
+        if self._previous_automatic_body_yaw is None:
+            return
+        if hasattr(self.backend.head_kinematics, "set_automatic_body_yaw"):
+            self.backend.head_kinematics.set_automatic_body_yaw(
+                self._previous_automatic_body_yaw
+            )
+        self._previous_automatic_body_yaw = None
 
     def status(self) -> dict[str, Any]:
         """Return a JSON-serializable status dictionary."""
@@ -404,55 +436,85 @@ class VisualServoController:
         """
         dt = (1.0 / self.config.control_frequency) if dt is None else dt
 
-        if getattr(self.backend, "is_move_running", False):
-            self._last_reason = "move_running"
-            return False
-
-        current_joints = np.array(
-            self.backend.get_present_head_joint_positions(), dtype=np.float64
-        )
-        current_pose = np.array(self.backend.get_present_head_pose(), dtype=np.float64)
         look_at = self.look_at_buffer.fresh(self.config)
-        if look_at is not None:
-            self._last_detection_time = look_at.timestamp
-            self._last_target_type = "look_at"
-            if self._look_at_reference_pose is None:
-                self._look_at_reference_pose = current_pose.copy()
-            desired_joints = self._ik_from_target_world(
-                target_world=np.array([look_at.x, look_at.y, look_at.z]),
-                current_head_pose=self._look_at_reference_pose,
-                body_yaw=float(current_joints[0]),
-            )
-        else:
+        detection = None
+        if look_at is None:
             self._look_at_reference_pose = None
             detection = self.buffer.fresh(self.config)
             if detection is None:
                 self._last_reason = "no_fresh_detection"
                 return False
 
-            self._last_detection_time = detection.timestamp
-            self._last_target_type = "detection"
-            pixel = self.filter.update(detection)
-            desired_joints = self._reachable_joints_from_pixel(
-                pixel=pixel,
-                detection=detection,
-                current_head_pose=current_pose,
-                body_yaw=float(current_joints[0]),
-            )
-        if desired_joints is None:
-            self._last_reason = "ik_failed"
+        release_motion_guard = self._try_acquire_motion_guard()
+        if release_motion_guard is None:
+            self._last_reason = "move_running"
             return False
 
-        command = self.limiter.limit(
-            desired=np.array(desired_joints, dtype=np.float64),
-            current=current_joints,
-            dt=dt,
-        )
-        self.backend.set_target_head_joint_positions(command)
-        self._last_command = command.copy()
-        self._command_count += 1
-        self._last_reason = "commanded"
-        return True
+        try:
+            current_joints = np.array(
+                self.backend.get_present_head_joint_positions(), dtype=np.float64
+            )
+            current_pose = np.array(
+                self.backend.get_present_head_pose(), dtype=np.float64
+            )
+            if look_at is not None:
+                self._last_detection_time = look_at.timestamp
+                self._last_target_type = "look_at"
+                if self._look_at_reference_pose is None:
+                    self._look_at_reference_pose = current_pose.copy()
+                desired_joints = self._ik_from_target_world(
+                    target_world=np.array([look_at.x, look_at.y, look_at.z]),
+                    current_head_pose=self._look_at_reference_pose,
+                    body_yaw=float(current_joints[0]),
+                )
+            else:
+                assert detection is not None
+                self._last_detection_time = detection.timestamp
+                self._last_target_type = "detection"
+                pixel = self.filter.update(detection)
+                desired_joints = self._reachable_joints_from_pixel(
+                    pixel=pixel,
+                    detection=detection,
+                    current_head_pose=current_pose,
+                    body_yaw=float(current_joints[0]),
+                )
+            if desired_joints is None:
+                self._last_reason = "ik_failed"
+                return False
+
+            command = self.limiter.limit(
+                desired=np.array(desired_joints, dtype=np.float64),
+                current=current_joints,
+                dt=dt,
+            )
+            self.backend.set_target_head_joint_positions(command)
+            self._last_command = command.copy()
+            self._command_count += 1
+            self._last_reason = "commanded"
+            return True
+        finally:
+            release_motion_guard()
+
+    def _try_acquire_motion_guard(self) -> Callable[[], None] | None:
+        """Acquire backend motion ownership for one servo step."""
+        try_start_move = getattr(self.backend, "_try_start_move", None)
+        end_move = getattr(self.backend, "_end_move", None)
+        if callable(try_start_move) and callable(end_move):
+            if not bool(try_start_move()):
+                return None
+
+            def release() -> None:
+                end_move()
+
+            return release
+
+        if getattr(self.backend, "is_move_running", False):
+            return None
+
+        def noop() -> None:
+            return None
+
+        return noop
 
     def _ik_from_target_world(
         self,

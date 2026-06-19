@@ -8,7 +8,7 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Request, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, FiniteFloat
 
 from ....daemon.backend.abstract import Backend
 from ....daemon.tracking.visual_servo import (
@@ -25,13 +25,13 @@ router = APIRouter(prefix="/tracking")
 class TrackingDetectionRequest(BaseModel):
     """2D detection produced by an external perception model."""
 
-    u: float
-    v: float
-    timestamp: float | None = None
-    confidence: float = 1.0
+    u: FiniteFloat = Field(ge=0.0)
+    v: FiniteFloat = Field(ge=0.0)
+    timestamp: FiniteFloat | None = None
+    confidence: FiniteFloat = Field(default=1.0, ge=0.0, le=1.0)
     frame_id: int | None = None
-    width: int = 1280
-    height: int = 720
+    width: int = Field(default=1280, gt=0)
+    height: int = Field(default=720, gt=0)
 
     def to_detection(self) -> TrackingDetection:
         """Convert request into a TrackingDetection."""
@@ -51,11 +51,11 @@ class TrackingDetectionRequest(BaseModel):
 class TrackingLookAtRequest(BaseModel):
     """Metric 3D look-at target in the robot/world frame."""
 
-    x: float
-    y: float
-    z: float
-    timestamp: float | None = None
-    confidence: float = 1.0
+    x: FiniteFloat
+    y: FiniteFloat
+    z: FiniteFloat
+    timestamp: FiniteFloat | None = None
+    confidence: FiniteFloat = Field(default=1.0, ge=0.0, le=1.0)
     frame_id: int | None = None
 
     def to_target(self) -> TrackingLookAtTarget:
@@ -75,15 +75,17 @@ class TrackingLookAtRequest(BaseModel):
 class VisualServoConfigRequest(BaseModel):
     """Runtime configuration for the visual servo loop."""
 
-    control_frequency: float = Field(default=50.0, gt=0.0)
-    min_confidence: float = Field(default=0.3, ge=0.0, le=1.0)
-    max_detection_age: float = Field(default=0.35, gt=0.0)
-    smoothing_alpha: float = Field(default=0.35, gt=0.0, le=1.0)
-    lookahead_distance: float = Field(default=0.5, gt=0.0)
-    joint_safety_margin: float = Field(default=0.08726646259971647, ge=0.0)
-    max_joint_velocity: float = Field(default=1.3962634015954636, gt=0.0)
-    max_joint_acceleration: float = Field(default=5.235987755982989, gt=0.0)
-    max_joint_jerk: float = Field(default=34.90658503988659, gt=0.0)
+    control_frequency: FiniteFloat = Field(default=50.0, gt=0.0)
+    min_confidence: FiniteFloat = Field(default=0.3, ge=0.0, le=1.0)
+    max_detection_age: FiniteFloat = Field(default=0.35, gt=0.0)
+    smoothing_alpha: FiniteFloat = Field(default=0.35, gt=0.0, le=1.0)
+    lookahead_distance: FiniteFloat = Field(default=0.5, gt=0.0)
+    joint_safety_margin: FiniteFloat = Field(
+        default=0.08726646259971647, ge=0.0
+    )
+    max_joint_velocity: FiniteFloat = Field(default=1.3962634015954636, gt=0.0)
+    max_joint_acceleration: FiniteFloat = Field(default=5.235987755982989, gt=0.0)
+    max_joint_jerk: FiniteFloat = Field(default=34.90658503988659, gt=0.0)
     automatic_body_yaw: bool = True
 
     def to_config(self) -> VisualServoConfig:
@@ -92,14 +94,36 @@ class VisualServoConfigRequest(BaseModel):
 
 
 def _get_or_create_visual_servo(
-    request: Request,
+    app_state: Any,
     backend: Backend,
 ) -> VisualServoController:
-    controller = getattr(request.app.state, "visual_servo", None)
-    if controller is None or controller.backend is not backend:
+    controller = getattr(app_state, "visual_servo", None)
+    if isinstance(controller, VisualServoController) and controller.backend is backend:
+        return controller
+    if controller is not None:
+        stop_visual_servo(app_state)
+    controller = getattr(app_state, "visual_servo", None)
+    if controller is None:
         controller = VisualServoController(backend=backend)
-        request.app.state.visual_servo = controller
+        app_state.visual_servo = controller
     assert isinstance(controller, VisualServoController)
+    return controller
+
+
+def stop_visual_servo(app_state: Any) -> Any | None:
+    """Stop and detach the app-owned visual servo controller."""
+    controller = getattr(app_state, "visual_servo", None)
+    if controller is None:
+        return None
+
+    stop = getattr(controller, "stop", None)
+    if callable(stop):
+        stop()
+
+    if bool(getattr(controller, "running", False)):
+        raise RuntimeError("Visual servo controller did not stop within timeout.")
+
+    app_state.visual_servo = None
     return controller
 
 
@@ -109,9 +133,8 @@ def start_visual_servo(
     config: VisualServoConfig | None = None,
 ) -> VisualServoController:
     """Start a fresh visual servo controller for the app backend."""
-    previous = getattr(app_state, "visual_servo", None)
-    if isinstance(previous, VisualServoController):
-        previous.stop()
+    if getattr(app_state, "visual_servo", None) is not None:
+        stop_visual_servo(app_state)
 
     controller = VisualServoController(
         backend=backend,
@@ -127,7 +150,7 @@ def get_visual_servo(
     backend: Backend = Depends(get_backend),
 ) -> VisualServoController:
     """Get daemon-local visual servo controller."""
-    return _get_or_create_visual_servo(request, backend)
+    return _get_or_create_visual_servo(request.app.state, backend)
 
 
 @router.get("/status")
@@ -155,10 +178,11 @@ async def start(
 
 @router.post("/stop")
 async def stop(
+    request: Request,
     controller: VisualServoController = Depends(get_visual_servo),
 ) -> dict[str, Any]:
     """Stop the robot-side visual servo controller."""
-    controller.stop()
+    stop_visual_servo(request.app.state)
     return controller.status()
 
 
@@ -189,7 +213,7 @@ async def ws_detections(
 ) -> None:
     """Accept streamed 2D detections over a WebSocket."""
     await websocket.accept()
-    controller = _get_or_create_visual_servo(websocket, backend)
+    controller = _get_or_create_visual_servo(websocket.app.state, backend)
     try:
         while True:
             data = await websocket.receive_text()

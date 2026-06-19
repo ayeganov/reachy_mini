@@ -194,6 +194,7 @@ class Backend:
             self.run()
         except Exception as e:
             self.error = str(e)
+            self.ready.clear()
             self.close()
             raise e
 

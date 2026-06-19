@@ -10,6 +10,7 @@ managing the robot's state.
 import argparse
 import asyncio
 import logging
+import math
 import types
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -18,8 +19,9 @@ from typing import Any, AsyncGenerator
 
 import uvicorn
 from fastapi import APIRouter, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -86,6 +88,19 @@ class Args:
     localhost_only: bool | None = None
 
 
+def _json_safe_validation_detail(value: Any) -> Any:
+    """Return validation detail content that JSONResponse can serialize."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, list):
+        return [_json_safe_validation_detail(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _json_safe_validation_detail(item) for key, item in value.items()
+        }
+    return value
+
+
 def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> FastAPI:
     """Create and configure the FastAPI application."""
     localhost_only = (
@@ -127,10 +142,9 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
             yield
         finally:
             try:
-                visual_servo = getattr(app.state, "visual_servo", None)
-                if visual_servo is not None:
+                if getattr(app.state, "visual_servo", None) is not None:
                     logging.info("Shutting down visual servo controller...")
-                    visual_servo.stop()
+                    tracking.stop_visual_servo(app.state)
             except Exception as e:
                 logging.exception("Error stopping visual servo controller: %s", e)
 
@@ -152,6 +166,16 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
     app = FastAPI(
         lifespan=lifespan,
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_exception_handler(
+        _request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": _json_safe_validation_detail(exc.errors())},
+        )
 
     app.state.args = args
     app.state.daemon = Daemon(

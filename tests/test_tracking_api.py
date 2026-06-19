@@ -1,8 +1,11 @@
-from fastapi.testclient import TestClient
 import numpy as np
+from fastapi.testclient import TestClient
 
+from reachy_mini.daemon.app import bg_job_register
 from reachy_mini.daemon.app.dependencies import get_backend
 from reachy_mini.daemon.app.main import Args, create_app
+from reachy_mini.daemon.app.routers.tracking import _get_or_create_visual_servo
+from reachy_mini.daemon.tracking.visual_servo import VisualServoController
 
 
 def test_tracking_status_route_is_registered() -> None:
@@ -56,6 +59,92 @@ def test_tracking_look_at_route_accepts_metric_target() -> None:
     assert body["accepted_look_at_targets"] == 1
 
 
+def test_tracking_detection_rejects_invalid_camera_dimensions() -> None:
+    class FakeKinematics:
+        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
+            self.automatic_body_yaw = automatic_body_yaw
+
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            return np.full(7, 0.2)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command = command
+
+    backend = FakeBackend()
+    app = create_app(Args(autostart=False))
+    app.dependency_overrides[get_backend] = lambda: backend
+
+    with TestClient(app) as client:
+        client.post("/api/tracking/start", json={})
+        response = client.post(
+            "/api/tracking/detection",
+            json={"u": 100.0, "v": 100.0, "width": 0, "height": 720},
+        )
+
+    assert response.status_code == 422
+
+
+def test_tracking_api_rejects_non_finite_values() -> None:
+    class FakeKinematics:
+        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
+            self.automatic_body_yaw = automatic_body_yaw
+
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            return np.full(7, 0.2)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command = command
+
+    backend = FakeBackend()
+    app = create_app(Args(autostart=False))
+    app.dependency_overrides[get_backend] = lambda: backend
+
+    with TestClient(app) as client:
+        detection_response = client.post(
+            "/api/tracking/detection",
+            content='{"u": Infinity, "v": 100.0, "width": 1280, "height": 720}',
+            headers={"Content-Type": "application/json"},
+        )
+        look_at_response = client.post(
+            "/api/tracking/look_at",
+            content='{"x": 0.5, "y": Infinity, "z": 0.15}',
+            headers={"Content-Type": "application/json"},
+        )
+        config_response = client.post(
+            "/api/tracking/start",
+            content='{"max_joint_velocity": Infinity}',
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert detection_response.status_code == 422
+    assert look_at_response.status_code == 422
+    assert config_response.status_code == 422
+
+
 def test_wireless_startup_starts_visual_tracking() -> None:
     class FakeKinematics:
         def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
@@ -107,3 +196,184 @@ def test_wireless_startup_starts_visual_tracking() -> None:
         assert app.state.visual_servo.running
 
     assert daemon.stopped
+
+
+def test_daemon_stop_route_stops_visual_tracking_before_backend_stop(
+    monkeypatch: object,
+) -> None:
+    class FakeVisualServo:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    class FakeDaemon:
+        def __init__(self, visual_servo: FakeVisualServo) -> None:
+            self.visual_servo = visual_servo
+            self.stopped_after_visual_servo = False
+
+        async def stop(self, **kwargs: object) -> None:
+            self.stopped_after_visual_servo = self.visual_servo.stopped
+
+    jobs = []
+
+    def capture_job(command: str, coro_func: object, *args: object) -> str:
+        jobs.append((coro_func, args))
+        return "job-id"
+
+    monkeypatch.setattr(bg_job_register, "run_command", capture_job)
+
+    visual_servo = FakeVisualServo()
+    daemon = FakeDaemon(visual_servo)
+    app = create_app(Args(autostart=False))
+    app.state.visual_servo = visual_servo
+    app.dependency_overrides[
+        __import__(
+            "reachy_mini.daemon.app.dependencies",
+            fromlist=["get_daemon"],
+        ).get_daemon
+    ] = lambda: daemon
+
+    with TestClient(app) as client:
+        response = client.post("/api/daemon/stop?goto_sleep=false")
+
+    assert response.status_code == 200
+    assert response.json() == {"job_id": "job-id"}
+    assert len(jobs) == 1
+
+    import asyncio
+    import logging
+
+    coro_func, args = jobs[0]
+    asyncio.run(coro_func(*args, logger=logging.getLogger("test")))
+
+    assert visual_servo.stopped
+    assert app.state.visual_servo is None
+    assert daemon.stopped_after_visual_servo
+
+
+def test_daemon_restart_route_replaces_visual_tracking_after_backend_restart(
+    monkeypatch: object,
+) -> None:
+    class FakeKinematics:
+        automatic_body_yaw = False
+
+        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
+            self.automatic_body_yaw = automatic_body_yaw
+
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            return np.zeros(7)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command = command
+
+    class FakeVisualServo:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    class FakeDaemon:
+        def __init__(self, visual_servo: FakeVisualServo) -> None:
+            self.backend = FakeBackend()
+            self.visual_servo = visual_servo
+            self.restarted_after_visual_servo = False
+
+        async def restart(self) -> None:
+            self.restarted_after_visual_servo = self.visual_servo.stopped
+            self.backend = FakeBackend()
+
+        async def stop(self, **kwargs: object) -> None:
+            pass
+
+    jobs = []
+
+    def capture_job(command: str, coro_func: object, *args: object) -> str:
+        jobs.append((coro_func, args))
+        return "job-id"
+
+    monkeypatch.setattr(bg_job_register, "run_command", capture_job)
+
+    visual_servo = FakeVisualServo()
+    daemon = FakeDaemon(visual_servo)
+    app = create_app(Args(autostart=False, wireless_version=False))
+    app.state.args.wireless_version = True
+    app.state.visual_servo = visual_servo
+    app.dependency_overrides[
+        __import__(
+            "reachy_mini.daemon.app.dependencies",
+            fromlist=["get_daemon"],
+        ).get_daemon
+    ] = lambda: daemon
+
+    with TestClient(app) as client:
+        response = client.post("/api/daemon/restart")
+
+    assert response.status_code == 200
+    assert len(jobs) == 1
+
+    import asyncio
+    import logging
+
+    coro_func, args = jobs[0]
+    asyncio.run(coro_func(*args, logger=logging.getLogger("test")))
+
+    assert visual_servo.stopped
+    assert daemon.restarted_after_visual_servo
+    assert isinstance(app.state.visual_servo, VisualServoController)
+    assert app.state.visual_servo.backend is daemon.backend
+    app.state.visual_servo.stop()
+
+
+def test_replacing_visual_servo_backend_stops_old_controller() -> None:
+    class FakeKinematics:
+        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
+            self.automatic_body_yaw = automatic_body_yaw
+
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            return np.zeros(7)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command = command
+
+    class AppState:
+        pass
+
+    old_backend = FakeBackend()
+    new_backend = FakeBackend()
+    app_state = AppState()
+    old_controller = VisualServoController(backend=old_backend)  # type: ignore[arg-type]
+    old_controller.start()
+    app_state.visual_servo = old_controller
+
+    new_controller = _get_or_create_visual_servo(app_state, new_backend)  # type: ignore[arg-type]
+
+    assert old_controller.status()["last_reason"] == "stopped"
+    assert not old_controller.running
+    assert new_controller.backend is new_backend
