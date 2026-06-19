@@ -33,6 +33,7 @@ from reachy_mini.daemon.app.routers import (
     motors,
     move,
     state,
+    tracking,
     volume,
 )
 from reachy_mini.daemon.daemon import Daemon
@@ -114,8 +115,25 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
                     localhost_only=localhost_only,
                     hardware_config_filepath=args.hardware_config_filepath,
                 )
+                if args.wireless_version:
+                    backend = app.state.daemon.backend
+                    if backend is None:
+                        logging.warning(
+                            "Visual tracking was not started: backend is not running."
+                        )
+                    else:
+                        logging.info("Starting wireless visual tracking controller...")
+                        tracking.start_visual_servo(app.state, backend)
             yield
         finally:
+            try:
+                visual_servo = getattr(app.state, "visual_servo", None)
+                if visual_servo is not None:
+                    logging.info("Shutting down visual servo controller...")
+                    visual_servo.stop()
+            except Exception as e:
+                logging.exception("Error stopping visual servo controller: %s", e)
+
             # Ensure cleanup happens even if there's an exception
             try:
                 logging.info("Shutting down app manager...")
@@ -141,6 +159,7 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
         wireless_version=args.wireless_version,
         desktop_app_daemon=args.desktop_app_daemon,
     )
+    app.state.visual_servo = None
     app.state.app_manager = AppManager(
         wireless_version=args.wireless_version,
         desktop_app_daemon=args.desktop_app_daemon,
@@ -155,6 +174,7 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
     router.include_router(motors.router)
     router.include_router(move.router)
     router.include_router(state.router)
+    router.include_router(tracking.router)
     router.include_router(volume.router)
 
     if args.wireless_version:
