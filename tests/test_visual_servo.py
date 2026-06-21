@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation as R
 
+from reachy_mini.daemon.tracking import visual_servo as visual_servo_module
 from reachy_mini.daemon.tracking.telemetry import (
     VisualServoTelemetryBuffer,
     dump_jsonl,
@@ -674,3 +675,285 @@ def test_tracking_telemetry_query_rejects_non_integer_bounds() -> None:
 
     with pytest.raises(ValueError, match="limit must be an integer"):
         buffer.query(limit=True)  # type: ignore[arg-type]
+
+
+def test_joint_command_limiter_reports_limit_hits_without_changing_command() -> None:
+    limits = np.array([[-0.5, 0.5]], dtype=np.float64)
+
+    def find_hit(
+        hits: list[dict[str, float | int | str]],
+        kind: str,
+    ) -> dict[str, float | int | str]:
+        matches = [hit for hit in hits if hit["kind"] == kind]
+        assert len(matches) == 1
+        return matches[0]
+
+    def run_case(config: VisualServoConfig) -> list[dict[str, float | int | str]]:
+        plain_limiter = JointCommandLimiter(limits=limits, config=config)
+        telemetry_limiter = JointCommandLimiter(limits=limits, config=config)
+        command = plain_limiter.limit(
+            desired=np.array([10.0]),
+            current=np.array([0.0]),
+            dt=0.02,
+        )
+        command_with_telemetry, telemetry = telemetry_limiter.limit_with_telemetry(
+            desired=np.array([10.0]),
+            current=np.array([0.0]),
+            dt=0.02,
+        )
+
+        np.testing.assert_allclose(command_with_telemetry, command)
+        assert telemetry["clamped_desired"] == [0.4]
+        return telemetry["limit_hits"]
+
+    position_hits = run_case(
+        VisualServoConfig(
+            joint_safety_margin=0.1,
+            max_joint_velocity=1e9,
+            max_joint_acceleration=1e9,
+            max_joint_jerk=1e9,
+        )
+    )
+    velocity_hits = run_case(
+        VisualServoConfig(
+            joint_safety_margin=0.1,
+            max_joint_velocity=0.01,
+            max_joint_acceleration=1e9,
+            max_joint_jerk=1e9,
+        )
+    )
+    acceleration_hits = run_case(
+        VisualServoConfig(
+            joint_safety_margin=0.1,
+            max_joint_velocity=1e9,
+            max_joint_acceleration=0.02,
+            max_joint_jerk=1e9,
+        )
+    )
+    jerk_hits = run_case(
+        VisualServoConfig(
+            joint_safety_margin=0.1,
+            max_joint_velocity=1e9,
+            max_joint_acceleration=1e9,
+            max_joint_jerk=0.03,
+        )
+    )
+
+    position_hit = find_hit(position_hits, "upper_position")
+    velocity_hit = find_hit(velocity_hits, "velocity")
+    acceleration_hit = find_hit(acceleration_hits, "acceleration")
+    jerk_hit = find_hit(jerk_hits, "jerk")
+
+    assert float(position_hit["value"]) > float(position_hit["limit"])
+    assert float(velocity_hit["value"]) > float(velocity_hit["limit"])
+    assert float(acceleration_hit["value"]) > float(acceleration_hit["limit"])
+    assert float(jerk_hit["value"]) > float(jerk_hit["limit"])
+
+
+def test_visual_servo_records_no_fresh_detection_without_backend_reads() -> None:
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = object()
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            raise AssertionError("no fresh target must not read joints")
+
+        def get_present_head_pose(self) -> np.ndarray:
+            raise AssertionError("no fresh target must not read pose")
+
+    controller = VisualServoController(backend=FakeBackend())  # type: ignore[arg-type]
+
+    assert not controller.step(dt=0.02)
+    record = controller.telemetry.query()["records"][0]
+    assert record["reason"] == "no_fresh_detection"
+    assert record["target_type"] == "none"
+    assert record["current_joints"] is None
+    assert record["current_pose"] is None
+    assert record["actual_joints"] is None
+    assert record["final_command"] is None
+
+
+def test_visual_servo_records_busy_motion_guard_without_backend_reads() -> None:
+    class FakeKinematics:
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            return np.zeros(7)
+
+    class BusyBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+        def _try_start_move(self) -> bool:
+            return False
+
+        def _end_move(self) -> None:
+            raise AssertionError("busy guard must not be released")
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            raise AssertionError("busy guard must not read joints")
+
+        def get_present_head_pose(self) -> np.ndarray:
+            raise AssertionError("busy guard must not read pose")
+
+    controller = VisualServoController(backend=BusyBackend())  # type: ignore[arg-type]
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+
+    assert not controller.step(dt=0.02)
+    record = controller.telemetry.query()["records"][0]
+    assert record["reason"] == "move_running"
+    assert record["target_type"] == "look_at"
+    assert record["current_joints"] is None
+    assert record["current_pose"] is None
+
+
+def test_visual_servo_records_commanded_look_at_tick() -> None:
+    class FakeKinematics:
+        automatic_body_yaw = True
+
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            return np.full(7, 0.2)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+            self.error = None
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command = command
+
+    controller = VisualServoController(backend=FakeBackend())  # type: ignore[arg-type]
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+
+    assert controller.step(dt=0.02)
+    record = controller.telemetry.query()["records"][0]
+    assert record["reason"] == "commanded"
+    assert record["target_type"] == "look_at"
+    assert record["input_target"]["kind"] == "look_at"  # type: ignore[index]
+    assert record["current_joints"] == [0.0] * 7
+    assert record["actual_joints"] == [0.0] * 7
+    assert record["actual_joints_source"] == "present_read_before_command"
+    assert record["final_command"] is not None
+    assert record["ik_joints"] == [0.2] * 7
+    assert record["ik_target"] is not None
+    assert record["body_yaw"]["current"] == 0.0  # type: ignore[index]
+    assert record["body_yaw"]["ik_input"] == 0.0  # type: ignore[index]
+    assert record["latency"]["target_age"] is not None  # type: ignore[index]
+
+
+def test_visual_servo_records_non_finite_ik_as_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTime:
+        def __init__(self) -> None:
+            self.monotonic_values = iter([1.0, 1.1, 1.7])
+
+        def monotonic(self) -> float:
+            return next(self.monotonic_values)
+
+        def time(self) -> float:
+            return 100.0
+
+    class FakeKinematics:
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            return np.array([0.0, np.inf, -np.inf, 0.0, 0.0, 0.0, 0.0])
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+            self.command_called = False
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command_called = True
+            raise AssertionError("IK failure must not command")
+
+    monkeypatch.setattr(visual_servo_module, "time", FakeTime())
+    backend = FakeBackend()
+    controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+
+    assert not controller.step(dt=0.02)
+    record = controller.telemetry.query()["records"][0]
+    assert record["reason"] == "ik_failed"
+    assert record["ik_failed"] is True
+    assert record["ik_joints"] == [0.0, None, None, 0.0, 0.0, 0.0, 0.0]
+    assert record["final_command"] is None
+    assert record["latency"]["processing_duration"] == pytest.approx(0.7)  # type: ignore[index]
+    assert backend.command_called is False
+
+
+def test_visual_servo_records_detection_projection_fallback() -> None:
+    class FakeKinematics:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            self.calls += 1
+            if self.calls == 1:
+                return np.full(7, np.nan)
+            return np.full(7, 0.2)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command = command
+
+    controller = VisualServoController(backend=FakeBackend())  # type: ignore[arg-type]
+    controller.submit(TrackingDetection(u=0.0, v=0.0, width=100, height=50))
+
+    assert controller.step(dt=0.02)
+    record = controller.telemetry.query()["records"][0]
+    projection = record["projected_target"]
+    assert isinstance(projection, dict)
+    assert projection["requested_pixel"] == [32.5, 16.25]
+    assert projection["projected_pixel"] is not None
+    assert projection["scale_from_center"] is not None
+    assert projection["ik_attempts"] > 1
+    assert projection["ik_failures"] >= 1
+
+
+def test_visual_servo_run_loop_records_step_error() -> None:
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.head_kinematics = object()
+
+    controller = VisualServoController(backend=FakeBackend())  # type: ignore[arg-type]
+
+    def fail_step(dt: float | None = None) -> bool:
+        controller._stop_event.set()
+        raise RuntimeError("boom")
+
+    controller.step = fail_step  # type: ignore[method-assign]
+    controller._run_loop()
+
+    record = controller.telemetry.query()["records"][0]
+    assert record["reason"] == "step_error"
+    assert record["error"] == "boom"
