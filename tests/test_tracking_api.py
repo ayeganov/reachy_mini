@@ -147,6 +147,43 @@ def test_tracking_api_rejects_non_finite_values() -> None:
     assert config_response.status_code == 422
 
 
+def test_tracking_start_rejects_oversized_telemetry_capacity() -> None:
+    class FakeKinematics:
+        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
+            self.automatic_body_yaw = automatic_body_yaw
+
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            return np.zeros(7)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command = command
+
+    app = create_app(Args(autostart=False))
+    app.dependency_overrides[get_backend] = lambda: FakeBackend()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/tracking/start",
+            json={"telemetry_capacity": 5001},
+        )
+
+    if app.state.visual_servo is not None:
+        app.state.visual_servo.stop()
+    assert response.status_code == 422
+
+
 def test_wireless_startup_starts_visual_tracking() -> None:
     class FakeKinematics:
         def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:

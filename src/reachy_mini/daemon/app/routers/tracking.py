@@ -97,7 +97,7 @@ class VisualServoConfigRequest(BaseModel):
     max_joint_acceleration: FiniteFloat = Field(default=5.235987755982989, gt=0.0)
     max_joint_jerk: FiniteFloat = Field(default=34.90658503988659, gt=0.0)
     automatic_body_yaw: bool = True
-    telemetry_capacity: int = Field(default=3000, gt=0)
+    telemetry_capacity: int = Field(default=3000, gt=0, le=5000)
 
     def to_config(self) -> VisualServoConfig:
         """Convert request into controller config."""
