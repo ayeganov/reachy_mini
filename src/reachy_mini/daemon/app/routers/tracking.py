@@ -7,10 +7,20 @@ robot-side daemon owns smoothing, safety constraints, and motor target updates.
 import json
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, Request, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field, FiniteFloat
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from pydantic import BaseModel, Field, FiniteFloat, NonNegativeInt
 
 from ....daemon.backend.abstract import Backend
+from ....daemon.tracking.telemetry import TelemetryQuery
 from ....daemon.tracking.visual_servo import (
     TrackingDetection,
     TrackingLookAtTarget,
@@ -87,6 +97,7 @@ class VisualServoConfigRequest(BaseModel):
     max_joint_acceleration: FiniteFloat = Field(default=5.235987755982989, gt=0.0)
     max_joint_jerk: FiniteFloat = Field(default=34.90658503988659, gt=0.0)
     automatic_body_yaw: bool = True
+    telemetry_capacity: int = Field(default=3000, gt=0)
 
     def to_config(self) -> VisualServoConfig:
         """Convert request into controller config."""
@@ -159,6 +170,43 @@ async def status(
 ) -> dict[str, Any]:
     """Return visual servo status."""
     return controller.status()
+
+
+@router.get("/telemetry")
+async def telemetry(
+    request: Request,
+    from_timestamp: FiniteFloat | None = Query(default=None, alias="from"),
+    to_timestamp: FiniteFloat | None = Query(default=None, alias="to"),
+    from_sequence: NonNegativeInt | None = None,
+    to_sequence: NonNegativeInt | None = None,
+    limit: NonNegativeInt = 1000,
+) -> dict[str, Any]:
+    """Return retained visual servo telemetry records."""
+    try:
+        query = TelemetryQuery(
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+            from_sequence=from_sequence,
+            to_sequence=to_sequence,
+            limit=limit,
+        )
+        query.validate()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    controller = getattr(request.app.state, "visual_servo", None)
+    if not isinstance(controller, VisualServoController):
+        raise HTTPException(
+            status_code=404,
+            detail="Visual servo controller is not running; no telemetry buffer exists.",
+        )
+    return controller.telemetry.query(
+        from_timestamp=query.from_timestamp,
+        to_timestamp=query.to_timestamp,
+        from_sequence=query.from_sequence,
+        to_sequence=query.to_sequence,
+        limit=query.limit,
+    )
 
 
 @router.post("/start")
