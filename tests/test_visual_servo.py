@@ -1,8 +1,18 @@
+# ruff: noqa: D100,D103
 import time
+from pathlib import Path
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation as R
 
+from reachy_mini.daemon.tracking.telemetry import (
+    VisualServoTelemetryBuffer,
+    dump_jsonl,
+    finite_json_value,
+    load_jsonl,
+    summarize_records,
+)
 from reachy_mini.daemon.tracking.visual_servo import (
     DetectionBuffer,
     JointCommandLimiter,
@@ -535,3 +545,132 @@ def test_visual_servo_does_not_acquire_motion_guard_without_fresh_target() -> No
     assert not controller.step(dt=0.02)
     assert backend.guard_attempts == 0
     assert controller.status()["last_reason"] == "no_fresh_detection"
+
+
+def test_tracking_telemetry_buffer_drops_old_records() -> None:
+    buffer = VisualServoTelemetryBuffer(capacity=2)
+
+    buffer.append({"timestamp": 10.0, "sequence": 0, "reason": "a"})
+    buffer.append({"timestamp": 11.0, "sequence": 1, "reason": "b"})
+    buffer.append({"timestamp": 12.0, "sequence": 2, "reason": "c"})
+
+    result = buffer.query()
+
+    assert result["dropped_records"] == 1
+    assert result["oldest_sequence"] == 1
+    assert result["newest_sequence"] == 2
+    assert result["oldest_timestamp"] == 11.0
+    assert result["newest_timestamp"] == 12.0
+    assert [record["reason"] for record in result["records"]] == ["b", "c"]
+
+
+def test_tracking_telemetry_query_filters_by_time_sequence_and_limit() -> None:
+    buffer = VisualServoTelemetryBuffer(capacity=10)
+    for sequence in range(5):
+        buffer.append(
+            {
+                "timestamp": 100.0 + sequence,
+                "sequence": sequence,
+                "reason": str(sequence),
+            }
+        )
+
+    result = buffer.query(
+        from_timestamp=101.0,
+        to_timestamp=104.0,
+        from_sequence=2,
+        to_sequence=4,
+        limit=2,
+    )
+
+    assert [record["sequence"] for record in result["records"]] == [2, 3]
+    assert result["returned"] == 2
+    assert result["limit"] == 2
+    assert result["oldest_sequence"] == 0
+    assert result["newest_sequence"] == 4
+
+
+def test_finite_json_value_replaces_non_finite_numpy_values() -> None:
+    value = finite_json_value(np.array([0.1, np.nan, np.inf, -np.inf]))
+
+    assert value == [0.1, None, None, None]
+
+
+def test_tracking_telemetry_jsonl_writes_strict_json_values(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "telemetry.jsonl"
+
+    dump_jsonl(
+        [
+            {
+                "timestamp": 1.0,
+                "sequence": 1,
+                "reason": "non_finite",
+                "value": float("nan"),
+                "nested": {"value": np.inf},
+            }
+        ],
+        path,
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert "NaN" not in text
+    assert "Infinity" not in text
+    assert load_jsonl(path) == [
+        {
+            "timestamp": 1.0,
+            "sequence": 1,
+            "reason": "non_finite",
+            "value": None,
+            "nested": {"value": None},
+        }
+    ]
+
+
+def test_tracking_telemetry_load_rejects_non_object_and_non_finite_jsonl(
+    tmp_path: Path,
+) -> None:
+    array_path = tmp_path / "array.jsonl"
+    array_path.write_text("[1,2,3]\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="JSONL row must be an object"):
+        load_jsonl(array_path)
+
+    non_finite_path = tmp_path / "non_finite.jsonl"
+    non_finite_path.write_text('{"value":NaN}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-finite JSON constant"):
+        load_jsonl(non_finite_path)
+
+
+def test_tracking_telemetry_summary_skips_empty_and_mismatched_commands() -> None:
+    summary = summarize_records(
+        [
+            {"timestamp": 1.0, "sequence": 1, "final_command": []},
+            {"timestamp": 2.0, "sequence": 2, "final_command": [1.0, 2.0]},
+            {"timestamp": 3.0, "sequence": 3, "final_command": [2.0]},
+        ]
+    )
+
+    assert summary["command_smoothness"] == {
+        "max_velocity": None,
+        "max_acceleration": None,
+        "max_jerk": None,
+    }
+
+
+def test_tracking_telemetry_query_rejects_non_integer_bounds() -> None:
+    buffer = VisualServoTelemetryBuffer()
+
+    with pytest.raises(
+        ValueError,
+        match="timestamp filters must be finite real numbers",
+    ):
+        buffer.query(from_timestamp=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="from_sequence must be an integer"):
+        buffer.query(from_sequence=0.5)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="limit must be an integer"):
+        buffer.query(limit=True)  # type: ignore[arg-type]
