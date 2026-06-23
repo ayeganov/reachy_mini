@@ -1,3 +1,5 @@
+# ruff: noqa: D100,D103
+
 import numpy as np
 from fastapi.testclient import TestClient
 
@@ -143,6 +145,43 @@ def test_tracking_api_rejects_non_finite_values() -> None:
     assert detection_response.status_code == 422
     assert look_at_response.status_code == 422
     assert config_response.status_code == 422
+
+
+def test_tracking_start_rejects_oversized_telemetry_capacity() -> None:
+    class FakeKinematics:
+        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
+            self.automatic_body_yaw = automatic_body_yaw
+
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            return np.zeros(7)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command = command
+
+    app = create_app(Args(autostart=False))
+    app.dependency_overrides[get_backend] = lambda: FakeBackend()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/tracking/start",
+            json={"telemetry_capacity": 5001},
+        )
+
+    if app.state.visual_servo is not None:
+        app.state.visual_servo.stop()
+    assert response.status_code == 422
 
 
 def test_wireless_startup_starts_visual_tracking() -> None:
@@ -377,3 +416,141 @@ def test_replacing_visual_servo_backend_stops_old_controller() -> None:
     assert old_controller.status()["last_reason"] == "stopped"
     assert not old_controller.running
     assert new_controller.backend is new_backend
+
+
+def test_tracking_telemetry_route_does_not_create_controller() -> None:
+    app = create_app(Args(autostart=False))
+
+    with TestClient(app) as client:
+        response = client.get("/api/tracking/telemetry")
+
+    assert response.status_code == 404
+    assert "Visual servo controller is not running" in response.json()["detail"]
+    assert app.state.visual_servo is None
+
+
+def test_tracking_telemetry_route_rejects_invalid_query_without_controller() -> None:
+    app = create_app(Args(autostart=False))
+
+    with TestClient(app) as client:
+        range_response = client.get(
+            "/api/tracking/telemetry",
+            params={"from": 20.0, "to": 10.0},
+        )
+        limit_response = client.get(
+            "/api/tracking/telemetry",
+            params={"limit": 5001},
+        )
+
+    assert range_response.status_code == 422
+    assert limit_response.status_code == 422
+    assert app.state.visual_servo is None
+
+
+def test_tracking_telemetry_route_filters_records() -> None:
+    class FakeKinematics:
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            return np.zeros(7)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command = command
+
+    backend = FakeBackend()
+    app = create_app(Args(autostart=False))
+    controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
+    controller.telemetry.append({"timestamp": 10.0, "sequence": 0, "reason": "a"})
+    controller.telemetry.append({"timestamp": 11.0, "sequence": 1, "reason": "b"})
+    controller.telemetry.append({"timestamp": 12.0, "sequence": 2, "reason": "c"})
+    app.state.visual_servo = controller
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/tracking/telemetry",
+            params={
+                "from": 10.5,
+                "to": 11.5,
+                "from_sequence": 1,
+                "to_sequence": 2,
+                "limit": 5,
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["returned"] == 1
+    assert body["records"][0]["sequence"] == 1
+    assert body["oldest_sequence"] == 0
+    assert body["newest_sequence"] == 2
+
+
+def test_tracking_telemetry_route_rejects_invalid_query() -> None:
+    class FakeKinematics:
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            return np.zeros(7)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command = command
+
+    app = create_app(Args(autostart=False))
+    app.state.visual_servo = VisualServoController(backend=FakeBackend())  # type: ignore[arg-type]
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/tracking/telemetry",
+            params={"from": 20.0, "to": 10.0},
+        )
+
+    assert response.status_code == 422
+
+
+def test_tracking_telemetry_route_rejects_non_finite_query() -> None:
+    class FakeKinematics:
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            return np.zeros(7)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command = command
+
+    app = create_app(Args(autostart=False))
+    app.state.visual_servo = VisualServoController(backend=FakeBackend())  # type: ignore[arg-type]
+
+    with TestClient(app) as client:
+        response = client.get("/api/tracking/telemetry?from=Infinity")
+
+    assert response.status_code == 422

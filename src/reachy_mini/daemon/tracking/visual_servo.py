@@ -18,6 +18,8 @@ import numpy as np
 import numpy.typing as npt
 from scipy.spatial.transform import Rotation as R
 
+from .telemetry import VisualServoTelemetryBuffer, finite_json_value
+
 if TYPE_CHECKING:
     from reachy_mini.daemon.backend.abstract import Backend
 
@@ -88,6 +90,18 @@ class VisualServoConfig:
     max_joint_acceleration: float = np.deg2rad(300.0)
     max_joint_jerk: float = np.deg2rad(2000.0)
     automatic_body_yaw: bool = True
+    telemetry_capacity: int = 3000
+
+
+@dataclass(frozen=True)
+class JointTargetTelemetry:
+    """IK and projection metadata for one desired joint target."""
+
+    joints: npt.NDArray[np.float64] | None
+    ik_target: npt.NDArray[np.float64] | None
+    ik_joints: npt.NDArray[np.float64] | None
+    ik_failed: bool
+    projected_target: dict[str, Any] | None = None
 
 
 class DetectionBuffer:
@@ -235,10 +249,45 @@ class JointCommandLimiter:
         dt: float,
     ) -> npt.NDArray[np.float64]:
         """Return a clamped, jerk-limited command."""
+        command, _telemetry = self.limit_with_telemetry(desired, current, dt)
+        return command
+
+    def limit_with_telemetry(
+        self,
+        desired: npt.NDArray[np.float64],
+        current: npt.NDArray[np.float64],
+        dt: float,
+    ) -> tuple[npt.NDArray[np.float64], dict[str, Any]]:
+        """Return a clamped, jerk-limited command and telemetry metadata."""
         if dt <= 0.0:
             raise ValueError("dt must be positive")
 
-        desired = self.clamp(desired.astype(np.float64))
+        desired = desired.astype(np.float64)
+        margin = self.config.joint_safety_margin
+        lower = self.limits[:, 0] + margin
+        upper = self.limits[:, 1] - margin
+        clamped_desired = np.clip(desired, lower, upper)
+        hits: list[dict[str, float | int | str]] = []
+        for index, (raw, low, high) in enumerate(zip(desired, lower, upper)):
+            if raw < low:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "lower_position",
+                        "value": float(raw),
+                        "limit": float(low),
+                    }
+                )
+            if raw > high:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "upper_position",
+                        "value": float(raw),
+                        "limit": float(high),
+                    }
+                )
+
         current = current.astype(np.float64)
 
         if self._last_command is None:
@@ -247,22 +296,55 @@ class JointCommandLimiter:
             self._acceleration = np.zeros(self.limits.shape[0], dtype=np.float64)
 
         reference = self._last_command
-        error = desired - reference
+        error = clamped_desired - reference
         max_stop_velocity = np.sqrt(
             np.maximum(0.0, 2.0 * self.config.max_joint_acceleration * np.abs(error))
         )
+        requested_velocity = np.sign(error) * max_stop_velocity
         desired_velocity = np.sign(error) * np.minimum(
             self.config.max_joint_velocity,
             max_stop_velocity,
         )
+        for index, velocity in enumerate(requested_velocity):
+            if abs(float(velocity)) > self.config.max_joint_velocity:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "velocity",
+                        "value": float(velocity),
+                        "limit": float(self.config.max_joint_velocity),
+                    }
+                )
 
         desired_acceleration = (desired_velocity - self._velocity) / dt
+        requested_acceleration_delta = desired_acceleration - self._acceleration
         acceleration_delta = np.clip(
-            desired_acceleration - self._acceleration,
+            requested_acceleration_delta,
             -self.config.max_joint_jerk * dt,
             self.config.max_joint_jerk * dt,
         )
-        acceleration = self._acceleration + acceleration_delta
+        for index, delta in enumerate(requested_acceleration_delta):
+            if abs(float(delta)) > self.config.max_joint_jerk * dt:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "jerk",
+                        "value": float(delta / dt),
+                        "limit": float(self.config.max_joint_jerk),
+                    }
+                )
+        requested_acceleration = self._acceleration + acceleration_delta
+        for index, accel in enumerate(requested_acceleration):
+            if abs(float(accel)) > self.config.max_joint_acceleration:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "acceleration",
+                        "value": float(accel),
+                        "limit": float(self.config.max_joint_acceleration),
+                    }
+                )
+        acceleration = requested_acceleration
         acceleration = np.clip(
             acceleration,
             -self.config.max_joint_acceleration,
@@ -277,10 +359,13 @@ class JointCommandLimiter:
         )
 
         command = reference + velocity * dt
-        crossing_target = np.sign(desired - command) != np.sign(error)
+        crossing_target = np.sign(clamped_desired - command) != np.sign(error)
         close_to_target = np.abs(error) < 1e-6
         should_snap = crossing_target | close_to_target
-        command = cast(npt.NDArray[np.float64], np.where(should_snap, desired, command))
+        command = cast(
+            npt.NDArray[np.float64],
+            np.where(should_snap, clamped_desired, command),
+        )
         velocity = cast(
             npt.NDArray[np.float64],
             np.where(should_snap, 0.0, velocity).astype(np.float64),
@@ -293,7 +378,10 @@ class JointCommandLimiter:
         self._last_command = command.copy()
         self._velocity = velocity
         self._acceleration = acceleration
-        return command
+        return command, {
+            "clamped_desired": clamped_desired.tolist(),
+            "limit_hits": hits,
+        }
 
 
 class VisualServoController:
@@ -312,6 +400,10 @@ class VisualServoController:
         self.look_at_buffer = LookAtTargetBuffer()
         self.filter = PixelTargetFilter(self.config.smoothing_alpha)
         self.limiter = JointCommandLimiter(config=self.config)
+        self.telemetry = VisualServoTelemetryBuffer(
+            capacity=self.config.telemetry_capacity
+        )
+        self._telemetry_sequence = 0
         self.logger = logger or logging.getLogger(__name__)
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -410,6 +502,95 @@ class VisualServoController:
             "error": self._error,
         }
 
+    def _new_telemetry_record(
+        self,
+        *,
+        dt: float,
+        target_type: str,
+        reason: str,
+        input_target: dict[str, Any] | None = None,
+        start_monotonic: float | None = None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        monotonic_now = time.monotonic()
+        record = {
+            "sequence": self._telemetry_sequence,
+            "timestamp": now,
+            "monotonic_timestamp": monotonic_now,
+            "dt": dt,
+            "target_type": target_type,
+            "input_target": input_target,
+            "smoothed_target": None,
+            "current_joints": None,
+            "current_pose": None,
+            "ik_target": None,
+            "ik_joints": None,
+            "projected_target": None,
+            "final_command": None,
+            "actual_joints": None,
+            "actual_joints_source": "none",
+            "reason": reason,
+            "ik_failed": False,
+            "limit_hits": [],
+            "body_yaw": {
+                "current": None,
+                "ik_input": None,
+                "automatic_enabled": self._automatic_body_yaw_state(),
+            },
+            "latency": {
+                "target_age": None,
+                "processing_duration": None
+                if start_monotonic is None
+                else monotonic_now - start_monotonic,
+            },
+            "backend": self._backend_telemetry(),
+            "backend_extra": {},
+            "error": None,
+        }
+        self._telemetry_sequence += 1
+        return record
+
+    def _append_telemetry(self, record: dict[str, Any]) -> None:
+        self.telemetry.append(record)
+
+    def _backend_telemetry(self) -> dict[str, Any]:
+        ready = getattr(self.backend, "ready", None)
+        is_set = getattr(ready, "is_set", None)
+        return {
+            "ready": bool(is_set()) if callable(is_set) else None,
+            "error": getattr(self.backend, "error", None),
+            "motor_control_mode": getattr(self.backend, "motor_control_mode", None),
+        }
+
+    def _automatic_body_yaw_state(self) -> bool | None:
+        value = getattr(self.backend.head_kinematics, "automatic_body_yaw", None)
+        return value if isinstance(value, bool) else None
+
+    @staticmethod
+    def _detection_target(detection: TrackingDetection) -> dict[str, Any]:
+        return {
+            "kind": "detection",
+            "u": detection.u,
+            "v": detection.v,
+            "timestamp": detection.timestamp,
+            "confidence": detection.confidence,
+            "frame_id": detection.frame_id,
+            "width": detection.width,
+            "height": detection.height,
+        }
+
+    @staticmethod
+    def _look_at_target(target: TrackingLookAtTarget) -> dict[str, Any]:
+        return {
+            "kind": "look_at",
+            "x": target.x,
+            "y": target.y,
+            "z": target.z,
+            "timestamp": target.timestamp,
+            "confidence": target.confidence,
+            "frame_id": target.frame_id,
+        }
+
     def _run_loop(self) -> None:
         period = 1.0 / self.config.control_frequency
         next_tick = time.monotonic()
@@ -420,6 +601,14 @@ class VisualServoController:
             except Exception as exc:
                 self._error = str(exc)
                 self._last_reason = "error"
+                record = self._new_telemetry_record(
+                    dt=period,
+                    target_type="none",
+                    reason="step_error",
+                    start_monotonic=start,
+                )
+                record["error"] = str(exc)
+                self._append_telemetry(record)
                 log = logging.getLogger(__name__)
                 log.exception("Visual servo step failed")
 
@@ -435,6 +624,7 @@ class VisualServoController:
         Returns True when a motor target was produced.
         """
         dt = (1.0 / self.config.control_frequency) if dt is None else dt
+        start_monotonic = time.monotonic()
 
         look_at = self.look_at_buffer.fresh(self.config)
         detection = None
@@ -443,11 +633,40 @@ class VisualServoController:
             detection = self.buffer.fresh(self.config)
             if detection is None:
                 self._last_reason = "no_fresh_detection"
+                self._append_telemetry(
+                    self._new_telemetry_record(
+                        dt=dt,
+                        target_type="none",
+                        reason="no_fresh_detection",
+                        start_monotonic=start_monotonic,
+                    )
+                )
                 return False
+
+        target_type = "none"
+        input_target: dict[str, Any] | None = None
+        target_timestamp: float | None = None
+        if look_at is not None:
+            target_type = "look_at"
+            input_target = self._look_at_target(look_at)
+            target_timestamp = look_at.timestamp
+        elif detection is not None:
+            target_type = "detection"
+            input_target = self._detection_target(detection)
+            target_timestamp = detection.timestamp
 
         release_motion_guard = self._try_acquire_motion_guard()
         if release_motion_guard is None:
             self._last_reason = "move_running"
+            self._append_telemetry(
+                self._new_telemetry_record(
+                    dt=dt,
+                    target_type=target_type,
+                    reason="move_running",
+                    input_target=input_target,
+                    start_monotonic=start_monotonic,
+                )
+            )
             return False
 
         try:
@@ -457,40 +676,82 @@ class VisualServoController:
             current_pose = np.array(
                 self.backend.get_present_head_pose(), dtype=np.float64
             )
+            if target_timestamp is not None:
+                self._last_detection_time = target_timestamp
+            if target_type != "none":
+                self._last_target_type = target_type
+            record = self._new_telemetry_record(
+                dt=dt,
+                target_type=target_type,
+                reason="ik_failed",
+                input_target=input_target,
+                start_monotonic=start_monotonic,
+            )
+            pixel: npt.NDArray[np.float64] | None = None
+            body_yaw = float(current_joints[0])
             if look_at is not None:
-                self._last_detection_time = look_at.timestamp
-                self._last_target_type = "look_at"
                 if self._look_at_reference_pose is None:
                     self._look_at_reference_pose = current_pose.copy()
-                desired_joints = self._ik_from_target_world(
+                target_result = self._ik_from_target_world_with_telemetry(
                     target_world=np.array([look_at.x, look_at.y, look_at.z]),
                     current_head_pose=self._look_at_reference_pose,
-                    body_yaw=float(current_joints[0]),
+                    body_yaw=body_yaw,
                 )
             else:
                 assert detection is not None
-                self._last_detection_time = detection.timestamp
-                self._last_target_type = "detection"
                 pixel = self.filter.update(detection)
-                desired_joints = self._reachable_joints_from_pixel(
+                target_result = self._reachable_joints_from_pixel_with_telemetry(
                     pixel=pixel,
                     detection=detection,
                     current_head_pose=current_pose,
-                    body_yaw=float(current_joints[0]),
+                    body_yaw=body_yaw,
                 )
-            if desired_joints is None:
+
+            record["smoothed_target"] = (
+                finite_json_value(pixel) if detection is not None else None
+            )
+            record["current_joints"] = finite_json_value(current_joints)
+            record["current_pose"] = finite_json_value(current_pose)
+            record["ik_target"] = finite_json_value(target_result.ik_target)
+            record["ik_joints"] = finite_json_value(target_result.ik_joints)
+            record["ik_failed"] = target_result.ik_failed
+            record["projected_target"] = finite_json_value(
+                target_result.projected_target
+            )
+            record["body_yaw"]["current"] = body_yaw
+            record["body_yaw"]["ik_input"] = body_yaw
+            record["latency"]["target_age"] = (
+                None
+                if target_timestamp is None
+                else max(0.0, time.time() - target_timestamp)
+            )
+            if target_result.joints is None:
+                record["reason"] = "ik_failed"
                 self._last_reason = "ik_failed"
+                record["latency"]["processing_duration"] = (
+                    time.monotonic() - start_monotonic
+                )
+                self._append_telemetry(record)
                 return False
 
-            command = self.limiter.limit(
-                desired=np.array(desired_joints, dtype=np.float64),
+            command, limit_telemetry = self.limiter.limit_with_telemetry(
+                desired=np.array(target_result.joints, dtype=np.float64),
                 current=current_joints,
                 dt=dt,
             )
+            record["limit_hits"] = limit_telemetry["limit_hits"]
             self.backend.set_target_head_joint_positions(command)
             self._last_command = command.copy()
             self._command_count += 1
             self._last_reason = "commanded"
+            record["final_command"] = finite_json_value(command)
+            record["actual_joints"] = finite_json_value(current_joints)
+            record["actual_joints_source"] = "present_read_before_command"
+            record["reason"] = "commanded"
+            record["latency"]["processing_duration"] = (
+                time.monotonic() - start_monotonic
+            )
+            self._append_telemetry(record)
             return True
         finally:
             release_motion_guard()
@@ -516,12 +777,12 @@ class VisualServoController:
 
         return noop
 
-    def _ik_from_target_world(
+    def _ik_from_target_world_with_telemetry(
         self,
         target_world: npt.NDArray[np.float64],
         current_head_pose: npt.NDArray[np.float64],
         body_yaw: float,
-    ) -> npt.NDArray[np.float64] | None:
+    ) -> JointTargetTelemetry:
         target_pose = self._look_at_pose(
             current_head_pose=current_head_pose,
             target_world=target_world,
@@ -529,11 +790,129 @@ class VisualServoController:
         )
         joints = self.backend.head_kinematics.ik(target_pose, body_yaw=body_yaw)
         if joints is None:
-            return None
+            return JointTargetTelemetry(
+                joints=None,
+                ik_target=target_pose,
+                ik_joints=None,
+                ik_failed=True,
+            )
         joints_array = np.array(joints, dtype=np.float64)
-        if not self._valid_joints(joints_array):
-            return None
-        return joints_array
+        failed = not self._valid_joints(joints_array)
+        return JointTargetTelemetry(
+            joints=None if failed else joints_array,
+            ik_target=target_pose,
+            ik_joints=joints_array,
+            ik_failed=failed,
+        )
+
+    def _ik_from_target_world(
+        self,
+        target_world: npt.NDArray[np.float64],
+        current_head_pose: npt.NDArray[np.float64],
+        body_yaw: float,
+    ) -> npt.NDArray[np.float64] | None:
+        return self._ik_from_target_world_with_telemetry(
+            target_world=target_world,
+            current_head_pose=current_head_pose,
+            body_yaw=body_yaw,
+        ).joints
+
+    def _reachable_joints_from_pixel_with_telemetry(
+        self,
+        pixel: npt.NDArray[np.float64],
+        detection: TrackingDetection,
+        current_head_pose: npt.NDArray[np.float64],
+        body_yaw: float,
+    ) -> JointTargetTelemetry:
+        attempts = 0
+        failures = 0
+        requested_pixel = pixel.copy()
+        initial = self._ik_from_pixel_with_telemetry(
+            pixel=pixel,
+            detection=detection,
+            current_head_pose=current_head_pose,
+            body_yaw=body_yaw,
+        )
+        attempts += 1
+        failures += int(initial.ik_failed)
+        if initial.joints is not None:
+            return JointTargetTelemetry(
+                joints=initial.joints,
+                ik_target=initial.ik_target,
+                ik_joints=initial.ik_joints,
+                ik_failed=False,
+                projected_target={
+                    "requested_pixel": requested_pixel.tolist(),
+                    "projected_pixel": pixel.tolist(),
+                    "scale_from_center": 1.0,
+                    "ik_attempts": attempts,
+                    "ik_failures": failures,
+                },
+            )
+
+        center = np.array(
+            [float(detection.width) / 2.0, float(detection.height) / 2.0],
+            dtype=np.float64,
+        )
+        center_result = self._ik_from_pixel_with_telemetry(
+            pixel=center,
+            detection=detection,
+            current_head_pose=current_head_pose,
+            body_yaw=body_yaw,
+        )
+        attempts += 1
+        failures += int(center_result.ik_failed)
+        if center_result.joints is None:
+            return JointTargetTelemetry(
+                joints=None,
+                ik_target=center_result.ik_target,
+                ik_joints=center_result.ik_joints,
+                ik_failed=True,
+                projected_target={
+                    "requested_pixel": requested_pixel.tolist(),
+                    "projected_pixel": None,
+                    "scale_from_center": None,
+                    "ik_attempts": attempts,
+                    "ik_failures": failures,
+                },
+            )
+
+        best = center_result
+        best_pixel = center.copy()
+        best_scale = 0.0
+        low = 0.0
+        high = 1.0
+        for _ in range(8):
+            mid = (low + high) / 2.0
+            candidate = center + mid * (pixel - center)
+            candidate_result = self._ik_from_pixel_with_telemetry(
+                pixel=candidate,
+                detection=detection,
+                current_head_pose=current_head_pose,
+                body_yaw=body_yaw,
+            )
+            attempts += 1
+            failures += int(candidate_result.ik_failed)
+            if candidate_result.joints is not None:
+                best = candidate_result
+                best_pixel = candidate
+                best_scale = mid
+                low = mid
+            else:
+                high = mid
+        return JointTargetTelemetry(
+            joints=best.joints,
+            ik_target=best.ik_target,
+            ik_joints=best.ik_joints,
+            ik_failed=best.ik_failed,
+            projected_target={
+                "requested_pixel": requested_pixel.tolist(),
+                "projected_pixel": best_pixel.tolist(),
+                "scale_from_center": best_scale,
+                "ik_attempts": attempts,
+                "ik_failures": failures,
+            },
+        )
 
     def _reachable_joints_from_pixel(
         self,
@@ -542,49 +921,41 @@ class VisualServoController:
         current_head_pose: npt.NDArray[np.float64],
         body_yaw: float,
     ) -> npt.NDArray[np.float64] | None:
-        joints = self._ik_from_pixel(
+        return self._reachable_joints_from_pixel_with_telemetry(
             pixel=pixel,
             detection=detection,
             current_head_pose=current_head_pose,
             body_yaw=body_yaw,
-        )
-        if self._valid_joints(joints):
-            assert joints is not None
-            return joints
+        ).joints
 
-        center = np.array(
-            [float(detection.width) / 2.0, float(detection.height) / 2.0],
-            dtype=np.float64,
-        )
-        center_joints = self._ik_from_pixel(
-            pixel=center,
+    def _ik_from_pixel_with_telemetry(
+        self,
+        pixel: npt.NDArray[np.float64],
+        detection: TrackingDetection,
+        current_head_pose: npt.NDArray[np.float64],
+        body_yaw: float,
+    ) -> JointTargetTelemetry:
+        target_pose = self._pose_from_pixel(
+            pixel=pixel,
             detection=detection,
             current_head_pose=current_head_pose,
-            body_yaw=body_yaw,
         )
-        if not self._valid_joints(center_joints):
-            return None
-
-        assert center_joints is not None
-        best = center_joints
-        low = 0.0
-        high = 1.0
-        for _ in range(8):
-            mid = (low + high) / 2.0
-            candidate = center + mid * (pixel - center)
-            candidate_joints = self._ik_from_pixel(
-                pixel=candidate,
-                detection=detection,
-                current_head_pose=current_head_pose,
-                body_yaw=body_yaw,
+        joints = self.backend.head_kinematics.ik(target_pose, body_yaw=body_yaw)
+        if joints is None:
+            return JointTargetTelemetry(
+                joints=None,
+                ik_target=target_pose,
+                ik_joints=None,
+                ik_failed=True,
             )
-            if self._valid_joints(candidate_joints):
-                assert candidate_joints is not None
-                best = candidate_joints
-                low = mid
-            else:
-                high = mid
-        return best
+        joints_array = np.array(joints, dtype=np.float64)
+        failed = not self._valid_joints(joints_array)
+        return JointTargetTelemetry(
+            joints=None if failed else joints_array,
+            ik_target=target_pose,
+            ik_joints=joints_array,
+            ik_failed=failed,
+        )
 
     def _ik_from_pixel(
         self,
@@ -593,19 +964,16 @@ class VisualServoController:
         current_head_pose: npt.NDArray[np.float64],
         body_yaw: float,
     ) -> npt.NDArray[np.float64] | None:
-        target_pose = self._pose_from_pixel(
+        return self._ik_from_pixel_with_telemetry(
             pixel=pixel,
             detection=detection,
             current_head_pose=current_head_pose,
-        )
-        joints = self.backend.head_kinematics.ik(target_pose, body_yaw=body_yaw)
-        if joints is None:
-            return None
-        return np.array(joints, dtype=np.float64)
+            body_yaw=body_yaw,
+        ).joints
 
     @staticmethod
     def _valid_joints(joints: npt.NDArray[np.float64] | None) -> bool:
-        return joints is not None and not np.any(np.isnan(joints))
+        return joints is not None and bool(np.all(np.isfinite(joints)))
 
     def _pose_from_pixel(
         self,
