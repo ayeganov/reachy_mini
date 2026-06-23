@@ -79,6 +79,7 @@ reachy-mini-daemon = "reachy_mini.daemon.app.main:main"
 reachy-mini-app-assistant = "reachy_mini.apps.app:main"
 reachy-mini-reflash-motors = "reachy_mini.tools.reflash_motors:main"
 reachy-mini-tracking-telemetry = "reachy_mini.tools.tracking_telemetry:main"
+reachy-mini-look-at-pad = "reachy_mini.tools.look_at_pad:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
