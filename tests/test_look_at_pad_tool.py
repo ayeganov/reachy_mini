@@ -26,9 +26,9 @@ def test_named_pad_points_match_metric_y_z_plane() -> None:
 
     assert screen_to_target(*points["center"], plane) == (0.5, 0.0, -0.004)
     assert screen_to_target(*points["top"], plane) == (0.5, 0.0, 0.146)
-    assert screen_to_target(*points["right"], plane) == (0.5, 0.15, -0.004)
+    assert screen_to_target(*points["right"], plane) == (0.5, -0.15, -0.004)
     assert screen_to_target(*points["bottom"], plane) == (0.5, 0.0, -0.154)
-    assert screen_to_target(*points["left"], plane) == (0.5, -0.15, -0.004)
+    assert screen_to_target(*points["left"], plane) == (0.5, 0.15, -0.004)
 
 
 def test_build_replay_targets_exercises_both_lateral_and_vertical_axes() -> None:

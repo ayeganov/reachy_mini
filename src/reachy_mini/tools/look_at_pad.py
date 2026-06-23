@@ -91,9 +91,9 @@ def named_screen_points(canvas_size: int) -> dict[str, tuple[float, float]]:
     return {
         "center": center,
         "top": (center[0], center[1] - radius),
-        "right": (center[0] + radius, center[1]),
+        "right": (center[0] - radius, center[1]),
         "bottom": (center[0], center[1] + radius),
-        "left": (center[0] - radius, center[1]),
+        "left": (center[0] + radius, center[1]),
     }
 
 
