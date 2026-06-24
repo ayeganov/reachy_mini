@@ -17,6 +17,7 @@ from reachy_mini.daemon.tracking.telemetry import (
 from reachy_mini.daemon.tracking.visual_servo import (
     DetectionBuffer,
     JointCommandLimiter,
+    LookAtTargetFilter,
     PixelTargetFilter,
     TrackingDetection,
     TrackingLookAtTarget,
@@ -170,6 +171,48 @@ def test_pixel_filter_eases_first_detection_from_image_center() -> None:
     np.testing.assert_allclose(filtered, np.array([25.0, 12.5]))
 
 
+def test_look_at_filter_eases_successive_metric_targets() -> None:
+    target_filter = LookAtTargetFilter(alpha=0.25)
+
+    first = target_filter.update(
+        TrackingLookAtTarget(
+            x=0.5,
+            y=0.0,
+            z=0.0,
+            timestamp=10.0,
+            confidence=0.8,
+            frame_id=1,
+        )
+    )
+    second = target_filter.update(
+        TrackingLookAtTarget(
+            x=0.5,
+            y=0.3,
+            z=0.2,
+            timestamp=11.0,
+            confidence=0.7,
+            frame_id=2,
+        )
+    )
+
+    assert first == TrackingLookAtTarget(
+        x=0.5,
+        y=0.0,
+        z=0.0,
+        timestamp=10.0,
+        confidence=0.8,
+        frame_id=1,
+    )
+    assert second == TrackingLookAtTarget(
+        x=0.5,
+        y=0.075,
+        z=0.05,
+        timestamp=11.0,
+        confidence=0.7,
+        frame_id=2,
+    )
+
+
 def test_visual_servo_reduces_unreachable_pixel_until_ik_is_valid() -> None:
     class FakeKinematics:
         def __init__(self) -> None:
@@ -250,6 +293,84 @@ def test_visual_servo_commands_from_3d_look_at_target() -> None:
     assert controller.status()["last_target_type"] == "look_at"
     assert backend.command is not None
     assert backend.head_kinematics.last_pose is not None
+
+
+def test_visual_servo_records_smoothed_look_at_target() -> None:
+    class FakeKinematics:
+        def __init__(self) -> None:
+            self.forward_axes: list[np.ndarray] = []
+
+        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
+            self.automatic_body_yaw = automatic_body_yaw
+
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            self.forward_axes.append(pose[:3, 0].copy())
+            return np.zeros(7)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command = command
+
+    backend = FakeBackend()
+    controller = VisualServoController(
+        backend=backend,  # type: ignore[arg-type]
+        config=VisualServoConfig(
+            smoothing_alpha=0.5,
+            max_joint_velocity=1e9,
+            max_joint_acceleration=1e9,
+            max_joint_jerk=1e9,
+        ),
+    )
+    controller.submit_look_at(
+        TrackingLookAtTarget(
+            x=0.5,
+            y=0.0,
+            z=0.0,
+            timestamp=time.time(),
+            frame_id=1,
+        )
+    )
+    assert controller.step(dt=0.02)
+    controller.submit_look_at(
+        TrackingLookAtTarget(
+            x=0.5,
+            y=0.2,
+            z=0.2,
+            timestamp=time.time(),
+            frame_id=2,
+        )
+    )
+    assert controller.step(dt=0.02)
+
+    records = controller.telemetry.query()["records"]
+    assert records[0]["input_target"]["y"] == 0.0  # type: ignore[index]
+    assert records[0]["smoothed_target"]["y"] == 0.0  # type: ignore[index]
+    assert records[1]["input_target"]["y"] == 0.2  # type: ignore[index]
+    assert records[1]["smoothed_target"] == {
+        "kind": "look_at",
+        "x": 0.5,
+        "y": 0.1,
+        "z": 0.1,
+        "timestamp": records[1]["input_target"]["timestamp"],  # type: ignore[index]
+        "confidence": 1.0,
+        "frame_id": 2,
+    }
+    expected_forward = np.array([0.5, 0.1, 0.1], dtype=np.float64)
+    expected_forward /= np.linalg.norm(expected_forward)
+    np.testing.assert_allclose(
+        backend.head_kinematics.forward_axes[1], expected_forward
+    )
 
 
 def test_visual_servo_3d_look_at_uses_world_up_for_predictable_target_plane() -> None:
@@ -499,7 +620,9 @@ def test_visual_servo_skips_command_when_backend_motion_guard_is_busy() -> None:
             raise AssertionError("servo must not read pose without motion ownership")
 
         def set_target_head_joint_positions(self, command: np.ndarray) -> None:
-            raise AssertionError("servo must not command joints without motion ownership")
+            raise AssertionError(
+                "servo must not command joints without motion ownership"
+            )
 
     backend = BusyBackend()
     controller = VisualServoController(backend=backend)  # type: ignore[arg-type]

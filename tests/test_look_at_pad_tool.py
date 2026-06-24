@@ -10,6 +10,7 @@ from reachy_mini.tools.look_at_pad import (
     build_replay_targets,
     named_screen_points,
     screen_to_target,
+    summarize_replay_records,
 )
 
 
@@ -69,6 +70,47 @@ def test_default_tracking_config_matches_interactive_pad_values() -> None:
         "max_joint_velocity": 0.60,
         "max_joint_acceleration": 1.60,
         "max_joint_jerk": 8.0,
+    }
+
+
+def test_replay_summary_includes_command_smoothness() -> None:
+    records = [
+        {
+            "timestamp": 1.0,
+            "target_type": "look_at",
+            "reason": "commanded",
+            "input_target": {"y": 0.0, "z": 0.0},
+            "final_command": [0.0, 0.0],
+            "limit_hits": [],
+            "ik_failed": False,
+        },
+        {
+            "timestamp": 2.0,
+            "target_type": "look_at",
+            "reason": "commanded",
+            "input_target": {"y": 0.1, "z": 0.0},
+            "final_command": [1.0, 0.0],
+            "limit_hits": [{"kind": "jerk", "limit": 8.0}],
+            "ik_failed": False,
+        },
+        {
+            "timestamp": 3.0,
+            "target_type": "look_at",
+            "reason": "commanded",
+            "input_target": {"y": 0.1, "z": 0.1},
+            "final_command": [1.0, 1.0],
+            "limit_hits": [],
+            "ik_failed": False,
+        },
+    ]
+
+    summary = summarize_replay_records(records)
+
+    assert summary["limit_hit_count"] == 1
+    assert summary["command_smoothness"] == {
+        "max_velocity": 1.0,
+        "max_acceleration": 1.0,
+        "max_jerk": None,
     }
 
 

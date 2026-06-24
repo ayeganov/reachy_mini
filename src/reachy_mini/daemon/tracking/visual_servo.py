@@ -208,6 +208,37 @@ class PixelTargetFilter:
         return self._value.copy()
 
 
+class LookAtTargetFilter:
+    """Exponential smoothing for incoming metric look-at targets."""
+
+    def __init__(self, alpha: float) -> None:
+        """Initialize the filter."""
+        if not 0.0 < alpha <= 1.0:
+            raise ValueError("alpha must be in (0, 1]")
+        self.alpha = alpha
+        self._value: npt.NDArray[np.float64] | None = None
+
+    def reset(self) -> None:
+        """Clear the filter state."""
+        self._value = None
+
+    def update(self, target: TrackingLookAtTarget) -> TrackingLookAtTarget:
+        """Update the filter and return the smoothed metric target."""
+        value = np.array([target.x, target.y, target.z], dtype=np.float64)
+        if self._value is None:
+            self._value = value
+        else:
+            self._value = self.alpha * value + (1.0 - self.alpha) * self._value
+        return TrackingLookAtTarget(
+            x=float(self._value[0]),
+            y=float(self._value[1]),
+            z=float(self._value[2]),
+            timestamp=target.timestamp,
+            confidence=target.confidence,
+            frame_id=target.frame_id,
+        )
+
+
 class JointCommandLimiter:
     """Clamp and jerk-limit head joint commands before sending them to motors."""
 
@@ -399,6 +430,7 @@ class VisualServoController:
         self.buffer = DetectionBuffer()
         self.look_at_buffer = LookAtTargetBuffer()
         self.filter = PixelTargetFilter(self.config.smoothing_alpha)
+        self.look_at_filter = LookAtTargetFilter(self.config.smoothing_alpha)
         self.limiter = JointCommandLimiter(config=self.config)
         self.telemetry = VisualServoTelemetryBuffer(
             capacity=self.config.telemetry_capacity
@@ -435,6 +467,7 @@ class VisualServoController:
             return
         self._stop_event.clear()
         self.filter.reset()
+        self.look_at_filter.reset()
         self.limiter.reset()
         self._look_at_reference_pose = None
         if self.config.automatic_body_yaw and hasattr(
@@ -464,6 +497,7 @@ class VisualServoController:
                 return
         self._thread = None
         self._look_at_reference_pose = None
+        self.look_at_filter.reset()
         self._restore_automatic_body_yaw()
         self._last_reason = "stopped"
         self._error = None
@@ -630,6 +664,7 @@ class VisualServoController:
         detection = None
         if look_at is None:
             self._look_at_reference_pose = None
+            self.look_at_filter.reset()
             detection = self.buffer.fresh(self.config)
             if detection is None:
                 self._last_reason = "no_fresh_detection"
@@ -688,12 +723,16 @@ class VisualServoController:
                 start_monotonic=start_monotonic,
             )
             pixel: npt.NDArray[np.float64] | None = None
+            smoothed_look_at: TrackingLookAtTarget | None = None
             body_yaw = float(current_joints[0])
             if look_at is not None:
                 if self._look_at_reference_pose is None:
                     self._look_at_reference_pose = current_pose.copy()
+                smoothed_look_at = self.look_at_filter.update(look_at)
                 target_result = self._ik_from_target_world_with_telemetry(
-                    target_world=np.array([look_at.x, look_at.y, look_at.z]),
+                    target_world=np.array(
+                        [smoothed_look_at.x, smoothed_look_at.y, smoothed_look_at.z]
+                    ),
                     current_head_pose=self._look_at_reference_pose,
                     body_yaw=body_yaw,
                 )
@@ -708,7 +747,11 @@ class VisualServoController:
                 )
 
             record["smoothed_target"] = (
-                finite_json_value(pixel) if detection is not None else None
+                finite_json_value(pixel)
+                if detection is not None
+                else self._look_at_target(smoothed_look_at)
+                if smoothed_look_at is not None
+                else None
             )
             record["current_joints"] = finite_json_value(current_joints)
             record["current_pose"] = finite_json_value(current_pose)

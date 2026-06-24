@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
-from reachy_mini.daemon.tracking.telemetry import dump_jsonl
+from reachy_mini.daemon.tracking.telemetry import dump_jsonl, summarize_records
 
 DEFAULT_BASE_URL = "http://reachy-mini.local:8017/api"
 DEFAULT_TRACKING_CONFIG = {
@@ -285,6 +285,7 @@ def replay(args: argparse.Namespace) -> dict[str, Any]:
 
 def summarize_replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     """Return replay-oriented summary fields from telemetry records."""
+    telemetry_summary = summarize_records(records)
     look_at = [record for record in records if record.get("target_type") == "look_at"]
     commanded = [
         record for record in look_at if isinstance(record.get("final_command"), list)
@@ -317,6 +318,8 @@ def summarize_replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "ik_failures": ik_failures,
         "reason_counts": reason_counts,
         "limit_hits": limit_hits,
+        "limit_hit_count": telemetry_summary["limit_hit_count"],
+        "command_smoothness": telemetry_summary["command_smoothness"],
         "target_y_span_m": _span(target_y),
         "target_z_span_m": _span(target_z),
         "final_command_spans_rad": command_spans,
