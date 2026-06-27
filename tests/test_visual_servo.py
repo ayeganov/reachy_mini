@@ -63,8 +63,10 @@ def test_look_at_joint_profile_converges_to_fixed_target_within_two_seconds() ->
         positions.append(float(command[1]))
 
     assert abs(positions[-1] - 0.3) <= 0.001
-    assert all(after >= before for before, after in zip(positions, positions[1:]))
-    assert max(positions) <= 0.3
+    assert all(
+        after >= before - 1e-12 for before, after in zip(positions, positions[1:])
+    )
+    assert max(positions) <= 0.3 + 1e-12
     np.testing.assert_allclose(profile._velocity, 0.0)
     np.testing.assert_allclose(profile._acceleration, 0.0)
 
@@ -86,32 +88,33 @@ def test_look_at_joint_profile_jerk_limits_normal_acceleration_changes() -> None
     assert np.max(np.abs(profile._acceleration - first)) <= 2.0 * 0.02
 
 
-def test_look_at_joint_profile_reports_target_crossing_reset_exceptions() -> None:
-    config = VisualServoConfig(
-        joint_safety_margin=0.0,
-        max_joint_velocity=2.0,
-        max_joint_acceleration=0.1,
-        max_joint_jerk=0.1,
-    )
+def test_look_at_joint_profile_has_no_unbounded_target_crossing_reset() -> None:
+    config = _acceptance_profile_config()
     profile = LookAtJointCommandProfile(config=config)
-    profile._position = np.zeros(6)
-    profile._velocity[0] = 1.0
-    profile._acceleration[0] = 1.0
-    desired = np.zeros(7)
-    desired[1] = 0.001
+    desired = np.array([0.0, *([0.3] * 6)])
+    previous_position = np.zeros(6)
+    previous_velocity = np.zeros(6)
+    previous_acceleration = np.zeros(6)
 
-    command, hits = profile.update_with_telemetry(desired, np.zeros(7), dt=0.02)
+    for dt in [0.0114, 0.0286, 0.017, 0.023, 0.02] * 25:
+        command, hits = profile.update_with_telemetry(desired, np.zeros(7), dt=dt)
+        velocity = (command[1:] - previous_position) / dt
+        acceleration = (velocity - previous_velocity) / dt
+        jerk = (acceleration - previous_acceleration) / dt
 
-    assert command[1] == desired[1]
-    assert profile._velocity[0] == 0.0
-    assert profile._acceleration[0] == 0.0
-    reset_hits = [hit for hit in hits if hit.get("reason") == "target_crossing_reset"]
-    assert {hit["kind"] for hit in reset_hits} == {"acceleration", "jerk"}
-    assert {hit["source"] for hit in reset_hits} == {
-        "profile_acceleration",
-        "profile_jerk",
-    }
-    assert all(hit["joint_index"] == 1 for hit in reset_hits)
+        assert np.max(np.abs(velocity)) <= config.max_joint_velocity + 1e-9
+        assert np.max(np.abs(acceleration)) <= config.max_joint_acceleration + 1e-9
+        assert np.max(np.abs(jerk)) <= config.max_joint_jerk + 1e-7
+        assert not any(hit.get("reason") == "target_crossing_reset" for hit in hits)
+        assert np.max(command[1:]) <= 0.3 + 1e-9
+
+        previous_position = command[1:].copy()
+        previous_velocity = velocity
+        previous_acceleration = acceleration
+
+    np.testing.assert_allclose(command[1:], 0.3, atol=1e-9)
+    np.testing.assert_allclose(profile._velocity, 0.0, atol=1e-9)
+    np.testing.assert_allclose(profile._acceleration, 0.0, atol=1e-9)
 
 
 def test_look_at_joint_profile_reports_position_saturation_sources() -> None:
@@ -120,7 +123,7 @@ def test_look_at_joint_profile_reports_position_saturation_sources() -> None:
         joint_safety_margin=0.0,
         max_joint_velocity=100.0,
         max_joint_acceleration=100.0,
-        max_joint_jerk=1e9,
+        max_joint_jerk=0.1,
         look_at_profile_response_hz=0.001,
     )
     profile = LookAtJointCommandProfile(limits=limits, config=config)
@@ -217,7 +220,9 @@ class _MotionTestKinematics:
         self.automatic_body_yaw = automatic_body_yaw
 
     def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-        return self.joints.copy()
+        joints = self.joints.copy()
+        joints[0] = body_yaw
+        return joints
 
 
 class _MotionTestBackend:
@@ -247,7 +252,7 @@ class _MotionTestBackend:
 
 
 def test_visual_servo_records_profiled_look_at_command() -> None:
-    desired = np.array([0.7, *([0.3] * 6)])
+    desired = np.array([0.1, *([0.3] * 6)])
     backend = _MotionTestBackend(desired)
     backend.current = np.array([0.1, *([0.2] * 6)])
     controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
@@ -261,6 +266,33 @@ def test_visual_servo_records_profiled_look_at_command() -> None:
         assert isinstance(vector, list) and len(vector) == 7
         assert all(isinstance(value, float) and np.isfinite(value) for value in vector)
     assert record["profiled_command"][0] == record["ik_joints"][0]
+    assert record["final_command"] == record["profiled_command"]
+    assert record["limit_hits"] == []
+
+
+def test_visual_servo_rejects_unsafe_profiled_body_yaw_without_writing() -> None:
+    backend = _MotionTestBackend()
+
+    def unsafe_ik(pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+        return np.array([0.2, *([0.2] * 6)])
+
+    backend.head_kinematics.ik = unsafe_ik  # type: ignore[method-assign]
+    controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+
+    assert not controller.step(dt=0.02)
+
+    assert backend.commands == []
+    assert controller.look_at_profile._position is None
+    assert controller.look_at_guard._last_command is None
+    record = controller.telemetry.query()["records"][0]
+    assert record["reason"] == "safety_rejected"
+    assert record["final_command"] is None
+    assert {hit["kind"] for hit in record["limit_hits"]} >= {
+        "velocity",
+        "acceleration",
+        "jerk",
+    }
 
 
 def test_visual_servo_profile_fields_are_empty_without_profile_update() -> None:
@@ -318,7 +350,7 @@ def test_visual_servo_profile_fields_are_empty_without_profile_update() -> None:
     assert all(record["profile_limit_hits"] == [] for record in records)
 
 
-def test_visual_servo_look_at_ik_failure_resets_profile_and_seeds_limiter() -> None:
+def test_visual_servo_look_at_ik_failure_resets_profile_and_seeds_guard() -> None:
     backend = _MotionTestBackend()
     controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
@@ -329,9 +361,12 @@ def test_visual_servo_look_at_ik_failure_resets_profile_and_seeds_limiter() -> N
     assert not controller.step(dt=0.02)
 
     assert controller.look_at_profile._position is None
-    np.testing.assert_array_equal(controller.limiter._last_command, backend.current)
-    np.testing.assert_allclose(controller.limiter._velocity, 0.0)
-    np.testing.assert_allclose(controller.limiter._acceleration, 0.0)
+    np.testing.assert_array_equal(
+        controller.look_at_guard._last_command, backend.current
+    )
+    np.testing.assert_allclose(controller.look_at_guard._velocity, 0.0)
+    np.testing.assert_allclose(controller.look_at_guard._acceleration, 0.0)
+    assert controller.limiter._last_command is None
     assert controller._last_command_path == "look_at"
 
 
@@ -349,12 +384,12 @@ def test_visual_servo_no_target_gap_clears_look_at_motion_state() -> None:
     assert not controller.step(dt=0.02)
 
     assert controller.look_at_profile._position is None
-    assert controller.limiter._last_command is None
+    assert controller.look_at_guard._last_command is None
     assert controller._last_command_path is None
     assert (backend.joint_reads, backend.pose_reads) == reads
 
 
-def test_visual_servo_detection_keeps_limiter_state() -> None:
+def test_visual_servo_detection_initializes_its_limiter_after_look_at() -> None:
     backend = _MotionTestBackend()
     controller = VisualServoController(
         backend=backend,  # type: ignore[arg-type]
@@ -362,15 +397,13 @@ def test_visual_servo_detection_keeps_limiter_state() -> None:
     )
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
     assert controller.step(dt=0.02)
-    previous_command = controller.limiter._last_command.copy()  # type: ignore[union-attr]
+    assert controller.limiter._last_command is None
     original_limit = controller.limiter.limit_with_telemetry
 
     def check_existing_state(
         desired: np.ndarray, current: np.ndarray, dt: float
     ) -> tuple[np.ndarray, dict[str, object]]:
-        np.testing.assert_array_equal(
-            controller.limiter._last_command, previous_command
-        )
+        assert controller.limiter._last_command is None
         return original_limit(desired, current, dt)
 
     controller.limiter.limit_with_telemetry = check_existing_state  # type: ignore[method-assign]
@@ -379,6 +412,7 @@ def test_visual_servo_detection_keeps_limiter_state() -> None:
 
     assert controller.step(dt=0.02)
     assert controller.look_at_profile._position is None
+    assert controller.look_at_guard._last_command is None
     assert controller._last_command_path == "detection"
 
 
@@ -423,6 +457,65 @@ def test_visual_servo_rejects_invalid_dt_before_backend_reads() -> None:
     assert backend.commands == []
 
 
+def test_visual_servo_resets_without_io_after_a_control_stall() -> None:
+    backend = _MotionTestBackend()
+    controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
+    controller.look_at_profile._position = np.ones(6)
+    controller.look_at_guard._last_command = np.ones(7)
+    controller.limiter._last_command = np.ones(7)
+    controller._last_command_path = "look_at"
+
+    assert not controller.step(dt=0.041)
+
+    assert controller.look_at_profile._position is None
+    assert controller.look_at_guard._last_command is None
+    assert controller.limiter._last_command is None
+    assert controller._last_command_path is None
+    assert backend.joint_reads == 0
+    assert backend.pose_reads == 0
+    assert backend.commands == []
+    record = controller.telemetry.query()["records"][0]
+    assert record["reason"] == "control_stall"
+    assert record["dt"] == 0.041
+
+
+def test_visual_servo_look_at_commands_obey_elapsed_time_limits_under_jitter() -> None:
+    config = _acceptance_profile_config()
+    desired = np.array([0.0, *([0.3] * 6)])
+    backend = _MotionTestBackend(desired)
+    controller = VisualServoController(
+        backend=backend,
+        config=config,  # type: ignore[arg-type]
+    )
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+    dts = [0.0114, 0.0286, 0.017, 0.023, 0.02] * 25
+    previous_command = backend.current.copy()
+    previous_velocity = np.zeros(7)
+    previous_acceleration = np.zeros(7)
+
+    for dt in dts:
+        assert controller.step(dt=dt)
+        command = backend.commands[-1]
+        velocity = (command - previous_command) / dt
+        acceleration = (velocity - previous_velocity) / dt
+        jerk = (acceleration - previous_acceleration) / dt
+        assert np.max(np.abs(velocity)) <= config.max_joint_velocity + 1e-9
+        assert np.max(np.abs(acceleration)) <= config.max_joint_acceleration + 1e-9
+        assert np.max(np.abs(jerk)) <= config.max_joint_jerk + 1e-7
+        previous_command = command
+        previous_velocity = velocity
+        previous_acceleration = acceleration
+        backend.current = command.copy()
+
+    records = controller.telemetry.query()["records"]
+    assert [record["dt"] for record in records] == dts
+    assert all(record["reason"] == "commanded" for record in records)
+    assert all(
+        record["final_command"] == record["profiled_command"] for record in records
+    )
+    assert all(record["limit_hits"] == [] for record in records)
+
+
 def test_visual_servo_backend_write_failure_resets_state_and_recovers() -> None:
     desired = np.array([0.2, *([0.6] * 6)])
     backend = _MotionTestBackend(desired)
@@ -433,6 +526,7 @@ def test_visual_servo_backend_write_failure_resets_state_and_recovers() -> None:
     with pytest.raises(RuntimeError, match="write failed"):
         controller.step(dt=0.02)
     assert controller.look_at_profile._position is None
+    assert controller.look_at_guard._last_command is None
     assert controller.limiter._last_command is None
     assert controller._last_command_path is None
 
@@ -463,6 +557,7 @@ def test_visual_servo_detection_backend_write_failure_resets_limiter_and_recover
     assert controller._last_command_path is None
 
     backend.current = np.full(7, 0.4)
+    desired[0] = backend.current[0]
     expected = JointCommandLimiter(config=config).limit(
         desired, backend.current, dt=0.02
     )
@@ -483,6 +578,7 @@ def test_visual_servo_non_finite_current_joints_fail_closed_and_recover() -> Non
     assert backend.pose_reads == 0
     assert backend.commands == []
     assert controller.look_at_profile._position is None
+    assert controller.look_at_guard._last_command is None
     assert controller.limiter._last_command is None
 
     backend.current = np.full(7, 0.3)
@@ -509,20 +605,24 @@ def test_visual_servo_start_and_stop_reset_motion_state(
     backend = _MotionTestBackend()
     controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
     controller.look_at_profile._position = np.ones(6)
+    controller.look_at_guard._last_command = np.ones(7)
     controller.limiter._last_command = np.ones(7)
     controller._last_command_path = "look_at"
     monkeypatch.setattr(visual_servo_module.threading, "Thread", ControlledThread)
 
     controller.start()
     assert controller.look_at_profile._position is None
+    assert controller.look_at_guard._last_command is None
     assert controller.limiter._last_command is None
     assert controller._last_command_path is None
 
     controller.look_at_profile._position = np.ones(6)
+    controller.look_at_guard._last_command = np.ones(7)
     controller.limiter._last_command = np.ones(7)
     controller._last_command_path = "look_at"
     controller.stop()
     assert controller.look_at_profile._position is None
+    assert controller.look_at_guard._last_command is None
     assert controller.limiter._last_command is None
     assert controller._last_command_path is None
     assert backend.joint_reads == 0
@@ -539,12 +639,14 @@ def test_visual_servo_start_and_stop_reset_motion_state(
     timed_out = VisualServoController(backend=backend)  # type: ignore[arg-type]
     timed_out._thread = StuckThread()  # type: ignore[assignment]
     timed_out.look_at_profile._position = np.ones(6)
+    timed_out.look_at_guard._last_command = np.ones(7)
     timed_out.limiter._last_command = np.ones(7)
     timed_out._last_command_path = "look_at"
 
     timed_out.stop()
 
     np.testing.assert_array_equal(timed_out.look_at_profile._position, np.ones(6))
+    np.testing.assert_array_equal(timed_out.look_at_guard._last_command, np.ones(7))
     np.testing.assert_array_equal(timed_out.limiter._last_command, np.ones(7))
     assert timed_out._last_command_path == "look_at"
 
@@ -787,7 +889,7 @@ def test_visual_servo_commands_from_3d_look_at_target() -> None:
 
         def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
             self.last_pose = pose
-            return np.full(7, 0.2)
+            return np.array([body_yaw, *([0.2] * 6)])
 
     class FakeBackend:
         is_move_running = False
@@ -906,7 +1008,7 @@ def test_visual_servo_3d_look_at_uses_world_up_for_predictable_target_plane() ->
 
         def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
             self.last_pose = pose
-            return np.full(7, 0.2)
+            return np.array([body_yaw, *([0.2] * 6)])
 
     class FakeBackend:
         is_move_running = False
@@ -1080,7 +1182,7 @@ def test_visual_servo_uses_backend_motion_guard_for_joint_write() -> None:
             self.automatic_body_yaw = automatic_body_yaw
 
         def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.full(7, 0.2)
+            return np.array([body_yaw, *([0.2] * 6)])
 
     class GuardedBackend:
         is_move_running = False
@@ -1122,7 +1224,7 @@ def test_visual_servo_skips_command_when_backend_motion_guard_is_busy() -> None:
             self.automatic_body_yaw = automatic_body_yaw
 
         def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.full(7, 0.2)
+            return np.array([body_yaw, *([0.2] * 6)])
 
     class BusyBackend:
         is_move_running = False
@@ -1494,7 +1596,7 @@ def test_visual_servo_records_commanded_look_at_tick() -> None:
         automatic_body_yaw = True
 
         def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.full(7, 0.2)
+            return np.array([body_yaw, *([0.2] * 6)])
 
     class FakeBackend:
         is_move_running = False
@@ -1524,7 +1626,7 @@ def test_visual_servo_records_commanded_look_at_tick() -> None:
     assert record["actual_joints"] == [0.0] * 7
     assert record["actual_joints_source"] == "present_read_before_command"
     assert record["final_command"] is not None
-    assert record["ik_joints"] == [0.2] * 7
+    assert record["ik_joints"] == [0.0, *([0.2] * 6)]
     assert record["ik_target"] is not None
     assert record["body_yaw"]["current"] == 0.0  # type: ignore[index]
     assert record["body_yaw"]["ik_input"] == 0.0  # type: ignore[index]
@@ -1637,3 +1739,53 @@ def test_visual_servo_run_loop_records_step_error() -> None:
     record = controller.telemetry.query()["records"][0]
     assert record["reason"] == "step_error"
     assert record["error"] == "boom"
+
+
+def test_visual_servo_run_loop_uses_elapsed_time_without_catch_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.head_kinematics = object()
+
+    class FakeStopEvent:
+        def __init__(self) -> None:
+            self.stopped = False
+            self.waits: list[float] = []
+
+        def is_set(self) -> bool:
+            return self.stopped
+
+        def set(self) -> None:
+            self.stopped = True
+
+        def wait(self, timeout: float) -> bool:
+            self.waits.append(timeout)
+            clock[0] += timeout
+            return self.stopped
+
+    clock = [10.0]
+    controller = VisualServoController(backend=FakeBackend())  # type: ignore[arg-type]
+    stop_event = FakeStopEvent()
+    controller._stop_event = stop_event  # type: ignore[assignment]
+    dts: list[float] = []
+    processing_times = iter([0.005, 0.03, 0.0])
+
+    def monotonic() -> float:
+        return clock[0]
+
+    def step(dt: float | None = None) -> bool:
+        assert dt is not None
+        dts.append(dt)
+        clock[0] += next(processing_times)
+        if len(dts) == 3:
+            stop_event.set()
+        return False
+
+    monkeypatch.setattr(visual_servo_module.time, "monotonic", monotonic)
+    controller.step = step  # type: ignore[method-assign]
+
+    controller._run_loop()
+
+    assert dts == pytest.approx([0.02, 0.02, 0.03])
+    assert stop_event.waits == pytest.approx([0.015, 0.0, 0.02])

@@ -284,6 +284,85 @@ class LookAtJointCommandProfile:
         self._velocity = np.zeros(6, dtype=np.float64)
         self._acceleration = np.zeros(6, dtype=np.float64)
 
+    @staticmethod
+    def _advance_motion(
+        position: float,
+        velocity: float,
+        acceleration: float,
+        jerk: float,
+        duration: float,
+    ) -> tuple[float, float, float]:
+        return (
+            position
+            + velocity * duration
+            + 0.5 * acceleration * duration**2
+            + jerk * duration**3 / 6.0,
+            velocity + acceleration * duration + 0.5 * jerk * duration**2,
+            acceleration + jerk * duration,
+        )
+
+    @classmethod
+    def _stopping_distance(
+        cls,
+        velocity: float,
+        acceleration: float,
+        max_jerk: float,
+        max_acceleration: float,
+    ) -> float:
+        """Estimate forward distance needed for a jerk-bounded stop."""
+        if velocity <= 0.0:
+            return 0.0
+
+        peak_acceleration = np.sqrt(
+            max(0.0, acceleration**2 / 2.0 + max_jerk * velocity)
+        )
+        position = 0.0
+        if peak_acceleration <= max_acceleration:
+            ramp_down = max(0.0, (acceleration + peak_acceleration) / max_jerk)
+            position, velocity, acceleration = cls._advance_motion(
+                position,
+                velocity,
+                acceleration,
+                -max_jerk,
+                ramp_down,
+            )
+            position, _velocity, _acceleration = cls._advance_motion(
+                position,
+                velocity,
+                acceleration,
+                max_jerk,
+                peak_acceleration / max_jerk,
+            )
+            return max(0.0, position)
+
+        ramp_down = max(0.0, (acceleration + max_acceleration) / max_jerk)
+        position, velocity, acceleration = cls._advance_motion(
+            position,
+            velocity,
+            acceleration,
+            -max_jerk,
+            ramp_down,
+        )
+        hold = max(
+            0.0,
+            velocity / max_acceleration - max_acceleration / (2.0 * max_jerk),
+        )
+        position, velocity, acceleration = cls._advance_motion(
+            position,
+            velocity,
+            acceleration,
+            0.0,
+            hold,
+        )
+        position, _velocity, _acceleration = cls._advance_motion(
+            position,
+            velocity,
+            acceleration,
+            max_jerk,
+            max_acceleration / max_jerk,
+        )
+        return max(0.0, position)
+
     def update_with_telemetry(
         self,
         desired: npt.NDArray[np.float64],
@@ -333,93 +412,140 @@ class LookAtJointCommandProfile:
                     }
                 )
 
+        target = np.clip(desired_stewart, lower, upper)
         omega = 2.0 * np.pi * self.config.look_at_profile_response_hz
-        error = desired_stewart - position
-        requested_acceleration = omega * omega * error - 2.0 * omega * velocity
-        requested_delta = requested_acceleration - acceleration
-        max_acceleration_delta = self.config.max_joint_jerk * dt
-        for index, delta in enumerate(requested_delta, start=1):
-            if abs(float(delta)) > max_acceleration_delta:
+        next_position = position.copy()
+        next_velocity = velocity.copy()
+        next_acceleration = acceleration.copy()
+        max_velocity = self.config.max_joint_velocity
+        max_acceleration = self.config.max_joint_acceleration
+        max_jerk = self.config.max_joint_jerk
+
+        for local_index in range(6):
+            error = float(target[local_index] - position[local_index])
+            direction = 1.0 if error >= 0.0 else -1.0
+            distance = abs(error)
+            directed_velocity = direction * float(velocity[local_index])
+            directed_acceleration = direction * float(acceleration[local_index])
+
+            if (
+                distance <= 1e-12
+                and abs(directed_velocity) <= 1e-10
+                and abs(directed_acceleration) <= 1e-8
+            ):
+                next_position[local_index] = target[local_index]
+                next_velocity[local_index] = 0.0
+                next_acceleration[local_index] = 0.0
+                continue
+
+            requested_directed_acceleration = (
+                omega * omega * distance - omega * directed_velocity
+            )
+            requested_acceleration = direction * requested_directed_acceleration
+            requested_delta = requested_acceleration - acceleration[local_index]
+            requested_velocity = velocity[local_index] + requested_acceleration * dt
+            joint_index = local_index + 1
+            if abs(float(requested_delta / dt)) > max_jerk:
                 hits.append(
                     {
-                        "joint_index": index,
+                        "joint_index": joint_index,
                         "kind": "jerk",
                         "source": "profile_jerk",
-                        "value": float(delta / dt),
-                        "limit": float(self.config.max_joint_jerk),
+                        "value": float(requested_delta / dt),
+                        "limit": float(max_jerk),
                     }
                 )
-        acceleration += np.clip(
-            requested_delta, -max_acceleration_delta, max_acceleration_delta
-        )
-        for index, value in enumerate(acceleration, start=1):
-            if abs(float(value)) > self.config.max_joint_acceleration:
+            if abs(float(requested_acceleration)) > max_acceleration:
                 hits.append(
                     {
-                        "joint_index": index,
+                        "joint_index": joint_index,
                         "kind": "acceleration",
                         "source": "profile_acceleration",
-                        "value": float(value),
-                        "limit": float(self.config.max_joint_acceleration),
+                        "value": float(requested_acceleration),
+                        "limit": float(max_acceleration),
                     }
                 )
-        np.clip(
-            acceleration,
-            -self.config.max_joint_acceleration,
-            self.config.max_joint_acceleration,
-            out=acceleration,
-        )
-
-        velocity += acceleration * dt
-        for index, value in enumerate(velocity, start=1):
-            if abs(float(value)) > self.config.max_joint_velocity:
+            if abs(float(requested_velocity)) > max_velocity:
                 hits.append(
                     {
-                        "joint_index": index,
+                        "joint_index": joint_index,
                         "kind": "velocity",
                         "source": "profile_velocity",
-                        "value": float(value),
-                        "limit": float(self.config.max_joint_velocity),
+                        "value": float(requested_velocity),
+                        "limit": float(max_velocity),
                     }
                 )
-        np.clip(
-            velocity,
-            -self.config.max_joint_velocity,
-            self.config.max_joint_velocity,
-            out=velocity,
-        )
 
-        next_position = position + velocity * dt
-        next_error = desired_stewart - next_position
-        should_snap = (np.sign(next_error) != np.sign(error)) | (np.abs(error) <= 1e-6)
-        for index in np.flatnonzero(should_snap):
-            effective_acceleration = -velocity[index] / dt
-            effective_jerk = -acceleration[index] / dt
-            if abs(float(effective_acceleration)) > self.config.max_joint_acceleration:
-                hits.append(
-                    {
-                        "joint_index": int(index + 1),
-                        "kind": "acceleration",
-                        "source": "profile_acceleration",
-                        "value": float(effective_acceleration),
-                        "limit": float(self.config.max_joint_acceleration),
-                        "reason": "target_crossing_reset",
-                    }
+            acceleration_low = max(
+                -max_acceleration, directed_acceleration - max_jerk * dt
+            )
+            acceleration_high = min(
+                max_acceleration, directed_acceleration + max_jerk * dt
+            )
+            candidate = float(
+                np.clip(
+                    requested_directed_acceleration,
+                    acceleration_low,
+                    acceleration_high,
                 )
-            if abs(float(effective_jerk)) > self.config.max_joint_jerk:
-                hits.append(
-                    {
-                        "joint_index": int(index + 1),
-                        "kind": "jerk",
-                        "source": "profile_jerk",
-                        "value": float(effective_jerk),
-                        "limit": float(self.config.max_joint_jerk),
-                        "reason": "target_crossing_reset",
-                    }
+            )
+
+            def speed_at_rest(acceleration_value: float) -> float:
+                velocity_after_step = directed_velocity + acceleration_value * dt
+                return velocity_after_step + max(0.0, acceleration_value) ** 2 / (
+                    2.0 * max_jerk
                 )
-            next_position[index] = desired_stewart[index]
-            velocity[index] = 0.0
-            acceleration[index] = 0.0
+
+            if speed_at_rest(candidate) > max_velocity:
+                speed_low = acceleration_low
+                speed_high = candidate
+                if speed_at_rest(speed_low) >= max_velocity:
+                    candidate = speed_low
+                else:
+                    for _ in range(30):
+                        midpoint = (speed_low + speed_high) / 2.0
+                        if speed_at_rest(midpoint) > max_velocity:
+                            speed_high = midpoint
+                        else:
+                            speed_low = midpoint
+                    candidate = (speed_low + speed_high) / 2.0
+
+            def distance_after_step(acceleration_value: float) -> float:
+                velocity_after_step = max(
+                    0.0, directed_velocity + acceleration_value * dt
+                )
+                return velocity_after_step * dt + self._stopping_distance(
+                    velocity_after_step,
+                    acceleration_value,
+                    max_jerk,
+                    max_acceleration,
+                )
+
+            chosen_acceleration = candidate
+            if directed_velocity >= 0.0:
+                if distance_after_step(acceleration_low) >= distance:
+                    chosen_acceleration = acceleration_low
+                elif distance_after_step(candidate) > distance:
+                    search_low = acceleration_low
+                    search_high = candidate
+                    for _ in range(30):
+                        midpoint = (search_low + search_high) / 2.0
+                        if distance_after_step(midpoint) > distance:
+                            search_high = midpoint
+                        else:
+                            search_low = midpoint
+                    chosen_acceleration = (search_low + search_high) / 2.0
+
+            next_acceleration[local_index] = direction * chosen_acceleration
+            next_velocity[local_index] = (
+                velocity[local_index] + next_acceleration[local_index] * dt
+            )
+            next_position[local_index] = (
+                position[local_index] + next_velocity[local_index] * dt
+            )
+
+        velocity = next_velocity
+        acceleration = next_acceleration
 
         for index, (value, low, high) in enumerate(
             zip(next_position, lower, upper), start=1
@@ -452,6 +578,103 @@ class LookAtJointCommandProfile:
         profiled = desired_vector.copy()
         profiled[1:7] = position
         return profiled, hits
+
+
+class JointCommandSafetyGuard:
+    """Reject unsafe profiled commands without generating another trajectory."""
+
+    def __init__(
+        self,
+        limits: npt.NDArray[np.float64] = HEAD_JOINT_LIMITS,
+        config: VisualServoConfig | None = None,
+    ) -> None:
+        """Initialize the guard."""
+        if limits.shape != (7, 2):
+            raise ValueError("limits must have shape (7, 2)")
+        self.limits = limits.astype(np.float64)
+        self.config = config or VisualServoConfig()
+        self._last_command: npt.NDArray[np.float64] | None = None
+        self._velocity: npt.NDArray[np.float64] = np.zeros(7, dtype=np.float64)
+        self._acceleration: npt.NDArray[np.float64] = np.zeros(7, dtype=np.float64)
+
+    def reset(self, command: npt.NDArray[np.float64] | None = None) -> None:
+        """Clear derivative state, optionally seeding the command position."""
+        self._last_command = command.copy() if command is not None else None
+        self._velocity = np.zeros(7, dtype=np.float64)
+        self._acceleration = np.zeros(7, dtype=np.float64)
+
+    def check(
+        self,
+        command: npt.NDArray[np.float64],
+        current: npt.NDArray[np.float64],
+        dt: float,
+    ) -> tuple[
+        list[dict[str, float | int | str]],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+    ]:
+        """Return violations and derivative state without changing the command."""
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError("dt must be finite and positive")
+        command_vector = _finite_joint_vector(command, length=7, name="command")
+        current_vector = _finite_joint_vector(current, length=7, name="current")
+        reference = current_vector if self._last_command is None else self._last_command
+        velocity = (command_vector - reference) / dt
+        acceleration = (velocity - self._velocity) / dt
+        jerk = (acceleration - self._acceleration) / dt
+        margin = self.config.joint_safety_margin
+        lower = self.limits[:, 0] + margin
+        upper = self.limits[:, 1] - margin
+        tolerance = 1e-7
+        hits: list[dict[str, float | int | str]] = []
+
+        for index, value in enumerate(command_vector):
+            if value < lower[index] - tolerance:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "lower_position",
+                        "value": float(value),
+                        "limit": float(lower[index]),
+                    }
+                )
+            if value > upper[index] + tolerance:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "upper_position",
+                        "value": float(value),
+                        "limit": float(upper[index]),
+                    }
+                )
+
+        for kind, values, limit in (
+            ("velocity", velocity, self.config.max_joint_velocity),
+            ("acceleration", acceleration, self.config.max_joint_acceleration),
+            ("jerk", jerk, self.config.max_joint_jerk),
+        ):
+            for index, value in enumerate(values):
+                if abs(float(value)) > limit + tolerance:
+                    hits.append(
+                        {
+                            "joint_index": index,
+                            "kind": kind,
+                            "value": float(value),
+                            "limit": float(limit),
+                        }
+                    )
+        return hits, velocity, acceleration
+
+    def commit(
+        self,
+        command: npt.NDArray[np.float64],
+        velocity: npt.NDArray[np.float64],
+        acceleration: npt.NDArray[np.float64],
+    ) -> None:
+        """Retain a command after its backend write succeeds."""
+        self._last_command = command.copy()
+        self._velocity = velocity.copy()
+        self._acceleration = acceleration.copy()
 
 
 class JointCommandLimiter:
@@ -649,6 +872,7 @@ class VisualServoController:
         self.filter = PixelTargetFilter(self.config.smoothing_alpha)
         self.look_at_filter = LookAtTargetFilter(self.config.smoothing_alpha)
         self.look_at_profile = LookAtJointCommandProfile(config=self.config)
+        self.look_at_guard = JointCommandSafetyGuard(config=self.config)
         self.limiter = JointCommandLimiter(config=self.config)
         self.telemetry = VisualServoTelemetryBuffer(
             capacity=self.config.telemetry_capacity
@@ -688,6 +912,7 @@ class VisualServoController:
         self.filter.reset()
         self.look_at_filter.reset()
         self.look_at_profile.reset()
+        self.look_at_guard.reset()
         self.limiter.reset()
         self._last_command_path = None
         self._look_at_reference_pose = None
@@ -720,6 +945,7 @@ class VisualServoController:
         self._look_at_reference_pose = None
         self.look_at_filter.reset()
         self.look_at_profile.reset()
+        self.look_at_guard.reset()
         self.limiter.reset()
         self._last_command_path = None
         self._restore_automatic_body_yaw()
@@ -853,16 +1079,18 @@ class VisualServoController:
 
     def _run_loop(self) -> None:
         period = 1.0 / self.config.control_frequency
-        next_tick = time.monotonic()
+        previous_start: float | None = None
         while not self._stop_event.is_set():
             start = time.monotonic()
+            dt = period if previous_start is None else start - previous_start
+            previous_start = start
             try:
-                self.step(period)
+                self.step(dt)
             except Exception as exc:
                 self._error = str(exc)
                 self._last_reason = "error"
                 record = self._new_telemetry_record(
-                    dt=period,
+                    dt=dt,
                     target_type="none",
                     reason="step_error",
                     start_monotonic=start,
@@ -872,10 +1100,7 @@ class VisualServoController:
                 log = logging.getLogger(__name__)
                 log.exception("Visual servo step failed")
 
-            next_tick += period
-            sleep_time = max(0.0, next_tick - time.monotonic())
-            if sleep_time == 0.0:
-                next_tick = start
+            sleep_time = max(0.0, period - (time.monotonic() - start))
             self._stop_event.wait(sleep_time)
 
     def step(self, dt: float | None = None) -> bool:
@@ -887,6 +1112,18 @@ class VisualServoController:
         if not np.isfinite(dt) or dt <= 0.0:
             raise ValueError("dt must be finite and positive")
         start_monotonic = time.monotonic()
+        if dt > 2.0 / self.config.control_frequency:
+            self._reset_motion_state()
+            self._last_reason = "control_stall"
+            self._append_telemetry(
+                self._new_telemetry_record(
+                    dt=dt,
+                    target_type="none",
+                    reason="control_stall",
+                    start_monotonic=start_monotonic,
+                )
+            )
+            return False
 
         look_at = self.look_at_buffer.fresh(self.config)
         detection = None
@@ -894,10 +1131,10 @@ class VisualServoController:
             self._look_at_reference_pose = None
             self.look_at_filter.reset()
             self.look_at_profile.reset()
+            self.look_at_guard.reset()
             detection = self.buffer.fresh(self.config)
             if detection is None:
                 if self._last_command_path == "look_at":
-                    self.limiter.reset()
                     self._last_command_path = None
                 self._last_reason = "no_fresh_detection"
                 self._append_telemetry(
@@ -945,6 +1182,7 @@ class VisualServoController:
                 )
             except ValueError:
                 self.look_at_profile.reset()
+                self.look_at_guard.reset()
                 self.limiter.reset()
                 raise
             current_pose = np.array(
@@ -1010,7 +1248,7 @@ class VisualServoController:
             if target_result.joints is None:
                 if look_at is not None:
                     self.look_at_profile.reset()
-                    self.limiter.reset(current_joints)
+                    self.look_at_guard.reset(current_joints)
                 record["reason"] = "ik_failed"
                 self._last_reason = "ik_failed"
                 record["latency"]["processing_duration"] = (
@@ -1030,18 +1268,47 @@ class VisualServoController:
                 )
                 record["profiled_command"] = finite_json_value(desired_joints)
                 record["profile_limit_hits"] = profile_hits
-            command, limit_telemetry = self.limiter.limit_with_telemetry(
-                desired=desired_joints,
-                current=current_joints,
-                dt=dt,
-            )
-            record["limit_hits"] = limit_telemetry["limit_hits"]
+                guard_hits, guard_velocity, guard_acceleration = (
+                    self.look_at_guard.check(
+                        command=desired_joints,
+                        current=current_joints,
+                        dt=dt,
+                    )
+                )
+                record["limit_hits"] = guard_hits
+                if guard_hits:
+                    self.look_at_profile.reset()
+                    self.look_at_guard.reset()
+                    record["reason"] = "safety_rejected"
+                    record["latency"]["processing_duration"] = (
+                        time.monotonic() - start_monotonic
+                    )
+                    self._last_reason = "safety_rejected"
+                    self._append_telemetry(record)
+                    return False
+                command = desired_joints
+            else:
+                if self._last_command_path != "detection":
+                    self.limiter.reset()
+                command, limit_telemetry = self.limiter.limit_with_telemetry(
+                    desired=desired_joints,
+                    current=current_joints,
+                    dt=dt,
+                )
+                record["limit_hits"] = limit_telemetry["limit_hits"]
             try:
                 self.backend.set_target_head_joint_positions(command)
             except Exception:
                 self.look_at_profile.reset()
+                self.look_at_guard.reset()
                 self.limiter.reset()
                 raise
+            if look_at is not None:
+                self.look_at_guard.commit(
+                    command,
+                    guard_velocity,
+                    guard_acceleration,
+                )
             self._last_command_path = target_type
             self._last_command = command.copy()
             self._command_count += 1
@@ -1057,6 +1324,16 @@ class VisualServoController:
             return True
         finally:
             release_motion_guard()
+
+    def _reset_motion_state(self) -> None:
+        """Reset controller-owned motion state without backend I/O."""
+        self.filter.reset()
+        self.look_at_filter.reset()
+        self.look_at_profile.reset()
+        self.look_at_guard.reset()
+        self.limiter.reset()
+        self._look_at_reference_pose = None
+        self._last_command_path = None
 
     def _try_acquire_motion_guard(self) -> Callable[[], None] | None:
         """Acquire backend motion ownership for one servo step."""
