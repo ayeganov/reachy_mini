@@ -272,6 +272,9 @@ class LookAtJointCommandProfile:
         self._position: npt.NDArray[np.float64] | None = None
         self._velocity = np.zeros(6, dtype=np.float64)
         self._acceleration = np.zeros(6, dtype=np.float64)
+        self._body_yaw_position: float | None = None
+        self._body_yaw_velocity = 0.0
+        self._body_yaw_acceleration = 0.0
 
     def _validate_response_frequency(self) -> None:
         response_hz = self.config.look_at_profile_response_hz
@@ -283,6 +286,9 @@ class LookAtJointCommandProfile:
         self._position = None
         self._velocity = np.zeros(6, dtype=np.float64)
         self._acceleration = np.zeros(6, dtype=np.float64)
+        self._body_yaw_position = None
+        self._body_yaw_velocity = 0.0
+        self._body_yaw_acceleration = 0.0
 
     @staticmethod
     def _advance_motion(
@@ -376,21 +382,34 @@ class LookAtJointCommandProfile:
         desired_vector = _finite_joint_vector(desired, length=7, name="desired")
         current_vector = _finite_joint_vector(current, length=7, name="current")
 
-        position = (
+        stewart_position = (
             current_vector[1:7].copy()
             if self._position is None
             else self._position.copy()
         )
-        velocity = self._velocity.copy()
-        acceleration = self._acceleration.copy()
-        desired_stewart = desired_vector[1:7]
-        lower = self.limits[1:7, 0] + self.config.joint_safety_margin
-        upper = self.limits[1:7, 1] - self.config.joint_safety_margin
+        position = np.concatenate(
+            (
+                np.array(
+                    [
+                        current_vector[0]
+                        if self._body_yaw_position is None
+                        else self._body_yaw_position
+                    ]
+                ),
+                stewart_position,
+            )
+        )
+        velocity = np.concatenate(
+            (np.array([self._body_yaw_velocity]), self._velocity.copy())
+        )
+        acceleration = np.concatenate(
+            (np.array([self._body_yaw_acceleration]), self._acceleration.copy())
+        )
+        lower = self.limits[:, 0] + self.config.joint_safety_margin
+        upper = self.limits[:, 1] - self.config.joint_safety_margin
         hits: list[dict[str, float | int | str]] = []
 
-        for index, (value, low, high) in enumerate(
-            zip(desired_stewart, lower, upper), start=1
-        ):
+        for index, (value, low, high) in enumerate(zip(desired_vector, lower, upper)):
             if value < low:
                 hits.append(
                     {
@@ -412,7 +431,7 @@ class LookAtJointCommandProfile:
                     }
                 )
 
-        target = np.clip(desired_stewart, lower, upper)
+        target = np.clip(desired_vector, lower, upper)
         omega = 2.0 * np.pi * self.config.look_at_profile_response_hz
         next_position = position.copy()
         next_velocity = velocity.copy()
@@ -421,7 +440,7 @@ class LookAtJointCommandProfile:
         max_acceleration = self.config.max_joint_acceleration
         max_jerk = self.config.max_joint_jerk
 
-        for local_index in range(6):
+        for local_index in range(7):
             error = float(target[local_index] - position[local_index])
             direction = 1.0 if error >= 0.0 else -1.0
             distance = abs(error)
@@ -444,7 +463,7 @@ class LookAtJointCommandProfile:
             requested_acceleration = direction * requested_directed_acceleration
             requested_delta = requested_acceleration - acceleration[local_index]
             requested_velocity = velocity[local_index] + requested_acceleration * dt
-            joint_index = local_index + 1
+            joint_index = local_index
             if abs(float(requested_delta / dt)) > max_jerk:
                 hits.append(
                     {
@@ -547,9 +566,7 @@ class LookAtJointCommandProfile:
         velocity = next_velocity
         acceleration = next_acceleration
 
-        for index, (value, low, high) in enumerate(
-            zip(next_position, lower, upper), start=1
-        ):
+        for index, (value, low, high) in enumerate(zip(next_position, lower, upper)):
             if value < low:
                 hits.append(
                     {
@@ -572,12 +589,13 @@ class LookAtJointCommandProfile:
                 )
         position = np.clip(next_position, lower, upper)
 
-        self._position = position.copy()
-        self._velocity = velocity
-        self._acceleration = acceleration
-        profiled = desired_vector.copy()
-        profiled[1:7] = position
-        return profiled, hits
+        self._body_yaw_position = float(position[0])
+        self._body_yaw_velocity = float(velocity[0])
+        self._body_yaw_acceleration = float(acceleration[0])
+        self._position = position[1:7].copy()
+        self._velocity = velocity[1:7].copy()
+        self._acceleration = acceleration[1:7].copy()
+        return position, hits
 
 
 class JointCommandSafetyGuard:

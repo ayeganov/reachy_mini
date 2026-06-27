@@ -37,16 +37,14 @@ def _acceptance_profile_config() -> VisualServoConfig:
     )
 
 
-def test_look_at_joint_profile_initializes_from_current_and_preserves_body_yaw() -> (
-    None
-):
+def test_look_at_joint_profile_initializes_from_current_and_profiles_body_yaw() -> None:
     profile = LookAtJointCommandProfile(config=_acceptance_profile_config())
     current = np.array([0.1, *([0.2] * 6)])
     desired = np.array([0.7, *([0.3] * 6)])
 
     command, _hits = profile.update_with_telemetry(desired, current, dt=0.02)
 
-    assert command[0] == 0.7
+    assert current[0] < command[0] < desired[0]
     assert np.all(command[1:] >= current[1:])
     assert np.all(command[1:] < desired[1:])
     assert np.max(command[1:] - current[1:]) == pytest.approx(8.0 * 0.02**3)
@@ -172,6 +170,9 @@ def test_look_at_joint_profile_reset_clears_motion_state() -> None:
     profile.reset()
 
     assert profile._position is None
+    assert profile._body_yaw_position is None
+    assert profile._body_yaw_velocity == 0.0
+    assert profile._body_yaw_acceleration == 0.0
     np.testing.assert_allclose(profile._velocity, 0.0)
     np.testing.assert_allclose(profile._acceleration, 0.0)
 
@@ -184,6 +185,9 @@ def test_look_at_joint_profile_rejects_invalid_inputs_without_state_mutation() -
         profile._position.copy(),  # type: ignore[union-attr]
         profile._velocity.copy(),
         profile._acceleration.copy(),
+        profile._body_yaw_position,
+        profile._body_yaw_velocity,
+        profile._body_yaw_acceleration,
     )
     invalid_calls = [
         (desired, np.zeros(7), 0.0),
@@ -202,6 +206,9 @@ def test_look_at_joint_profile_rejects_invalid_inputs_without_state_mutation() -
         np.testing.assert_array_equal(profile._position, state[0])
         np.testing.assert_array_equal(profile._velocity, state[1])
         np.testing.assert_array_equal(profile._acceleration, state[2])
+        assert profile._body_yaw_position == state[3]
+        assert profile._body_yaw_velocity == state[4]
+        assert profile._body_yaw_acceleration == state[5]
 
     for response_hz in (0.0, -1.0, 5.1, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="look_at_profile_response_hz"):
@@ -272,12 +279,14 @@ def test_visual_servo_records_profiled_look_at_command() -> None:
 
 def test_visual_servo_rejects_unsafe_profiled_body_yaw_without_writing() -> None:
     backend = _MotionTestBackend()
-
-    def unsafe_ik(pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-        return np.array([0.2, *([0.2] * 6)])
-
-    backend.head_kinematics.ik = unsafe_ik  # type: ignore[method-assign]
     controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
+
+    def unsafe_profile(
+        desired: np.ndarray, current: np.ndarray, dt: float
+    ) -> tuple[np.ndarray, list[dict[str, float | int | str]]]:
+        return np.array([0.2, *([0.2] * 6)]), []
+
+    controller.look_at_profile.update_with_telemetry = unsafe_profile  # type: ignore[method-assign]
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
 
     assert not controller.step(dt=0.02)
@@ -514,6 +523,33 @@ def test_visual_servo_look_at_commands_obey_elapsed_time_limits_under_jitter() -
         record["final_command"] == record["profiled_command"] for record in records
     )
     assert all(record["limit_hits"] == [] for record in records)
+
+
+def test_visual_servo_profiles_body_yaw_encoder_steps() -> None:
+    config = _acceptance_profile_config()
+    backend = _MotionTestBackend(np.array([0.0, *([0.2] * 6)]))
+    backend.current[0] = 0.003067961575771161
+    controller = VisualServoController(
+        backend=backend,
+        config=config,  # type: ignore[arg-type]
+    )
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+
+    assert controller.step(dt=0.02)
+    first = backend.commands[-1].copy()
+    backend.current = first.copy()
+    backend.current[0] = 0.004601942363656963
+    assert controller.step(dt=0.02)
+    second = backend.commands[-1]
+
+    assert first[0] < second[0] < backend.current[0]
+    assert (second[0] - first[0]) / 0.02 <= config.max_joint_velocity
+    records = controller.telemetry.query()["records"]
+    assert all(record["reason"] == "commanded" for record in records)
+    assert all(record["limit_hits"] == [] for record in records)
+    assert all(
+        record["final_command"] == record["profiled_command"] for record in records
+    )
 
 
 def test_visual_servo_backend_write_failure_resets_state_and_recovers() -> None:
