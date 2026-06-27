@@ -288,7 +288,13 @@ def _summarize_command_smoothness(
     samples: list[tuple[float, npt.NDArray[np.float64]]] = []
     command_length: int | None = None
     for record in records:
-        timestamp = record.get("timestamp")
+        monotonic_timestamp = record.get("monotonic_timestamp")
+        timestamp = (
+            monotonic_timestamp
+            if isinstance(monotonic_timestamp, int | float)
+            and math.isfinite(monotonic_timestamp)
+            else record.get("timestamp")
+        )
         command = record.get(command_field)
         if isinstance(timestamp, int | float) and isinstance(command, list):
             numeric_command: list[float] = []

@@ -1501,6 +1501,29 @@ def test_tracking_telemetry_summary_includes_profile_and_final_smoothness() -> N
     assert summary["command_smoothness"] == summary["final_command_smoothness"]
 
 
+def test_tracking_telemetry_smoothness_prefers_monotonic_timestamps() -> None:
+    records = [
+        {
+            "timestamp": wall_time,
+            "monotonic_timestamp": monotonic_time,
+            "final_command": [command],
+        }
+        for wall_time, monotonic_time, command in (
+            (1.0, 10.0, 0.0),
+            (1.1, 11.0, 1.0),
+            (2.1, 12.0, 2.0),
+        )
+    ]
+
+    summary = summarize_records(records)
+
+    assert summary["final_command_smoothness"] == {
+        "max_velocity": 1.0,
+        "max_acceleration": 0.0,
+        "max_jerk": None,
+    }
+
+
 def test_tracking_telemetry_query_rejects_non_integer_bounds() -> None:
     buffer = VisualServoTelemetryBuffer()
 
