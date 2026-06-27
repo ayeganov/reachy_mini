@@ -90,12 +90,11 @@ class VisualServoConfigRequest(BaseModel):
     max_detection_age: FiniteFloat = Field(default=0.35, gt=0.0)
     smoothing_alpha: FiniteFloat = Field(default=0.35, gt=0.0, le=1.0)
     lookahead_distance: FiniteFloat = Field(default=0.5, gt=0.0)
-    joint_safety_margin: FiniteFloat = Field(
-        default=0.08726646259971647, ge=0.0
-    )
+    joint_safety_margin: FiniteFloat = Field(default=0.08726646259971647, ge=0.0)
     max_joint_velocity: FiniteFloat = Field(default=1.3962634015954636, gt=0.0)
     max_joint_acceleration: FiniteFloat = Field(default=5.235987755982989, gt=0.0)
     max_joint_jerk: FiniteFloat = Field(default=34.90658503988659, gt=0.0)
+    look_at_profile_response_hz: FiniteFloat = Field(default=1.0, gt=0.0, le=5.0)
     automatic_body_yaw: bool = True
     telemetry_capacity: int = Field(default=3000, gt=0, le=5000)
 

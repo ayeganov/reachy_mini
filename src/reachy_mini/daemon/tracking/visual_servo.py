@@ -89,6 +89,7 @@ class VisualServoConfig:
     max_joint_velocity: float = np.deg2rad(80.0)
     max_joint_acceleration: float = np.deg2rad(300.0)
     max_joint_jerk: float = np.deg2rad(2000.0)
+    look_at_profile_response_hz: float = 1.0
     automatic_body_yaw: bool = True
     telemetry_capacity: int = 3000
 
@@ -239,6 +240,220 @@ class LookAtTargetFilter:
         )
 
 
+def _finite_joint_vector(
+    value: npt.NDArray[np.float64],
+    *,
+    length: int,
+    name: str,
+) -> npt.NDArray[np.float64]:
+    try:
+        vector = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite {length}-element vector") from exc
+    if vector.shape != (length,) or not bool(np.all(np.isfinite(vector))):
+        raise ValueError(f"{name} must be a finite {length}-element vector")
+    return vector
+
+
+class LookAtJointCommandProfile:
+    """Generate bounded Stewart-joint motion toward look-at IK targets."""
+
+    def __init__(
+        self,
+        limits: npt.NDArray[np.float64] = HEAD_JOINT_LIMITS,
+        config: VisualServoConfig | None = None,
+    ) -> None:
+        """Initialize the profile."""
+        if limits.shape != (7, 2):
+            raise ValueError("limits must have shape (7, 2)")
+        self.limits = limits.astype(np.float64)
+        self.config = config or VisualServoConfig()
+        self._validate_response_frequency()
+        self._position: npt.NDArray[np.float64] | None = None
+        self._velocity = np.zeros(6, dtype=np.float64)
+        self._acceleration = np.zeros(6, dtype=np.float64)
+
+    def _validate_response_frequency(self) -> None:
+        response_hz = self.config.look_at_profile_response_hz
+        if not np.isfinite(response_hz) or not 0.0 < response_hz <= 5.0:
+            raise ValueError("look_at_profile_response_hz must be in (0, 5]")
+
+    def reset(self) -> None:
+        """Clear position and motion state without commanding hardware."""
+        self._position = None
+        self._velocity = np.zeros(6, dtype=np.float64)
+        self._acceleration = np.zeros(6, dtype=np.float64)
+
+    def update_with_telemetry(
+        self,
+        desired: npt.NDArray[np.float64],
+        current: npt.NDArray[np.float64],
+        dt: float,
+    ) -> tuple[npt.NDArray[np.float64], list[dict[str, float | int | str]]]:
+        """Advance the profile and return its command and limit hits."""
+        self._validate_response_frequency()
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError("dt must be finite and positive")
+        desired_vector = _finite_joint_vector(desired, length=7, name="desired")
+        current_vector = _finite_joint_vector(current, length=7, name="current")
+
+        position = (
+            current_vector[1:7].copy()
+            if self._position is None
+            else self._position.copy()
+        )
+        velocity = self._velocity.copy()
+        acceleration = self._acceleration.copy()
+        desired_stewart = desired_vector[1:7]
+        lower = self.limits[1:7, 0] + self.config.joint_safety_margin
+        upper = self.limits[1:7, 1] - self.config.joint_safety_margin
+        hits: list[dict[str, float | int | str]] = []
+
+        for index, (value, low, high) in enumerate(
+            zip(desired_stewart, lower, upper), start=1
+        ):
+            if value < low:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "lower_position",
+                        "source": "desired",
+                        "value": float(value),
+                        "limit": float(low),
+                    }
+                )
+            if value > high:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "upper_position",
+                        "source": "desired",
+                        "value": float(value),
+                        "limit": float(high),
+                    }
+                )
+
+        omega = 2.0 * np.pi * self.config.look_at_profile_response_hz
+        error = desired_stewart - position
+        requested_acceleration = omega * omega * error - 2.0 * omega * velocity
+        requested_delta = requested_acceleration - acceleration
+        max_acceleration_delta = self.config.max_joint_jerk * dt
+        for index, delta in enumerate(requested_delta, start=1):
+            if abs(float(delta)) > max_acceleration_delta:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "jerk",
+                        "source": "profile_jerk",
+                        "value": float(delta / dt),
+                        "limit": float(self.config.max_joint_jerk),
+                    }
+                )
+        acceleration += np.clip(
+            requested_delta, -max_acceleration_delta, max_acceleration_delta
+        )
+        for index, value in enumerate(acceleration, start=1):
+            if abs(float(value)) > self.config.max_joint_acceleration:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "acceleration",
+                        "source": "profile_acceleration",
+                        "value": float(value),
+                        "limit": float(self.config.max_joint_acceleration),
+                    }
+                )
+        np.clip(
+            acceleration,
+            -self.config.max_joint_acceleration,
+            self.config.max_joint_acceleration,
+            out=acceleration,
+        )
+
+        velocity += acceleration * dt
+        for index, value in enumerate(velocity, start=1):
+            if abs(float(value)) > self.config.max_joint_velocity:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "velocity",
+                        "source": "profile_velocity",
+                        "value": float(value),
+                        "limit": float(self.config.max_joint_velocity),
+                    }
+                )
+        np.clip(
+            velocity,
+            -self.config.max_joint_velocity,
+            self.config.max_joint_velocity,
+            out=velocity,
+        )
+
+        next_position = position + velocity * dt
+        next_error = desired_stewart - next_position
+        should_snap = (np.sign(next_error) != np.sign(error)) | (np.abs(error) <= 1e-6)
+        for index in np.flatnonzero(should_snap):
+            effective_acceleration = -velocity[index] / dt
+            effective_jerk = -acceleration[index] / dt
+            if abs(float(effective_acceleration)) > self.config.max_joint_acceleration:
+                hits.append(
+                    {
+                        "joint_index": int(index + 1),
+                        "kind": "acceleration",
+                        "source": "profile_acceleration",
+                        "value": float(effective_acceleration),
+                        "limit": float(self.config.max_joint_acceleration),
+                        "reason": "target_crossing_reset",
+                    }
+                )
+            if abs(float(effective_jerk)) > self.config.max_joint_jerk:
+                hits.append(
+                    {
+                        "joint_index": int(index + 1),
+                        "kind": "jerk",
+                        "source": "profile_jerk",
+                        "value": float(effective_jerk),
+                        "limit": float(self.config.max_joint_jerk),
+                        "reason": "target_crossing_reset",
+                    }
+                )
+            next_position[index] = desired_stewart[index]
+            velocity[index] = 0.0
+            acceleration[index] = 0.0
+
+        for index, (value, low, high) in enumerate(
+            zip(next_position, lower, upper), start=1
+        ):
+            if value < low:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "lower_position",
+                        "source": "profile_position",
+                        "value": float(value),
+                        "limit": float(low),
+                    }
+                )
+            if value > high:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "upper_position",
+                        "source": "profile_position",
+                        "value": float(value),
+                        "limit": float(high),
+                    }
+                )
+        position = np.clip(next_position, lower, upper)
+
+        self._position = position.copy()
+        self._velocity = velocity
+        self._acceleration = acceleration
+        profiled = desired_vector.copy()
+        profiled[1:7] = position
+        return profiled, hits
+
+
 class JointCommandLimiter:
     """Clamp and jerk-limit head joint commands before sending them to motors."""
 
@@ -290,10 +505,15 @@ class JointCommandLimiter:
         dt: float,
     ) -> tuple[npt.NDArray[np.float64], dict[str, Any]]:
         """Return a clamped, jerk-limited command and telemetry metadata."""
-        if dt <= 0.0:
-            raise ValueError("dt must be positive")
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError("dt must be finite and positive")
+        desired = _finite_joint_vector(
+            desired, length=self.limits.shape[0], name="desired"
+        )
+        current = _finite_joint_vector(
+            current, length=self.limits.shape[0], name="current"
+        )
 
-        desired = desired.astype(np.float64)
         margin = self.config.joint_safety_margin
         lower = self.limits[:, 0] + margin
         upper = self.limits[:, 1] - margin
@@ -318,9 +538,6 @@ class JointCommandLimiter:
                         "limit": float(high),
                     }
                 )
-
-        current = current.astype(np.float64)
-
         if self._last_command is None:
             self._last_command = current.copy()
             self._velocity = np.zeros(self.limits.shape[0], dtype=np.float64)
@@ -431,6 +648,7 @@ class VisualServoController:
         self.look_at_buffer = LookAtTargetBuffer()
         self.filter = PixelTargetFilter(self.config.smoothing_alpha)
         self.look_at_filter = LookAtTargetFilter(self.config.smoothing_alpha)
+        self.look_at_profile = LookAtJointCommandProfile(config=self.config)
         self.limiter = JointCommandLimiter(config=self.config)
         self.telemetry = VisualServoTelemetryBuffer(
             capacity=self.config.telemetry_capacity
@@ -443,6 +661,7 @@ class VisualServoController:
         self._last_reason = "not_started"
         self._last_detection_time: float | None = None
         self._last_target_type: str | None = None
+        self._last_command_path: str | None = None
         self._command_count = 0
         self._error: str | None = None
         self._look_at_reference_pose: npt.NDArray[np.float64] | None = None
@@ -468,7 +687,9 @@ class VisualServoController:
         self._stop_event.clear()
         self.filter.reset()
         self.look_at_filter.reset()
+        self.look_at_profile.reset()
         self.limiter.reset()
+        self._last_command_path = None
         self._look_at_reference_pose = None
         if self.config.automatic_body_yaw and hasattr(
             self.backend.head_kinematics, "set_automatic_body_yaw"
@@ -498,6 +719,9 @@ class VisualServoController:
         self._thread = None
         self._look_at_reference_pose = None
         self.look_at_filter.reset()
+        self.look_at_profile.reset()
+        self.limiter.reset()
+        self._last_command_path = None
         self._restore_automatic_body_yaw()
         self._last_reason = "stopped"
         self._error = None
@@ -560,6 +784,8 @@ class VisualServoController:
             "ik_target": None,
             "ik_joints": None,
             "projected_target": None,
+            "profiled_command": None,
+            "profile_limit_hits": [],
             "final_command": None,
             "actual_joints": None,
             "actual_joints_source": "none",
@@ -658,6 +884,8 @@ class VisualServoController:
         Returns True when a motor target was produced.
         """
         dt = (1.0 / self.config.control_frequency) if dt is None else dt
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError("dt must be finite and positive")
         start_monotonic = time.monotonic()
 
         look_at = self.look_at_buffer.fresh(self.config)
@@ -665,8 +893,12 @@ class VisualServoController:
         if look_at is None:
             self._look_at_reference_pose = None
             self.look_at_filter.reset()
+            self.look_at_profile.reset()
             detection = self.buffer.fresh(self.config)
             if detection is None:
+                if self._last_command_path == "look_at":
+                    self.limiter.reset()
+                    self._last_command_path = None
                 self._last_reason = "no_fresh_detection"
                 self._append_telemetry(
                     self._new_telemetry_record(
@@ -705,9 +937,16 @@ class VisualServoController:
             return False
 
         try:
-            current_joints = np.array(
-                self.backend.get_present_head_joint_positions(), dtype=np.float64
-            )
+            try:
+                current_joints = _finite_joint_vector(
+                    self.backend.get_present_head_joint_positions(),
+                    length=7,
+                    name="current",
+                )
+            except ValueError:
+                self.look_at_profile.reset()
+                self.limiter.reset()
+                raise
             current_pose = np.array(
                 self.backend.get_present_head_pose(), dtype=np.float64
             )
@@ -769,6 +1008,9 @@ class VisualServoController:
                 else max(0.0, time.time() - target_timestamp)
             )
             if target_result.joints is None:
+                if look_at is not None:
+                    self.look_at_profile.reset()
+                    self.limiter.reset(current_joints)
                 record["reason"] = "ik_failed"
                 self._last_reason = "ik_failed"
                 record["latency"]["processing_duration"] = (
@@ -777,13 +1019,30 @@ class VisualServoController:
                 self._append_telemetry(record)
                 return False
 
+            desired_joints = np.array(target_result.joints, dtype=np.float64)
+            if look_at is not None:
+                desired_joints, profile_hits = (
+                    self.look_at_profile.update_with_telemetry(
+                        desired=desired_joints,
+                        current=current_joints,
+                        dt=dt,
+                    )
+                )
+                record["profiled_command"] = finite_json_value(desired_joints)
+                record["profile_limit_hits"] = profile_hits
             command, limit_telemetry = self.limiter.limit_with_telemetry(
-                desired=np.array(target_result.joints, dtype=np.float64),
+                desired=desired_joints,
                 current=current_joints,
                 dt=dt,
             )
             record["limit_hits"] = limit_telemetry["limit_hits"]
-            self.backend.set_target_head_joint_positions(command)
+            try:
+                self.backend.set_target_head_joint_positions(command)
+            except Exception:
+                self.look_at_profile.reset()
+                self.limiter.reset()
+                raise
+            self._last_command_path = target_type
             self._last_command = command.copy()
             self._command_count += 1
             self._last_reason = "commanded"
@@ -1016,7 +1275,11 @@ class VisualServoController:
 
     @staticmethod
     def _valid_joints(joints: npt.NDArray[np.float64] | None) -> bool:
-        return joints is not None and bool(np.all(np.isfinite(joints)))
+        return (
+            joints is not None
+            and joints.shape == (7,)
+            and bool(np.all(np.isfinite(joints)))
+        )
 
     def _pose_from_pixel(
         self,

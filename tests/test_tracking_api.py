@@ -184,6 +184,62 @@ def test_tracking_start_rejects_oversized_telemetry_capacity() -> None:
     assert response.status_code == 422
 
 
+def test_tracking_start_validates_look_at_profile_response_hz() -> None:
+    class FakeKinematics:
+        automatic_body_yaw = False
+
+        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
+            self.automatic_body_yaw = automatic_body_yaw
+
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            return np.zeros(7)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.command = command
+
+    app = create_app(Args(autostart=False))
+    app.dependency_overrides[get_backend] = lambda: FakeBackend()
+
+    with TestClient(app) as client:
+        accepted = client.post(
+            "/api/tracking/start", json={"look_at_profile_response_hz": 1.0}
+        )
+        rejected = [
+            client.post(
+                "/api/tracking/start",
+                json={"look_at_profile_response_hz": value},
+            )
+            for value in (0.0, -1.0, 5.1)
+        ]
+        rejected.extend(
+            [
+                client.post(
+                    "/api/tracking/start",
+                    content=f'{{"look_at_profile_response_hz": {value}}}',
+                    headers={"Content-Type": "application/json"},
+                )
+                for value in ("NaN", "Infinity")
+            ]
+        )
+
+    if app.state.visual_servo is not None:
+        app.state.visual_servo.stop()
+    assert accepted.status_code == 200
+    assert all(response.status_code == 422 for response in rejected)
+
+
 def test_wireless_startup_starts_visual_tracking() -> None:
     class FakeKinematics:
         def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:

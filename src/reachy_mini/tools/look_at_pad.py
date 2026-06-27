@@ -11,7 +11,7 @@ import urllib.request
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 from reachy_mini.daemon.tracking.telemetry import dump_jsonl, summarize_records
 
@@ -22,8 +22,12 @@ DEFAULT_TRACKING_CONFIG = {
     "max_joint_velocity": 0.60,
     "max_joint_acceleration": 1.60,
     "max_joint_jerk": 8.0,
+    "look_at_profile_response_hz": 1.0,
 }
 DEFAULT_REPLAY_PATH = ("center", "top", "right", "bottom", "left", "center")
+NEUTRAL_TRANSLATION_TOLERANCE_M = 0.02
+NEUTRAL_ROTATION_TOLERANCE_RAD = 0.05
+NEUTRAL_BODY_YAW_TOLERANCE_RAD = 0.05
 
 
 @dataclass(frozen=True)
@@ -202,10 +206,10 @@ def replay(args: argparse.Namespace) -> dict[str, Any]:
     output_prefix = _resolve_output_prefix(args.output_prefix)
     jsonl_path = output_prefix.with_suffix(".jsonl")
     summary_path = output_prefix.with_suffix(".json")
+    tracking_config = dict(DEFAULT_TRACKING_CONFIG)
+    tracking_config["look_at_profile_response_hz"] = args.look_at_profile_response_hz
 
-    _post_json(
-        base_url, "/tracking/start", DEFAULT_TRACKING_CONFIG, timeout=args.timeout
-    )
+    _post_json(base_url, "/tracking/start", tracking_config, timeout=args.timeout)
     start_monotonic = time.monotonic()
     for index, target in enumerate(targets):
         _post_json(
@@ -238,14 +242,40 @@ def replay(args: argparse.Namespace) -> dict[str, Any]:
     object_records = _as_object_records(records)
     dump_jsonl(object_records, jsonl_path)
     record_summary = summarize_replay_records(object_records)
+
+    stop_status = None
+    if not args.leave_running or args.return_neutral:
+        stop_status = _post_json(base_url, "/tracking/stop", timeout=args.timeout)
+    return_status = None
+    post_return_state = None
+    neutral_return = None
+    if args.return_neutral:
+        return_status = _return_neutral(
+            base_url,
+            duration=args.return_duration,
+            timeout=args.timeout,
+        )
+        post_return_state = _request_json(
+            "GET",
+            base_url,
+            "/state/full?with_head_pose=true&with_head_joints=true&with_body_yaw=true",
+            timeout=args.timeout,
+        )
+        neutral_return = _summarize_neutral_return(post_return_state)
+
     summary = {
         "base_url": base_url,
         "default_config": DEFAULT_TRACKING_CONFIG,
+        "tracking_config": tracking_config,
         "plane": _plane_summary(plane),
         "path": list(path_names),
         "submitted_targets": len(targets),
         "after_sweep_state": after_sweep_state,
         "status_after": status_after,
+        "stop_status": stop_status,
+        "return_status": return_status,
+        "post_return_state": post_return_state,
+        "neutral_return": neutral_return,
         "telemetry_meta": {
             key: telemetry.get(key)
             for key in (
@@ -261,24 +291,17 @@ def replay(args: argparse.Namespace) -> dict[str, Any]:
     summary_path.write_text(
         json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8"
     )
-
-    stop_status = None
-    if not args.leave_running:
-        stop_status = _post_json(base_url, "/tracking/stop", timeout=args.timeout)
-    return_status = None
-    if args.return_neutral:
-        return_status = _return_neutral(
-            base_url,
-            duration=args.return_duration,
-            timeout=args.timeout,
-        )
     return {
         "jsonl_path": str(jsonl_path),
         "summary_path": str(summary_path),
+        "default_config": DEFAULT_TRACKING_CONFIG,
+        "tracking_config": tracking_config,
         "submitted_targets": len(targets),
         "record_count": len(object_records),
         "stop_status": stop_status,
         "return_status": return_status,
+        "post_return_state": post_return_state,
+        "neutral_return": neutral_return,
         **record_summary,
     }
 
@@ -293,11 +316,13 @@ def summarize_replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     command_rows = [
         [float(value) for value in record["final_command"]]
         for record in commanded
-        if all(isinstance(value, int | float) for value in record["final_command"])
+        if _finite_vector(record["final_command"], length=7)
     ]
     target_y = _input_target_values(look_at, "y")
     target_z = _input_target_values(look_at, "z")
     limit_hits: dict[str, int] = {}
+    profile_limit_hits: dict[str, int] = {}
+    profile_limit_hit_count = 0
     ik_failures = 0
     reason_counts: dict[str, int] = {}
     for record in records:
@@ -310,7 +335,35 @@ def summarize_replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             for hit in hits:
                 key = _limit_hit_key(hit)
                 limit_hits[key] = limit_hits.get(key, 0) + 1
+        profile_hits = record.get("profile_limit_hits")
+        if isinstance(profile_hits, list):
+            profile_limit_hit_count += len(profile_hits)
+            for hit in profile_hits:
+                key = _limit_hit_key(hit)
+                profile_limit_hits[key] = profile_limit_hits.get(key, 0) + 1
+    limiter_deltas: list[float] = []
+    limiter_changed_count = 0
+    limiter_compared_count = 0
+    for record in look_at:
+        if record.get("reason") != "commanded":
+            continue
+        profiled = record.get("profiled_command")
+        final = record.get("final_command")
+        if not _finite_vector(profiled, length=7) or not _finite_vector(
+            final, length=7
+        ):
+            continue
+        profiled_values = cast(list[int | float], profiled)
+        final_values = cast(list[int | float], final)
+        differences = [
+            abs(float(final_value) - float(profiled_value))
+            for profiled_value, final_value in zip(profiled_values, final_values)
+        ]
+        limiter_deltas.extend(differences)
+        limiter_compared_count += 1
+        limiter_changed_count += int(any(value > 1e-9 for value in differences))
     command_spans = _joint_spans(command_rows)
+    final_command_smoothness = telemetry_summary["final_command_smoothness"]
     return {
         "record_count": len(records),
         "look_at_record_count": len(look_at),
@@ -319,7 +372,20 @@ def summarize_replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "reason_counts": reason_counts,
         "limit_hits": limit_hits,
         "limit_hit_count": telemetry_summary["limit_hit_count"],
-        "command_smoothness": telemetry_summary["command_smoothness"],
+        "profile_limit_hits": profile_limit_hits,
+        "profile_limit_hit_count": profile_limit_hit_count,
+        "command_smoothness": final_command_smoothness,
+        "profiled_command_smoothness": telemetry_summary["profiled_command_smoothness"],
+        "final_command_smoothness": final_command_smoothness,
+        "limiter_delta": {
+            "max_abs_rad": max(limiter_deltas) if limiter_deltas else None,
+            "mean_abs_rad": (
+                sum(limiter_deltas) / len(limiter_deltas) if limiter_deltas else None
+            ),
+            "changed_tick_count": limiter_changed_count,
+        },
+        "limiter_changed_count": limiter_changed_count,
+        "limiter_compared_count": limiter_compared_count,
         "target_y_span_m": _span(target_y),
         "target_z_span_m": _span(target_z),
         "final_command_spans_rad": command_spans,
@@ -636,6 +702,7 @@ def _add_replay_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     parser.add_argument("--leave-running", action="store_true")
     parser.add_argument("--return-neutral", action="store_true")
     parser.add_argument("--return-duration", type=float, default=1.5)
+    parser.add_argument("--look-at-profile-response-hz", type=float, default=1.0)
 
 
 def _parse_path(value: str) -> tuple[str, ...]:
@@ -784,6 +851,30 @@ def _return_neutral(
     return move
 
 
+def _summarize_neutral_return(state: Mapping[str, Any]) -> dict[str, Any]:
+    pose = state.get("head_pose")
+    if not isinstance(pose, Mapping):
+        raise ValueError("post-return state must include head_pose")
+    translation = [abs(float(pose[key])) for key in ("x", "y", "z")]
+    rotation = [abs(float(pose[key])) for key in ("roll", "pitch", "yaw")]
+    body_yaw = abs(float(state["body_yaw"]))
+    max_translation = max(translation)
+    max_rotation = max(rotation)
+    return {
+        "max_translation_abs_m": max_translation,
+        "max_rotation_abs_rad": max_rotation,
+        "body_yaw_abs_rad": body_yaw,
+        "translation_tolerance_m": NEUTRAL_TRANSLATION_TOLERANCE_M,
+        "rotation_tolerance_rad": NEUTRAL_ROTATION_TOLERANCE_RAD,
+        "body_yaw_tolerance_rad": NEUTRAL_BODY_YAW_TOLERANCE_RAD,
+        "within_tolerance": (
+            max_translation <= NEUTRAL_TRANSLATION_TOLERANCE_M
+            and max_rotation <= NEUTRAL_ROTATION_TOLERANCE_RAD
+            and body_yaw <= NEUTRAL_BODY_YAW_TOLERANCE_RAD
+        ),
+    }
+
+
 def _as_object_records(records: list[Any]) -> list[dict[str, Any]]:
     if not all(isinstance(record, dict) for record in records):
         raise ValueError("telemetry records must be objects")
@@ -816,9 +907,23 @@ def _span(values: list[float]) -> float | None:
     return max(values) - min(values)
 
 
+def _finite_vector(value: Any, length: int | None = None) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and (length is None or len(value) == length)
+        and all(
+            isinstance(item, int | float)
+            and not isinstance(item, bool)
+            and math.isfinite(item)
+            for item in value
+        )
+    )
+
+
 def _limit_hit_key(hit: Any) -> str:
     if isinstance(hit, dict):
-        value = hit.get("limit") or hit.get("kind") or hit.get("reason") or "unknown"
+        value = hit.get("kind") or hit.get("limit") or hit.get("reason") or "unknown"
         return str(value)
     return str(hit)
 

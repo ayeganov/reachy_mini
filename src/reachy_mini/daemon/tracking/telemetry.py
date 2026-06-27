@@ -16,13 +16,7 @@ import numpy as np
 import numpy.typing as npt
 
 JsonValue: TypeAlias = (
-    bool
-    | int
-    | float
-    | str
-    | None
-    | list["JsonValue"]
-    | dict[str, "JsonValue"]
+    bool | int | float | str | None | list["JsonValue"] | dict[str, "JsonValue"]
 )
 
 
@@ -82,8 +76,7 @@ class TelemetryQuery:
         ):
             raise ValueError("from_sequence must be an integer")
         if self.to_sequence is not None and (
-            isinstance(self.to_sequence, bool)
-            or not isinstance(self.to_sequence, int)
+            isinstance(self.to_sequence, bool) or not isinstance(self.to_sequence, int)
         ):
             raise ValueError("to_sequence must be an integer")
         if self.from_sequence is not None and self.from_sequence < 0:
@@ -155,9 +148,9 @@ class VisualServoTelemetryBuffer:
             if isinstance(sequence, int):
                 retained_sequences.append(int(sequence))
 
-        filtered = [
-            record for record in records if _record_matches(record, query)
-        ][: query.limit]
+        filtered = [record for record in records if _record_matches(record, query)][
+            : query.limit
+        ]
 
         return {
             "records": filtered,
@@ -248,6 +241,10 @@ def summarize_records(records: list[dict[str, JsonValue]]) -> dict[str, Any]:
             if isinstance(duration, int | float):
                 latencies.append(float(duration))
 
+    profiled_command_smoothness = _summarize_command_smoothness(
+        records, "profiled_command"
+    )
+    final_command_smoothness = _summarize_command_smoothness(records, "final_command")
     return {
         "total_records": len(records),
         "first_timestamp": min(timestamps) if timestamps else None,
@@ -259,7 +256,9 @@ def summarize_records(records: list[dict[str, JsonValue]]) -> dict[str, Any]:
         "ik_failure_count": sum(1 for record in records if record.get("ik_failed")),
         "limit_hit_count": _count_limit_hits(records),
         "latency": _summarize_numbers(latencies),
-        "command_smoothness": _summarize_command_smoothness(records),
+        "command_smoothness": final_command_smoothness,
+        "profiled_command_smoothness": profiled_command_smoothness,
+        "final_command_smoothness": final_command_smoothness,
     }
 
 
@@ -284,16 +283,21 @@ def _summarize_numbers(values: list[float]) -> dict[str, float | None]:
 
 def _summarize_command_smoothness(
     records: list[dict[str, JsonValue]],
+    command_field: str,
 ) -> dict[str, float | None]:
     samples: list[tuple[float, npt.NDArray[np.float64]]] = []
     command_length: int | None = None
     for record in records:
         timestamp = record.get("timestamp")
-        command = record.get("final_command")
+        command = record.get(command_field)
         if isinstance(timestamp, int | float) and isinstance(command, list):
             numeric_command: list[float] = []
             for item in command:
-                if not isinstance(item, int | float):
+                if (
+                    isinstance(item, bool)
+                    or not isinstance(item, int | float)
+                    or not math.isfinite(item)
+                ):
                     break
                 numeric_command.append(float(item))
             else:
