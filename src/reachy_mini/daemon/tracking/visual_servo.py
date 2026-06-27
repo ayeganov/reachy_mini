@@ -908,6 +908,7 @@ class VisualServoController:
         self._error: str | None = None
         self._look_at_reference_pose: npt.NDArray[np.float64] | None = None
         self._previous_automatic_body_yaw: bool | None = None
+        self._last_command_time: float | None = None
 
     @property
     def running(self) -> bool:
@@ -934,6 +935,7 @@ class VisualServoController:
         self.limiter.reset()
         self._last_command_path = None
         self._look_at_reference_pose = None
+        self._last_command_time = None
         if self.config.automatic_body_yaw and hasattr(
             self.backend.head_kinematics, "set_automatic_body_yaw"
         ):
@@ -966,6 +968,7 @@ class VisualServoController:
         self.look_at_guard.reset()
         self.limiter.reset()
         self._last_command_path = None
+        self._last_command_time = None
         self._restore_automatic_body_yaw()
         self._last_reason = "stopped"
         self._error = None
@@ -1103,7 +1106,7 @@ class VisualServoController:
             dt = period if previous_start is None else start - previous_start
             previous_start = start
             try:
-                self.step(dt)
+                self.step(dt, use_command_elapsed=True)
             except Exception as exc:
                 self._error = str(exc)
                 self._last_reason = "error"
@@ -1121,7 +1124,12 @@ class VisualServoController:
             sleep_time = max(0.0, period - (time.monotonic() - start))
             self._stop_event.wait(sleep_time)
 
-    def step(self, dt: float | None = None) -> bool:
+    def step(
+        self,
+        dt: float | None = None,
+        *,
+        use_command_elapsed: bool = False,
+    ) -> bool:
         """Execute one servo step.
 
         Returns True when a motor target was produced.
@@ -1154,6 +1162,7 @@ class VisualServoController:
             if detection is None:
                 if self._last_command_path == "look_at":
                     self._last_command_path = None
+                    self._last_command_time = None
                 self._last_reason = "no_fresh_detection"
                 self._append_telemetry(
                     self._new_telemetry_record(
@@ -1202,6 +1211,7 @@ class VisualServoController:
                 self.look_at_profile.reset()
                 self.look_at_guard.reset()
                 self.limiter.reset()
+                self._last_command_time = None
                 raise
             current_pose = np.array(
                 self.backend.get_present_head_pose(), dtype=np.float64
@@ -1267,6 +1277,7 @@ class VisualServoController:
                 if look_at is not None:
                     self.look_at_profile.reset()
                     self.look_at_guard.reset(current_joints)
+                    self._last_command_time = None
                 record["reason"] = "ik_failed"
                 self._last_reason = "ik_failed"
                 record["latency"]["processing_duration"] = (
@@ -1276,12 +1287,29 @@ class VisualServoController:
                 return False
 
             desired_joints = np.array(target_result.joints, dtype=np.float64)
+            command_time = time.monotonic()
+            command_dt = dt
+            if use_command_elapsed and self._last_command_time is not None:
+                command_dt = command_time - self._last_command_time
+            if command_dt > 2.0 / self.config.control_frequency:
+                self._reset_motion_state()
+                record["dt"] = command_dt
+                record["monotonic_timestamp"] = command_time
+                record["reason"] = "control_stall"
+                record["latency"]["processing_duration"] = (
+                    time.monotonic() - start_monotonic
+                )
+                self._last_reason = "control_stall"
+                self._append_telemetry(record)
+                return False
+            record["dt"] = command_dt
+            record["monotonic_timestamp"] = command_time
             if look_at is not None:
                 desired_joints, profile_hits = (
                     self.look_at_profile.update_with_telemetry(
                         desired=desired_joints,
                         current=current_joints,
-                        dt=dt,
+                        dt=command_dt,
                     )
                 )
                 record["profiled_command"] = finite_json_value(desired_joints)
@@ -1290,13 +1318,14 @@ class VisualServoController:
                     self.look_at_guard.check(
                         command=desired_joints,
                         current=current_joints,
-                        dt=dt,
+                        dt=command_dt,
                     )
                 )
                 record["limit_hits"] = guard_hits
                 if guard_hits:
                     self.look_at_profile.reset()
                     self.look_at_guard.reset()
+                    self._last_command_time = None
                     record["reason"] = "safety_rejected"
                     record["latency"]["processing_duration"] = (
                         time.monotonic() - start_monotonic
@@ -1311,7 +1340,7 @@ class VisualServoController:
                 command, limit_telemetry = self.limiter.limit_with_telemetry(
                     desired=desired_joints,
                     current=current_joints,
-                    dt=dt,
+                    dt=command_dt,
                 )
                 record["limit_hits"] = limit_telemetry["limit_hits"]
             try:
@@ -1320,6 +1349,7 @@ class VisualServoController:
                 self.look_at_profile.reset()
                 self.look_at_guard.reset()
                 self.limiter.reset()
+                self._last_command_time = None
                 raise
             if look_at is not None:
                 self.look_at_guard.commit(
@@ -1328,6 +1358,7 @@ class VisualServoController:
                     guard_acceleration,
                 )
             self._last_command_path = target_type
+            self._last_command_time = command_time
             self._last_command = command.copy()
             self._command_count += 1
             self._last_reason = "commanded"
@@ -1352,6 +1383,7 @@ class VisualServoController:
         self.limiter.reset()
         self._look_at_reference_pose = None
         self._last_command_path = None
+        self._last_command_time = None
 
     def _try_acquire_motion_guard(self) -> Callable[[], None] | None:
         """Acquire backend motion ownership for one servo step."""

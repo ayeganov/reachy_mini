@@ -340,7 +340,9 @@ def test_visual_servo_profile_fields_are_empty_without_profile_update() -> None:
         backend=_MotionTestBackend()  # type: ignore[arg-type]
     )
 
-    def fail_step(dt: float | None = None) -> bool:
+    def fail_step(
+        dt: float | None = None, *, use_command_elapsed: bool = False
+    ) -> bool:
         error_controller._stop_event.set()
         raise RuntimeError("boom")
 
@@ -550,6 +552,26 @@ def test_visual_servo_profiles_body_yaw_encoder_steps() -> None:
     assert all(
         record["final_command"] == record["profiled_command"] for record in records
     )
+
+
+def test_visual_servo_runtime_dt_matches_command_timestamps() -> None:
+    backend = _MotionTestBackend(np.array([0.0, *([0.3] * 6)]))
+    controller = VisualServoController(
+        backend=backend,
+        config=_acceptance_profile_config(),  # type: ignore[arg-type]
+    )
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+
+    assert controller.step(dt=0.02, use_command_elapsed=True)
+    backend.current = backend.commands[-1].copy()
+    assert controller.step(dt=0.02, use_command_elapsed=True)
+
+    first, second = controller.telemetry.query()["records"]
+    assert first["dt"] == 0.02
+    assert second["dt"] == pytest.approx(
+        second["monotonic_timestamp"] - first["monotonic_timestamp"]
+    )
+    assert second["dt"] > 0.0
 
 
 def test_visual_servo_backend_write_failure_resets_state_and_recovers() -> None:
@@ -1765,7 +1787,9 @@ def test_visual_servo_run_loop_records_step_error() -> None:
 
     controller = VisualServoController(backend=FakeBackend())  # type: ignore[arg-type]
 
-    def fail_step(dt: float | None = None) -> bool:
+    def fail_step(
+        dt: float | None = None, *, use_command_elapsed: bool = False
+    ) -> bool:
         controller._stop_event.set()
         raise RuntimeError("boom")
 
@@ -1810,8 +1834,9 @@ def test_visual_servo_run_loop_uses_elapsed_time_without_catch_up(
     def monotonic() -> float:
         return clock[0]
 
-    def step(dt: float | None = None) -> bool:
+    def step(dt: float | None = None, *, use_command_elapsed: bool = False) -> bool:
         assert dt is not None
+        assert use_command_elapsed
         dts.append(dt)
         clock[0] += next(processing_times)
         if len(dts) == 3:
