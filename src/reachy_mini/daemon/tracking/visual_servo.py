@@ -89,7 +89,6 @@ class VisualServoConfig:
     max_joint_velocity: float = np.deg2rad(80.0)
     max_joint_acceleration: float = np.deg2rad(300.0)
     max_joint_jerk: float = np.deg2rad(2000.0)
-    max_joint_tracking_error: float = 0.08
     look_at_profile_response_hz: float = 1.0
     automatic_body_yaw: bool = True
     telemetry_capacity: int = 3000
@@ -269,7 +268,7 @@ class LookAtJointCommandProfile:
             raise ValueError("limits must have shape (7, 2)")
         self.limits = limits.astype(np.float64)
         self.config = config or VisualServoConfig()
-        self._validate_config()
+        self._validate_response_frequency()
         self._position: npt.NDArray[np.float64] | None = None
         self._velocity = np.zeros(6, dtype=np.float64)
         self._acceleration = np.zeros(6, dtype=np.float64)
@@ -277,13 +276,10 @@ class LookAtJointCommandProfile:
         self._body_yaw_velocity = 0.0
         self._body_yaw_acceleration = 0.0
 
-    def _validate_config(self) -> None:
+    def _validate_response_frequency(self) -> None:
         response_hz = self.config.look_at_profile_response_hz
         if not np.isfinite(response_hz) or not 0.0 < response_hz <= 5.0:
             raise ValueError("look_at_profile_response_hz must be in (0, 5]")
-        tracking_error = self.config.max_joint_tracking_error
-        if not np.isfinite(tracking_error) or tracking_error <= 0.0:
-            raise ValueError("max_joint_tracking_error must be finite and positive")
 
     def reset(self) -> None:
         """Clear position and motion state without commanding hardware."""
@@ -380,7 +376,7 @@ class LookAtJointCommandProfile:
         dt: float,
     ) -> tuple[npt.NDArray[np.float64], list[dict[str, float | int | str]]]:
         """Advance the profile and return its command and limit hits."""
-        self._validate_config()
+        self._validate_response_frequency()
         if not np.isfinite(dt) or dt <= 0.0:
             raise ValueError("dt must be finite and positive")
         desired_vector = _finite_joint_vector(desired, length=7, name="desired")
@@ -436,13 +432,6 @@ class LookAtJointCommandProfile:
                 )
 
         target = np.clip(desired_vector, lower, upper)
-        tracking_lower = np.maximum(
-            lower, current_vector - self.config.max_joint_tracking_error
-        )
-        tracking_upper = np.minimum(
-            upper, current_vector + self.config.max_joint_tracking_error
-        )
-        target = np.clip(target, tracking_lower, tracking_upper)
         omega = 2.0 * np.pi * self.config.look_at_profile_response_hz
         next_position = position.copy()
         next_velocity = velocity.copy()
@@ -585,9 +574,9 @@ class LookAtJointCommandProfile:
                 motion_direction = float(np.sign(velocity[local_index]))
             if motion_direction != 0.0:
                 boundary_distance = (
-                    tracking_upper[local_index] - position[local_index]
+                    upper[local_index] - position[local_index]
                     if motion_direction > 0.0
-                    else position[local_index] - tracking_lower[local_index]
+                    else position[local_index] - lower[local_index]
                 )
                 chosen_acceleration = motion_direction * constrain_for_stop(
                     motion_direction * chosen_acceleration,

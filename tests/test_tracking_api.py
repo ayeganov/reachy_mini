@@ -184,7 +184,7 @@ def test_tracking_start_rejects_oversized_telemetry_capacity() -> None:
     assert response.status_code == 422
 
 
-def test_tracking_start_validates_profile_config() -> None:
+def test_tracking_start_validates_look_at_profile_response_hz() -> None:
     class FakeKinematics:
         automatic_body_yaw = False
 
@@ -214,11 +214,7 @@ def test_tracking_start_validates_profile_config() -> None:
 
     with TestClient(app) as client:
         accepted = client.post(
-            "/api/tracking/start",
-            json={
-                "look_at_profile_response_hz": 1.0,
-                "max_joint_tracking_error": 0.08,
-            },
+            "/api/tracking/start", json={"look_at_profile_response_hz": 1.0}
         )
         rejected = [
             client.post(
@@ -236,18 +232,6 @@ def test_tracking_start_validates_profile_config() -> None:
                 )
                 for value in ("NaN", "Infinity")
             ]
-        )
-        rejected.extend(
-            client.post("/api/tracking/start", json={"max_joint_tracking_error": value})
-            for value in (0.0, -1.0)
-        )
-        rejected.extend(
-            client.post(
-                "/api/tracking/start",
-                content=f'{{"max_joint_tracking_error": {value}}}',
-                headers={"Content-Type": "application/json"},
-            )
-            for value in ("NaN", "Infinity")
         )
 
     if app.state.visual_servo is not None:

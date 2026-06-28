@@ -76,7 +76,6 @@ def test_default_tracking_config_matches_interactive_pad_values() -> None:
         "max_joint_velocity": 0.60,
         "max_joint_acceleration": 1.60,
         "max_joint_jerk": 8.0,
-        "max_joint_tracking_error": 0.08,
         "look_at_profile_response_hz": 1.0,
     }
 

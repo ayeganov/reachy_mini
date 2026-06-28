@@ -60,7 +60,6 @@ def test_look_at_joint_profile_converges_to_fixed_target_within_two_seconds() ->
     for _ in range(100):
         command, _hits = profile.update_with_telemetry(desired, current, dt=0.02)
         positions.append(float(command[1]))
-        current = command
 
     assert abs(positions[-1] - 0.3) <= 0.001
     assert all(
@@ -95,10 +94,9 @@ def test_look_at_joint_profile_has_no_unbounded_target_crossing_reset() -> None:
     previous_position = np.zeros(6)
     previous_velocity = np.zeros(6)
     previous_acceleration = np.zeros(6)
-    current = np.zeros(7)
 
     for dt in [0.0114, 0.0286, 0.017, 0.023, 0.02] * 25:
-        command, hits = profile.update_with_telemetry(desired, current, dt=dt)
+        command, hits = profile.update_with_telemetry(desired, np.zeros(7), dt=dt)
         velocity = (command[1:] - previous_position) / dt
         acceleration = (velocity - previous_velocity) / dt
         jerk = (acceleration - previous_acceleration) / dt
@@ -112,7 +110,6 @@ def test_look_at_joint_profile_has_no_unbounded_target_crossing_reset() -> None:
         previous_position = command[1:].copy()
         previous_velocity = velocity
         previous_acceleration = acceleration
-        current = command
 
     np.testing.assert_allclose(command[1:], 0.3, atol=1e-9)
     np.testing.assert_allclose(profile._velocity, 0.0, atol=1e-9)
@@ -144,36 +141,6 @@ def test_look_at_joint_profile_preserves_boundary_on_abrupt_reversals() -> None:
         assert guard_hits == []
         guard.commit(command, next_velocity, next_acceleration)
         current = command
-
-
-def test_look_at_joint_profile_limits_lead_over_measured_joints() -> None:
-    config = VisualServoConfig(
-        joint_safety_margin=0.0,
-        max_joint_velocity=0.6,
-        max_joint_acceleration=1.6,
-        max_joint_jerk=8.0,
-        max_joint_tracking_error=0.08,
-    )
-    profile = LookAtJointCommandProfile(config=config)
-    guard = JointCommandSafetyGuard(config=config)
-    current = np.zeros(7)
-    desired = np.full(7, 0.3)
-
-    for _ in range(300):
-        command, _hits = profile.update_with_telemetry(desired, current, 0.02)
-        guard_hits, velocity, acceleration = guard.check(command, current, 0.02)
-        assert np.max(np.abs(command - current)) <= 0.08 + 1e-9
-        assert guard_hits == []
-        guard.commit(command, velocity, acceleration)
-
-    np.testing.assert_allclose(command, 0.08, atol=1e-9)
-    current = command.copy()
-    for _ in range(20):
-        command, _hits = profile.update_with_telemetry(desired, current, 0.02)
-        guard_hits, velocity, acceleration = guard.check(command, current, 0.02)
-        assert guard_hits == []
-        guard.commit(command, velocity, acceleration)
-    assert np.all(command > current)
 
 
 def test_look_at_joint_profile_reports_velocity_acceleration_and_jerk_clamps() -> None:
@@ -264,12 +231,6 @@ def test_look_at_joint_profile_rejects_invalid_inputs_without_state_mutation() -
         with pytest.raises(ValueError, match="look_at_profile_response_hz"):
             LookAtJointCommandProfile(
                 config=VisualServoConfig(look_at_profile_response_hz=response_hz)
-            )
-
-    for tracking_error in (0.0, -1.0, float("nan"), float("inf")):
-        with pytest.raises(ValueError, match="max_joint_tracking_error"):
-            LookAtJointCommandProfile(
-                config=VisualServoConfig(max_joint_tracking_error=tracking_error)
             )
 
 

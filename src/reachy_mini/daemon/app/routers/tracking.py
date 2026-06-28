@@ -94,7 +94,6 @@ class VisualServoConfigRequest(BaseModel):
     max_joint_velocity: FiniteFloat = Field(default=1.3962634015954636, gt=0.0)
     max_joint_acceleration: FiniteFloat = Field(default=5.235987755982989, gt=0.0)
     max_joint_jerk: FiniteFloat = Field(default=34.90658503988659, gt=0.0)
-    max_joint_tracking_error: FiniteFloat = Field(default=0.08, gt=0.0)
     look_at_profile_response_hz: FiniteFloat = Field(default=1.0, gt=0.0, le=5.0)
     automatic_body_yaw: bool = True
     telemetry_capacity: int = Field(default=3000, gt=0, le=5000)
