@@ -17,12 +17,12 @@ from reachy_mini.daemon.tracking.telemetry import dump_jsonl, summarize_records
 
 DEFAULT_BASE_URL = "http://reachy-mini.local:8017/api"
 DEFAULT_TRACKING_CONFIG = {
-    "smoothing_alpha": 0.20,
+    "smoothing_alpha": 1.0,
     "joint_safety_margin": 0.1745329252,
     "max_joint_velocity": 0.60,
-    "max_joint_acceleration": 1.60,
-    "max_joint_jerk": 8.0,
-    "look_at_profile_response_hz": 1.0,
+    "max_joint_acceleration": 2.40,
+    "max_joint_jerk": 16.0,
+    "look_at_profile_response_hz": 2.0,
 }
 DEFAULT_REPLAY_PATH = ("center", "top", "right", "bottom", "left", "center")
 NEUTRAL_TRANSLATION_TOLERANCE_M = 0.02

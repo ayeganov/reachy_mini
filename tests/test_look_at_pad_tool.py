@@ -71,12 +71,12 @@ def test_build_replay_targets_exercises_both_lateral_and_vertical_axes() -> None
 
 def test_default_tracking_config_matches_interactive_pad_values() -> None:
     assert DEFAULT_TRACKING_CONFIG == {
-        "smoothing_alpha": 0.20,
+        "smoothing_alpha": 1.0,
         "joint_safety_margin": 0.1745329252,
         "max_joint_velocity": 0.60,
-        "max_joint_acceleration": 1.60,
-        "max_joint_jerk": 8.0,
-        "look_at_profile_response_hz": 1.0,
+        "max_joint_acceleration": 2.40,
+        "max_joint_jerk": 16.0,
+        "look_at_profile_response_hz": 2.0,
     }
 
 
@@ -333,7 +333,7 @@ def test_replay_sends_config_and_retains_post_return_state(
     assert summary["tracking_config"] == start_payload
     assert result["tracking_config"] == start_payload
     assert summary["default_config"] == DEFAULT_TRACKING_CONFIG
-    assert summary["default_config"]["look_at_profile_response_hz"] == 1.0
+    assert summary["default_config"]["look_at_profile_response_hz"] == 2.0
     assert summary["return_status"] == {"uuid": "neutral"}
     assert summary["post_return_state"] == post_return_state
     assert summary["neutral_return"]["within_tolerance"] is True
