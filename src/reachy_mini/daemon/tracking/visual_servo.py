@@ -535,8 +535,6 @@ class LookAtJointCommandProfile:
                 motion_acceleration: float,
                 available_distance: float,
             ) -> float:
-                if motion_velocity < 0.0:
-                    return acceleration_value
                 braking = max(-max_acceleration, motion_acceleration - max_jerk * dt)
 
                 def distance_after_step(value: float) -> float:
@@ -569,9 +567,11 @@ class LookAtJointCommandProfile:
                 distance,
             )
             chosen_acceleration *= direction
-            motion_direction = float(np.sign(velocity[local_index]))
+            motion_direction = float(
+                np.sign(velocity[local_index] + chosen_acceleration * dt)
+            )
             if motion_direction == 0.0:
-                motion_direction = float(np.sign(chosen_acceleration))
+                motion_direction = float(np.sign(velocity[local_index]))
             if motion_direction != 0.0:
                 boundary_distance = (
                     upper[local_index] - position[local_index]
@@ -1307,7 +1307,7 @@ class VisualServoController:
             if target_result.joints is None:
                 if look_at is not None:
                     self.look_at_profile.reset()
-                    self.look_at_guard.reset(current_joints)
+                    self.look_at_guard.reset()
                     self._last_command_time = None
                 record["reason"] = "ik_failed"
                 self._last_reason = "ik_failed"

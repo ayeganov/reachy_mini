@@ -116,46 +116,31 @@ def test_look_at_joint_profile_has_no_unbounded_target_crossing_reset() -> None:
     np.testing.assert_allclose(profile._acceleration, 0.0, atol=1e-9)
 
 
-def test_look_at_joint_profile_preserves_boundary_stopping_distance() -> None:
+def test_look_at_joint_profile_preserves_boundary_on_abrupt_reversals() -> None:
     config = _acceptance_profile_config()
     profile = LookAtJointCommandProfile(config=config)
     guard = JointCommandSafetyGuard(config=config)
-    upper = profile.limits[1, 1] - config.joint_safety_margin
-    position = upper - 0.0001849089660026504
-    velocity = 0.01
-    acceleration = -0.3
+    lower = profile.limits[3, 0] + config.joint_safety_margin
+    upper = profile.limits[3, 1] - config.joint_safety_margin
+    random = np.random.default_rng(19)
+    current = np.zeros(7)
     desired = np.zeros(7)
-    desired[1] = position - 0.0001
-    profile._position = np.array([position, 0.0, 0.0, 0.0, 0.0, 0.0])
-    profile._velocity[0] = velocity
-    profile._acceleration[0] = acceleration
-    guard._last_command = np.array([0.0, position, 0.0, 0.0, 0.0, 0.0, 0.0])
-    guard._velocity[1] = velocity
-    guard._acceleration[1] = acceleration
+    hold_ticks = 0
 
-    for _ in range(10):
-        command, profile_hits = profile.update_with_telemetry(
-            desired, np.zeros(7), dt=0.017
-        )
-        guard_hits, next_velocity, next_acceleration = guard.check(
-            command, np.zeros(7), dt=0.017
-        )
+    for _ in range(1_100):
+        if hold_ticks == 0:
+            desired[3] = (lower - 1.0, upper + 1.0)[int(random.integers(2))]
+            hold_ticks = int(random.integers(1, 31))
+        hold_ticks -= 1
+        dt = float(random.uniform(0.017, 0.026))
+        command, profile_hits = profile.update_with_telemetry(desired, current, dt)
+        guard_hits, next_velocity, next_acceleration = guard.check(command, current, dt)
 
-        assert command[1] <= upper
+        assert lower <= command[3] <= upper
         assert not any(hit.get("source") == "profile_position" for hit in profile_hits)
         assert guard_hits == []
         guard.commit(command, next_velocity, next_acceleration)
-
-    desired[1] = upper + 1.0
-    command, profile_hits = profile.update_with_telemetry(
-        desired, np.zeros(7), dt=0.017
-    )
-    guard_hits, _velocity, _acceleration = guard.check(command, np.zeros(7), dt=0.017)
-    assert any(
-        hit["kind"] == "upper_position" and hit["source"] == "desired"
-        for hit in profile_hits
-    )
-    assert guard_hits == []
+        current = command
 
 
 def test_look_at_joint_profile_reports_velocity_acceleration_and_jerk_clamps() -> None:
@@ -393,7 +378,7 @@ def test_visual_servo_profile_fields_are_empty_without_profile_update() -> None:
     assert all(record["profile_limit_hits"] == [] for record in records)
 
 
-def test_visual_servo_look_at_ik_failure_resets_profile_and_seeds_guard() -> None:
+def test_visual_servo_look_at_ik_failure_resets_guard_unseeded_and_recovers() -> None:
     backend = _MotionTestBackend()
     controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
@@ -404,13 +389,17 @@ def test_visual_servo_look_at_ik_failure_resets_profile_and_seeds_guard() -> Non
     assert not controller.step(dt=0.02)
 
     assert controller.look_at_profile._position is None
-    np.testing.assert_array_equal(
-        controller.look_at_guard._last_command, backend.current
-    )
+    assert controller.look_at_guard._last_command is None
     np.testing.assert_allclose(controller.look_at_guard._velocity, 0.0)
     np.testing.assert_allclose(controller.look_at_guard._acceleration, 0.0)
     assert controller.limiter._last_command is None
     assert controller._last_command_path == "look_at"
+
+    backend.current[0] += 0.00153398
+    backend.head_kinematics.joints = backend.current.copy()
+    assert controller.step(dt=0.02)
+    np.testing.assert_array_equal(backend.commands[-1], backend.current)
+    assert controller.telemetry.query()["records"][-1]["reason"] == "commanded"
 
 
 def test_visual_servo_no_target_gap_clears_look_at_motion_state() -> None:
