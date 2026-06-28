@@ -17,6 +17,7 @@ from reachy_mini.daemon.tracking.telemetry import (
 from reachy_mini.daemon.tracking.visual_servo import (
     DetectionBuffer,
     JointCommandLimiter,
+    JointCommandSafetyGuard,
     LookAtJointCommandProfile,
     LookAtTargetFilter,
     PixelTargetFilter,
@@ -115,29 +116,46 @@ def test_look_at_joint_profile_has_no_unbounded_target_crossing_reset() -> None:
     np.testing.assert_allclose(profile._acceleration, 0.0, atol=1e-9)
 
 
-def test_look_at_joint_profile_reports_position_saturation_sources() -> None:
-    limits = np.array([[-2.0, 2.0], *([[-1.0, 1.0]] * 6)], dtype=np.float64)
-    config = VisualServoConfig(
-        joint_safety_margin=0.0,
-        max_joint_velocity=100.0,
-        max_joint_acceleration=100.0,
-        max_joint_jerk=0.1,
-        look_at_profile_response_hz=0.001,
-    )
-    profile = LookAtJointCommandProfile(limits=limits, config=config)
-    profile._position = np.array([0.99, 0.0, 0.0, 0.0, 0.0, 0.0])
-    profile._velocity[0] = 1.0
+def test_look_at_joint_profile_preserves_boundary_stopping_distance() -> None:
+    config = _acceptance_profile_config()
+    profile = LookAtJointCommandProfile(config=config)
+    guard = JointCommandSafetyGuard(config=config)
+    upper = profile.limits[1, 1] - config.joint_safety_margin
+    position = upper - 0.0001849089660026504
+    velocity = 0.01
+    acceleration = -0.3
     desired = np.zeros(7)
-    desired[1] = 2.0
+    desired[1] = position - 0.0001
+    profile._position = np.array([position, 0.0, 0.0, 0.0, 0.0, 0.0])
+    profile._velocity[0] = velocity
+    profile._acceleration[0] = acceleration
+    guard._last_command = np.array([0.0, position, 0.0, 0.0, 0.0, 0.0, 0.0])
+    guard._velocity[1] = velocity
+    guard._acceleration[1] = acceleration
 
-    command, hits = profile.update_with_telemetry(desired, np.zeros(7), dt=0.02)
+    for _ in range(10):
+        command, profile_hits = profile.update_with_telemetry(
+            desired, np.zeros(7), dt=0.017
+        )
+        guard_hits, next_velocity, next_acceleration = guard.check(
+            command, np.zeros(7), dt=0.017
+        )
 
-    assert command[1] == 1.0
-    position_hits = [hit for hit in hits if hit["kind"] == "upper_position"]
-    assert {hit["source"] for hit in position_hits} == {
-        "desired",
-        "profile_position",
-    }
+        assert command[1] <= upper
+        assert not any(hit.get("source") == "profile_position" for hit in profile_hits)
+        assert guard_hits == []
+        guard.commit(command, next_velocity, next_acceleration)
+
+    desired[1] = upper + 1.0
+    command, profile_hits = profile.update_with_telemetry(
+        desired, np.zeros(7), dt=0.017
+    )
+    guard_hits, _velocity, _acceleration = guard.check(command, np.zeros(7), dt=0.017)
+    assert any(
+        hit["kind"] == "upper_position" and hit["source"] == "desired"
+        for hit in profile_hits
+    )
+    assert guard_hits == []
 
 
 def test_look_at_joint_profile_reports_velocity_acceleration_and_jerk_clamps() -> None:
@@ -161,6 +179,20 @@ def test_look_at_joint_profile_reports_velocity_acceleration_and_jerk_clamps() -
     assert all(
         abs(float(hit["value"])) > float(hit["limit"]) for hit in by_kind.values()
     )
+
+
+def test_joint_command_safety_guard_ignores_only_numerical_limit_noise() -> None:
+    config = _acceptance_profile_config()
+    guard = JointCommandSafetyGuard(config=config)
+    dt = 0.02
+
+    def hits_for_jerk(jerk: float) -> list[dict[str, float | int | str]]:
+        command = np.full(7, jerk * dt**3)
+        hits, _velocity, _acceleration = guard.check(command, np.zeros(7), dt)
+        return hits
+
+    assert not any(hit["kind"] == "jerk" for hit in hits_for_jerk(8.00000245))
+    assert any(hit["kind"] == "jerk" for hit in hits_for_jerk(8.00002))
 
 
 def test_look_at_joint_profile_reset_clears_motion_state() -> None:

@@ -529,33 +529,63 @@ class LookAtJointCommandProfile:
                             speed_low = midpoint
                     candidate = (speed_low + speed_high) / 2.0
 
-            def distance_after_step(acceleration_value: float) -> float:
-                velocity_after_step = max(
-                    0.0, directed_velocity + acceleration_value * dt
+            def constrain_for_stop(
+                acceleration_value: float,
+                motion_velocity: float,
+                motion_acceleration: float,
+                available_distance: float,
+            ) -> float:
+                if motion_velocity < 0.0:
+                    return acceleration_value
+                braking = max(-max_acceleration, motion_acceleration - max_jerk * dt)
+
+                def distance_after_step(value: float) -> float:
+                    velocity_after_step = max(0.0, motion_velocity + value * dt)
+                    return velocity_after_step * dt + self._stopping_distance(
+                        velocity_after_step,
+                        value,
+                        max_jerk,
+                        max_acceleration,
+                    )
+
+                if distance_after_step(braking) >= available_distance:
+                    return braking
+                if distance_after_step(acceleration_value) <= available_distance:
+                    return acceleration_value
+                safe = braking
+                unsafe = acceleration_value
+                for _ in range(30):
+                    midpoint = (safe + unsafe) / 2.0
+                    if distance_after_step(midpoint) > available_distance:
+                        unsafe = midpoint
+                    else:
+                        safe = midpoint
+                return (safe + unsafe) / 2.0
+
+            chosen_acceleration = constrain_for_stop(
+                candidate,
+                directed_velocity,
+                directed_acceleration,
+                distance,
+            )
+            chosen_acceleration *= direction
+            motion_direction = float(np.sign(velocity[local_index]))
+            if motion_direction == 0.0:
+                motion_direction = float(np.sign(chosen_acceleration))
+            if motion_direction != 0.0:
+                boundary_distance = (
+                    upper[local_index] - position[local_index]
+                    if motion_direction > 0.0
+                    else position[local_index] - lower[local_index]
                 )
-                return velocity_after_step * dt + self._stopping_distance(
-                    velocity_after_step,
-                    acceleration_value,
-                    max_jerk,
-                    max_acceleration,
+                chosen_acceleration = motion_direction * constrain_for_stop(
+                    motion_direction * chosen_acceleration,
+                    motion_direction * velocity[local_index],
+                    motion_direction * acceleration[local_index],
+                    max(0.0, boundary_distance),
                 )
 
-            chosen_acceleration = candidate
-            if directed_velocity >= 0.0:
-                if distance_after_step(acceleration_low) >= distance:
-                    chosen_acceleration = acceleration_low
-                elif distance_after_step(candidate) > distance:
-                    search_low = acceleration_low
-                    search_high = candidate
-                    for _ in range(30):
-                        midpoint = (search_low + search_high) / 2.0
-                        if distance_after_step(midpoint) > distance:
-                            search_high = midpoint
-                        else:
-                            search_low = midpoint
-                    chosen_acceleration = (search_low + search_high) / 2.0
-
-            next_acceleration[local_index] = direction * chosen_acceleration
+            next_acceleration[local_index] = chosen_acceleration
             next_velocity[local_index] = (
                 velocity[local_index] + next_acceleration[local_index] * dt
             )
@@ -587,7 +617,7 @@ class LookAtJointCommandProfile:
                         "limit": float(high),
                     }
                 )
-        position = np.clip(next_position, lower, upper)
+        position = next_position
 
         self._body_yaw_position = float(position[0])
         self._body_yaw_velocity = float(velocity[0])
@@ -643,11 +673,11 @@ class JointCommandSafetyGuard:
         margin = self.config.joint_safety_margin
         lower = self.limits[:, 0] + margin
         upper = self.limits[:, 1] - margin
-        tolerance = 1e-7
+        position_tolerance = 1e-9
         hits: list[dict[str, float | int | str]] = []
 
         for index, value in enumerate(command_vector):
-            if value < lower[index] - tolerance:
+            if value < lower[index] - position_tolerance:
                 hits.append(
                     {
                         "joint_index": index,
@@ -656,7 +686,7 @@ class JointCommandSafetyGuard:
                         "limit": float(lower[index]),
                     }
                 )
-            if value > upper[index] + tolerance:
+            if value > upper[index] + position_tolerance:
                 hits.append(
                     {
                         "joint_index": index,
@@ -671,6 +701,7 @@ class JointCommandSafetyGuard:
             ("acceleration", acceleration, self.config.max_joint_acceleration),
             ("jerk", jerk, self.config.max_joint_jerk),
         ):
+            tolerance = max(1e-9, limit * 1e-6)
             for index, value in enumerate(values):
                 if abs(float(value)) > limit + tolerance:
                     hits.append(
