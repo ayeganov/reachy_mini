@@ -1392,6 +1392,19 @@ def test_tracking_telemetry_buffer_drops_old_records() -> None:
     assert [record["reason"] for record in result["records"]] == ["b", "c"]
 
 
+def test_latest_telemetry_returns_only_an_isolated_newest_record() -> None:
+    buffer = VisualServoTelemetryBuffer(capacity=3000)
+    for sequence in range(3000):
+        buffer.append({"sequence": sequence, "nested": {"value": sequence}})
+
+    latest = buffer.latest()
+
+    assert latest == {"sequence": 2999, "nested": {"value": 2999}}
+    assert latest is not None
+    latest["sequence"] = -1
+    assert buffer.latest() == {"sequence": 2999, "nested": {"value": 2999}}
+
+
 def test_tracking_telemetry_query_filters_by_time_sequence_and_limit() -> None:
     buffer = VisualServoTelemetryBuffer(capacity=10)
     for sequence in range(5):

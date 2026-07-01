@@ -117,6 +117,13 @@ class VisualServoTelemetryBuffer:
                 self._dropped_records += 1
             self._records.append(json_record)
 
+    def latest(self) -> dict[str, JsonValue] | None:
+        """Return an isolated copy of only the newest record in constant time."""
+        with self._lock:
+            if not self._records:
+                return None
+            return copy.deepcopy(self._records[-1])
+
     def query(
         self,
         from_timestamp: float | None = None,

@@ -361,7 +361,10 @@ class MujocoRedTargetHarness:
         )
         self.frame_id += 1
         commanded = self.servo.step(dt=CONTROL_DT)
-        record: dict[str, Any] = dict(self.servo.telemetry.query()["records"][-1])
+        latest = self.servo.telemetry.latest()
+        if latest is None:
+            raise RuntimeError("look-at controller produced no telemetry record")
+        record: dict[str, Any] = dict(latest)
         reason = str(record["reason"])
         self.reasons.add(reason)
         self.ik_failures += int(bool(record.get("ik_failed")))

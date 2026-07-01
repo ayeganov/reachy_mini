@@ -65,6 +65,24 @@ def test_red_marker_is_detected_from_rendered_eye_camera_pixels() -> None:
         harness.close()
 
 
+def test_harness_step_reads_only_latest_telemetry_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = MujocoRedTargetHarness()
+    try:
+        monkeypatch.setattr(
+            harness.servo.telemetry,
+            "query",
+            lambda *args, **kwargs: pytest.fail("full telemetry query used per tick"),
+        )
+        harness.observe(CONTROL_DT * SENSOR_TICKS)
+        record = harness.step()
+
+        assert record["reason"] == "commanded"
+    finally:
+        harness.close()
+
+
 @pytest.mark.parametrize(
     ("name", "marker_y", "marker_z"),
     [
