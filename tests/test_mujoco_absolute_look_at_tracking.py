@@ -69,14 +69,14 @@ def test_red_marker_is_detected_from_rendered_eye_camera_pixels() -> None:
     ("name", "marker_y", "marker_z"),
     [
         ("center", 0.0, 0.0),
-        ("left", 0.15, 0.0),
-        ("right", -0.15, 0.0),
-        ("top", 0.0, 0.15),
-        ("bottom", 0.0, -0.15),
-        ("top_left", 0.106, 0.106),
-        ("top_right", -0.106, 0.106),
-        ("bottom_left", 0.106, -0.106),
-        ("bottom_right", -0.106, -0.106),
+        ("left", 0.2, 0.0),
+        ("right", -0.2, 0.0),
+        ("top", 0.0, 0.2),
+        ("bottom", 0.0, -0.2),
+        ("top_left", 0.1414, 0.1414),
+        ("top_right", -0.1414, 0.1414),
+        ("bottom_left", 0.1414, -0.1414),
+        ("bottom_right", -0.1414, -0.1414),
     ],
 )
 def test_rendered_marker_grid_centers_through_existing_look_at_path(
@@ -93,7 +93,7 @@ def test_rendered_marker_grid_centers_through_existing_look_at_path(
     assert result.ik_failures == 0, result
     assert result.guard_hits == 0, result
     assert result.profile_position_hits == 0, result
-    assert result.maximum_target_radius <= 0.15 + 1e-12, result
+    assert result.maximum_target_radius <= 0.2 + 1e-12, result
 
 
 def test_marker_loss_freezes_absolute_target_without_drift() -> None:
@@ -123,11 +123,11 @@ def test_marker_loss_freezes_absolute_target_without_drift() -> None:
 def test_abrupt_horizontal_reversal_centers_without_reset_or_stuck_state() -> None:
     harness = MujocoRedTargetHarness()
     try:
-        harness.set_marker_offset(0.15, 0.0)
+        harness.set_marker_offset(0.2, 0.0)
         first_centered, first_hold = _drive_until_centered(harness)
         first_target = harness.reference.target
 
-        harness.set_marker_offset(-0.15, 0.0)
+        harness.set_marker_offset(-0.2, 0.0)
         second_centered, second_hold = _drive_until_centered(harness)
 
         assert first_centered is not None and first_centered <= 2.5
@@ -137,7 +137,7 @@ def test_abrupt_horizontal_reversal_centers_without_reset_or_stuck_state() -> No
         assert harness.reference.target.y < first_target.y
         assert harness.guard_hits == 0
         assert harness.profile_position_hits == 0
-        assert harness.maximum_target_radius <= 0.15 + 1e-12
+        assert harness.maximum_target_radius <= 0.2 + 1e-12
     finally:
         harness.close()
 
@@ -154,5 +154,20 @@ def test_oracle_and_vision_modes_both_submit_look_at_targets() -> None:
         assert oracle_record["target_type"] == "look_at"
         assert vision_record["input_target"]["kind"] == "look_at"
         assert oracle_record["input_target"]["kind"] == "look_at"
+    finally:
+        harness.close()
+
+
+def test_oracle_compensates_camera_to_head_vertical_parallax() -> None:
+    harness = MujocoRedTargetHarness()
+    try:
+        harness.mode = "oracle"
+        oracle = harness._metric_target()
+
+        assert harness.marker_position[2] - oracle[2] == pytest.approx(0.0525)
+        assert oracle[2] == pytest.approx(
+            harness.look_at_plane.center_z,
+            abs=1e-6,
+        )
     finally:
         harness.close()

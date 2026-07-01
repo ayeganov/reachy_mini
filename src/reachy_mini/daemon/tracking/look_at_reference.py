@@ -13,7 +13,7 @@ class LookAtPlane:
     distance: float = 0.5
     center_y: float = 0.0
     center_z: float = 0.0
-    radius: float = 0.15
+    radius: float = 0.2
 
     def __post_init__(self) -> None:
         """Validate finite plane geometry."""
@@ -30,9 +30,9 @@ class LookAtPlane:
 class ImageErrorReferenceConfig:
     """Tuning and lifecycle limits for absolute-reference updates."""
 
-    horizontal_rate: float = 0.5
-    vertical_rate: float = 0.5
-    max_target_speed: float = 0.15
+    horizontal_rate: float = 2.0
+    vertical_rate: float = 2.0
+    max_target_speed: float = 0.6
     center_enter: float = 0.03
     center_exit: float = 0.05
     center_frames: int = 3

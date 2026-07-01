@@ -43,14 +43,14 @@ APPROVED_MOTION = {
 }
 SCENARIOS = {
     "center": (0.0, 0.0),
-    "left": (0.15, 0.0),
-    "right": (-0.15, 0.0),
-    "top": (0.0, 0.15),
-    "bottom": (0.0, -0.15),
-    "top_left": (0.106, 0.106),
-    "top_right": (-0.106, 0.106),
-    "bottom_left": (0.106, -0.106),
-    "bottom_right": (-0.106, -0.106),
+    "left": (0.2, 0.0),
+    "right": (-0.2, 0.0),
+    "top": (0.0, 0.2),
+    "bottom": (0.0, -0.2),
+    "top_left": (0.1414, 0.1414),
+    "top_right": (-0.1414, 0.1414),
+    "bottom_left": (0.1414, -0.1414),
+    "bottom_right": (-0.1414, -0.1414),
 }
 
 
@@ -114,7 +114,12 @@ def detect_red_marker(frame: npt.NDArray[np.uint8]) -> MarkerDetection | None:
 class MujocoRedTargetHarness:
     """Own deterministic physics, eye rendering, marker input, and look-at control."""
 
-    def __init__(self, width: int = 640, height: int = 360) -> None:
+    def __init__(
+        self,
+        width: int = 640,
+        height: int = 360,
+        target_radius: float = 0.2,
+    ) -> None:
         """Initialize a neutral simulated robot and its eye-camera renderer."""
         self.width = width
         self.height = height
@@ -147,7 +152,10 @@ class MujocoRedTargetHarness:
         self.studio_renderer: mujoco.Renderer | None = None
 
         head_pose = self.backend.get_present_head_pose()
-        self.look_at_plane = LookAtPlane(center_z=float(head_pose[2, 3]))
+        self.look_at_plane = LookAtPlane(
+            center_z=float(head_pose[2, 3]),
+            radius=target_radius,
+        )
         self.reference = AbsoluteLookAtReferenceController(
             plane=self.look_at_plane,
             config=ImageErrorReferenceConfig(),
@@ -307,10 +315,30 @@ class MujocoRedTargetHarness:
         return detection
 
     def _oracle_target(self) -> tuple[float, float, float]:
+        camera_origin, _rotation = self._camera_pose_robot_frame()
+        ray = self.marker_position - camera_origin
+        norm = float(np.linalg.norm(ray))
+        if norm <= 1e-9:
+            target = self.reference.target
+            return target.x, target.y, target.z
+        ray /= norm
+        head_origin = self.backend.get_present_head_pose()[:3, 3]
+        if ray[0] <= 1e-9:
+            target = self.reference.target
+            return target.x, target.y, target.z
+        distance = (self.look_at_plane.distance - head_origin[0]) / ray[0]
+        target_world = head_origin + distance * ray
+        offset_y = float(target_world[1] - self.look_at_plane.center_y)
+        offset_z = float(target_world[2] - self.look_at_plane.center_z)
+        radius = math.hypot(offset_y, offset_z)
+        if radius > self.look_at_plane.radius:
+            scale = self.look_at_plane.radius / radius
+            offset_y *= scale
+            offset_z *= scale
         return (
-            float(self.marker_position[0]),
-            float(self.marker_position[1]),
-            float(self.marker_position[2]),
+            self.look_at_plane.distance,
+            self.look_at_plane.center_y + offset_y,
+            self.look_at_plane.center_z + offset_z,
         )
 
     def _metric_target(self) -> tuple[float, float, float]:
@@ -389,7 +417,8 @@ class MujocoRedTargetHarness:
         lines = (
             f"mode={self.mode} {detection_text}",
             f"look_at=({target[0]:+.3f}, {target[1]:+.3f}, {target[2]:+.3f})",
-            "drag: move marker | v: vision | o: oracle | r: reset | q: quit",
+            f"radius={self.look_at_plane.radius:.2f}m | drag: move marker | "
+            "v: vision | o: oracle | r: reset | q: quit",
         )
         for row, text in enumerate(lines, start=1):
             cv2.putText(
@@ -460,9 +489,13 @@ def run_scenario(
         harness.close()
 
 
-def run_interactive() -> None:
+def run_interactive(target_radius: float = 0.2) -> None:
     """Open the rendered eye camera and allow direct marker dragging."""
-    harness = MujocoRedTargetHarness(width=1280, height=720)
+    harness = MujocoRedTargetHarness(
+        width=1280,
+        height=720,
+        target_radius=target_radius,
+    )
     window = "Reachy MuJoCo red-target tracking"
     studio_window = "Reachy MuJoCo third-person view"
     dragging = False
@@ -514,10 +547,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scenario", choices=tuple(SCENARIOS))
     parser.add_argument("--suite", action="store_true")
+    parser.add_argument("--radius", type=float, default=0.2)
     parser.add_argument("--artifact", type=Path)
     args = parser.parse_args()
     if args.scenario is None and not args.suite:
-        run_interactive()
+        run_interactive(target_radius=args.radius)
         return
     if args.suite:
         results = [

@@ -33,7 +33,7 @@ def test_reference_persists_and_accumulates_absolute_target_updates() -> None:
 def test_vertical_image_error_moves_absolute_target_with_expected_sign() -> None:
     controller = AbsoluteLookAtReferenceController(
         LookAtPlane(),
-        ImageErrorReferenceConfig(max_target_speed=1.0),
+        ImageErrorReferenceConfig(vertical_rate=0.5, max_target_speed=1.0),
     )
 
     below_center = controller.update(error_x=0.0, error_y=0.5, dt=0.1)
