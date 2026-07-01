@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
+import threading
 import time
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -27,6 +27,7 @@ from reachy_mini.media.receivers.zeromq_client import ZeroMQClient
 
 DEFAULT_BASE_URL = "http://reachy-mini.local:8017/api"
 APPROVED_TRACKING_CONFIG = {
+    "max_detection_age": 2.0,
     "smoothing_alpha": 1.0,
     "joint_safety_margin": 0.1745329252,
     "max_joint_velocity": 0.60,
@@ -34,11 +35,12 @@ APPROVED_TRACKING_CONFIG = {
     "max_joint_jerk": 16.0,
     "look_at_profile_response_hz": 2.0,
 }
+CONTROL_PERIOD = 0.04
 
 
 @dataclass(frozen=True)
 class YellowBoxDetectorConfig:
-    """HSV and geometry thresholds for the hardware target."""
+    """HSV and area thresholds for the hardware target."""
 
     hue_low: int = 18
     hue_high: int = 42
@@ -46,9 +48,6 @@ class YellowBoxDetectorConfig:
     value_low: int = 120
     min_area_ratio: float = 0.0005
     max_area_ratio: float = 0.5
-    min_rectangularity: float = 0.3
-    min_aspect_ratio: float = 1.5
-    max_aspect_ratio: float = 4.0
     morphology_size: int = 5
 
     def __post_init__(self) -> None:
@@ -61,10 +60,6 @@ class YellowBoxDetectorConfig:
             raise ValueError("value_low must be within [0, 255]")
         if not 0.0 < self.min_area_ratio < self.max_area_ratio <= 1.0:
             raise ValueError("area ratios must satisfy 0 < min < max <= 1")
-        if not 0.0 <= self.min_rectangularity <= 1.0:
-            raise ValueError("min_rectangularity must be within [0, 1]")
-        if not 1.0 <= self.min_aspect_ratio < self.max_aspect_ratio:
-            raise ValueError("aspect ratios must satisfy 1 <= min < max")
         if self.morphology_size < 1 or self.morphology_size % 2 == 0:
             raise ValueError("morphology_size must be a positive odd integer")
 
@@ -77,7 +72,6 @@ class YellowBoxDetection:
     v: float
     bounding_box: tuple[int, int, int, int]
     area_ratio: float
-    rectangularity: float
 
     def normalized_error(self, width: int, height: int) -> tuple[float, float]:
         """Return centroid error normalized by image half-width and half-height."""
@@ -94,30 +88,17 @@ class FollowDecision:
     """Reference-controller result for one detector observation."""
 
     update: ReferenceUpdate
-    submit_target: bool
-    acquired_frames: int
 
 
 class YellowBoxFollower:
-    """Require stable acquisition before driving the spherical reference."""
+    """Apply any available centroid directly to the spherical reference."""
 
     def __init__(
         self,
         controller: SphericalLookAtReferenceController,
-        acquisition_frames: int = 3,
-        max_centroid_jump: float = 0.35,
     ) -> None:
-        """Initialize acquisition state."""
-        if acquisition_frames < 1:
-            raise ValueError("acquisition_frames must be positive")
-        if not math.isfinite(max_centroid_jump) or max_centroid_jump <= 0.0:
-            raise ValueError("max_centroid_jump must be finite and positive")
+        """Initialize with no identity or acquisition state."""
         self.controller = controller
-        self.acquisition_frames = acquisition_frames
-        self.max_centroid_jump = max_centroid_jump
-        self._consecutive_detections = 0
-        self._has_commanded = False
-        self._last_error: tuple[float, float] | None = None
 
     def observe(
         self,
@@ -127,41 +108,16 @@ class YellowBoxFollower:
         height: int,
         dt: float,
     ) -> FollowDecision:
-        """Update acquisition and gaze reference from one frame."""
+        """Update the gaze reference directly from one frame."""
         if detection is None:
-            self._consecutive_detections = 0
             return FollowDecision(
                 update=self.controller.freeze("target_lost"),
-                submit_target=self._has_commanded,
-                acquired_frames=0,
             )
 
         error_x, error_y = detection.normalized_error(width, height)
-        if (
-            self._last_error is not None
-            and math.dist(self._last_error, (error_x, error_y)) > self.max_centroid_jump
-        ):
-            self._consecutive_detections = 0
-            return FollowDecision(
-                update=self.controller.freeze("candidate_jump"),
-                submit_target=self._has_commanded,
-                acquired_frames=0,
-            )
-        self._last_error = (error_x, error_y)
-        self._consecutive_detections += 1
-        if self._consecutive_detections < self.acquisition_frames:
-            return FollowDecision(
-                update=self.controller.freeze("acquiring"),
-                submit_target=False,
-                acquired_frames=self._consecutive_detections,
-            )
-
         update = self.controller.update(error_x=error_x, error_y=error_y, dt=dt)
-        self._has_commanded = True
         return FollowDecision(
             update=update,
-            submit_target=True,
-            acquired_frames=self._consecutive_detections,
         )
 
 
@@ -169,7 +125,7 @@ def detect_yellow_box(
     frame: npt.NDArray[np.uint8],
     config: YellowBoxDetectorConfig,
 ) -> tuple[YellowBoxDetection | None, npt.NDArray[np.uint8]]:
-    """Select the largest yellow contour satisfying the box thresholds."""
+    """Select the largest yellow contour satisfying color and area thresholds."""
     if frame.ndim != 3 or frame.shape[2] != 3 or frame.size == 0:
         raise ValueError("frame must be a non-empty BGR image")
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -199,15 +155,6 @@ def detect_yellow_box(
         if not config.min_area_ratio <= area_ratio <= config.max_area_ratio:
             continue
         x, y, width, height = cv2.boundingRect(contour)
-        rectangle_area = float(width * height)
-        if rectangle_area <= 0.0:
-            continue
-        rectangularity = area / rectangle_area
-        if rectangularity < config.min_rectangularity:
-            continue
-        aspect_ratio = max(width / height, height / width)
-        if not config.min_aspect_ratio <= aspect_ratio <= config.max_aspect_ratio:
-            continue
         moments = cv2.moments(contour)
         if moments["m00"] <= 0.0:
             continue
@@ -216,7 +163,6 @@ def detect_yellow_box(
             v=float(moments["m01"] / moments["m00"]),
             bounding_box=(x, y, width, height),
             area_ratio=area_ratio,
-            rectangularity=rectangularity,
         )
         candidates.append((area, detection))
     if not candidates:
@@ -261,8 +207,7 @@ def annotate_frame(
         )
         error_x, error_y = detection.normalized_error(width, height)
         detection_text = (
-            f"yellow e=({error_x:+.3f},{error_y:+.3f}) "
-            f"area={detection.area_ratio:.3f} rect={detection.rectangularity:.2f}"
+            f"yellow e=({error_x:+.3f},{error_y:+.3f}) area={detection.area_ratio:.3f}"
         )
     else:
         detection_text = "yellow target missing"
@@ -363,10 +308,90 @@ def _target_payload(target: LookAtReference, frame_id: int) -> dict[str, Any]:
         "x": target.x,
         "y": target.y,
         "z": target.z,
-        "timestamp": time.time(),
         "confidence": 1.0,
         "frame_id": frame_id,
     }
+
+
+class FixedRateLookAtSender:
+    """Refresh the latest metric target without blocking perception or display."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        initial_target: LookAtReference,
+        request_timeout: float,
+        period: float = CONTROL_PERIOD,
+    ) -> None:
+        """Initialize a stopped latest-target sender."""
+        if request_timeout <= 0.0:
+            raise ValueError("request_timeout must be positive")
+        if period <= 0.0:
+            raise ValueError("period must be positive")
+        self.base_url = base_url
+        self.request_timeout = request_timeout
+        self.period = period
+        self._target = initial_target
+        self._target_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.sent_count = 0
+        self.error_count = 0
+        self.last_error: str | None = None
+        self.latencies: list[float] = []
+
+    def set_target(self, target: LookAtReference) -> None:
+        """Replace the target used by the next sender tick."""
+        with self._target_lock:
+            self._target = target
+
+    def start(self) -> None:
+        """Start the sender thread."""
+        if self._thread is not None:
+            raise RuntimeError("look-at sender is already started")
+        self._thread = threading.Thread(
+            target=self._run,
+            name="yellow_box_look_at_sender",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the sender after any in-flight bounded request."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.request_timeout + 1.0)
+            if self._thread.is_alive():
+                self.error_count += 1
+                self.last_error = "look-at sender did not stop"
+            else:
+                self._thread = None
+
+    def _run(self) -> None:
+        next_tick = time.monotonic()
+        while not self._stop.is_set():
+            with self._target_lock:
+                target = self._target
+            started = time.monotonic()
+            try:
+                _request_json(
+                    "POST",
+                    self.base_url,
+                    "/tracking/look_at",
+                    _target_payload(target, self.sent_count + self.error_count),
+                    timeout=self.request_timeout,
+                )
+                self.sent_count += 1
+            except Exception as exc:
+                self.error_count += 1
+                self.last_error = str(exc)
+            self.latencies.append(time.monotonic() - started)
+            next_tick += self.period
+            now = time.monotonic()
+            if next_tick <= now:
+                next_tick = now + self.period
+            self._stop.wait(max(0.0, next_tick - now))
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -407,9 +432,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         value_low=args.value_low,
         min_area_ratio=args.min_area_ratio,
         max_area_ratio=args.max_area_ratio,
-        min_rectangularity=args.min_rectangularity,
-        min_aspect_ratio=args.min_aspect_ratio,
-        max_aspect_ratio=args.max_aspect_ratio,
         morphology_size=args.morphology_size,
     )
 
@@ -425,24 +447,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 ImageErrorReferenceConfig(),
             ),
-            acquisition_frames=args.acquisition_frames,
         )
 
     client = ZeroMQClient(host=camera_host, log_level="WARNING")
+    sender: FixedRateLookAtSender | None = None
     tracking_started = False
     telemetry: dict[str, Any] = {}
     frame_count = 0
     detection_count = 0
-    command_count = 0
+    control_tick_count = 0
     maximum_area_ratio = 0.0
     last_detection: YellowBoxDetection | None = None
     last_frame: npt.NDArray[np.uint8] | None = None
     last_annotated: npt.NDArray[np.uint8] | None = None
     last_mask: npt.NDArray[np.uint8] | None = None
     last_frame_timestamp: object = None
-    last_frame_monotonic: float | None = None
+    last_control_frame_timestamp: object = None
+    decision: FollowDecision | None = None
     started_at = time.monotonic()
+    next_control_tick = started_at
     stopped_by = "duration"
+    run_error: Exception | None = None
     output_prefix = args.output_prefix or Path(
         f"/tmp/reachy-yellow-box-{time.strftime('%Y%m%d-%H%M%S')}"
     )
@@ -458,62 +483,81 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 timeout=args.timeout,
             )
             tracking_started = True
+            assert follower is not None
+            sender = FixedRateLookAtSender(
+                base_url=base_url,
+                initial_target=follower.controller.target,
+                request_timeout=min(args.timeout, 1.5),
+            )
+            sender.start()
 
         while args.duration <= 0.0 or time.monotonic() - started_at < args.duration:
             packet = client.get_frame_with_metadata()
-            if packet is None:
-                time.sleep(0.005)
-                continue
-            frame, metadata = packet
-            frame = frame.copy()
-            last_frame = frame
-            timestamp = metadata.get("ts")
-            if timestamp == last_frame_timestamp:
-                time.sleep(0.002)
-                continue
-            last_frame_timestamp = timestamp
             now = time.monotonic()
-            dt = (
-                1.0 / 30.0
-                if last_frame_monotonic is None
-                else now - last_frame_monotonic
-            )
-            last_frame_monotonic = now
-
-            detection, mask = detect_yellow_box(frame, detector_config)
-            last_detection = detection
-            last_mask = mask
-            frame_count += 1
-            if detection is not None:
-                detection_count += 1
-                maximum_area_ratio = max(maximum_area_ratio, detection.area_ratio)
-
-            decision = None
-            if follower is not None:
-                decision = follower.observe(
-                    detection,
-                    width=frame.shape[1],
-                    height=frame.shape[0],
-                    dt=dt,
-                )
-                if decision.submit_target:
-                    _request_json(
-                        "POST",
-                        base_url,
-                        "/tracking/look_at",
-                        _target_payload(decision.update.target, frame_count),
-                        timeout=args.timeout,
+            new_frame = False
+            if packet is not None:
+                frame, metadata = packet
+                timestamp = metadata.get("ts")
+                if timestamp != last_frame_timestamp:
+                    new_frame = True
+                    last_frame_timestamp = timestamp
+                    last_frame = frame.copy()
+                    last_detection, last_mask = detect_yellow_box(
+                        last_frame,
+                        detector_config,
                     )
-                    command_count += 1
+                    frame_count += 1
+                    if last_detection is not None:
+                        detection_count += 1
+                        maximum_area_ratio = max(
+                            maximum_area_ratio,
+                            last_detection.area_ratio,
+                        )
 
-            last_annotated = annotate_frame(frame, detection, decision, args.follow)
+            if follower is not None and now >= next_control_tick:
+                fresh_detection = (
+                    last_detection
+                    if last_frame_timestamp != last_control_frame_timestamp
+                    else None
+                )
+                decision = follower.observe(
+                    fresh_detection,
+                    width=last_frame.shape[1] if last_frame is not None else 1280,
+                    height=last_frame.shape[0] if last_frame is not None else 720,
+                    dt=CONTROL_PERIOD,
+                )
+                assert sender is not None
+                sender.set_target(decision.update.target)
+                last_control_frame_timestamp = last_frame_timestamp
+                control_tick_count += 1
+                next_control_tick += CONTROL_PERIOD
+                if next_control_tick <= now:
+                    next_control_tick = now + CONTROL_PERIOD
+
+            if new_frame and last_frame is not None:
+                last_annotated = annotate_frame(
+                    last_frame,
+                    last_detection,
+                    decision,
+                    args.follow,
+                )
             if args.display:
-                cv2.imshow("Reachy yellow-box follow", last_annotated)
-                cv2.imshow("Reachy yellow mask", mask)
+                if new_frame and last_annotated is not None and last_mask is not None:
+                    cv2.imshow("Reachy yellow-box follow", last_annotated)
+                    cv2.imshow("Reachy yellow mask", last_mask)
                 if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                     stopped_by = "operator"
                     break
+            if not new_frame:
+                time.sleep(0.002)
+    except KeyboardInterrupt:
+        stopped_by = "interrupt"
+    except Exception as exc:
+        stopped_by = "error"
+        run_error = exc
     finally:
+        if sender is not None:
+            sender.stop()
         client.close()
         if args.display:
             cv2.destroyAllWindows()
@@ -555,13 +599,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "tracking_config": APPROVED_TRACKING_CONFIG if args.follow else None,
         "frame_count": frame_count,
         "detection_count": detection_count,
+        "control_tick_count": control_tick_count,
         "detection_fraction": detection_count / frame_count if frame_count else 0.0,
         "maximum_area_ratio": maximum_area_ratio,
         "last_detection": asdict(last_detection)
         if last_detection is not None
         else None,
-        "submitted_targets": command_count,
+        "submitted_targets": 0 if sender is None else sender.sent_count,
+        "sender_errors": 0 if sender is None else sender.error_count,
+        "sender_last_error": None if sender is None else sender.last_error,
+        "sender_latency_ms": None
+        if sender is None or not sender.latencies
+        else {
+            "median": float(np.median(sender.latencies) * 1000.0),
+            "p95": float(np.percentile(sender.latencies, 95) * 1000.0),
+            "maximum": float(max(sender.latencies) * 1000.0),
+        },
         "stopped_by": stopped_by,
+        "error": None if run_error is None else repr(run_error),
         "state_before": state_before,
         "state_after": state_after,
         "tracking_before": tracking_before,
@@ -570,6 +625,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output_prefix.with_suffix(".json").write_text(
         json.dumps(summary, indent=2, allow_nan=False) + "\n"
     )
+    if run_error is not None:
+        raise run_error
     return summary
 
 
@@ -592,16 +649,12 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument("--acquisition-frames", type=int, default=3)
     parser.add_argument("--hue-low", type=int, default=18)
     parser.add_argument("--hue-high", type=int, default=42)
     parser.add_argument("--saturation-low", type=int, default=170)
     parser.add_argument("--value-low", type=int, default=120)
     parser.add_argument("--min-area-ratio", type=float, default=0.0005)
     parser.add_argument("--max-area-ratio", type=float, default=0.5)
-    parser.add_argument("--min-rectangularity", type=float, default=0.3)
-    parser.add_argument("--min-aspect-ratio", type=float, default=1.5)
-    parser.add_argument("--max-aspect-ratio", type=float, default=4.0)
     parser.add_argument("--morphology-size", type=int, default=5)
     args = parser.parse_args()
     summary = run(args)
