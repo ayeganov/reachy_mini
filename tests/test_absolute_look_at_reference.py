@@ -5,81 +5,110 @@ import math
 import pytest
 
 from reachy_mini.daemon.tracking.look_at_reference import (
-    AbsoluteLookAtReferenceController,
     ImageErrorReferenceConfig,
-    LookAtPlane,
+    LookAtSphere,
+    SphericalLookAtReferenceController,
 )
 
 
-def test_reference_persists_and_accumulates_absolute_target_updates() -> None:
-    controller = AbsoluteLookAtReferenceController(
-        LookAtPlane(center_z=0.02),
+def test_reference_persists_and_rotates_absolute_direction() -> None:
+    controller = SphericalLookAtReferenceController(
+        LookAtSphere(origin_z=0.02),
         ImageErrorReferenceConfig(
-            horizontal_rate=0.2,
-            vertical_rate=0.3,
-            max_target_speed=1.0,
+            horizontal_rate=1.0,
+            vertical_rate=1.0,
+            max_angular_speed=2.0,
         ),
     )
 
     first = controller.update(error_x=0.5, error_y=0.0, dt=0.1)
     second = controller.update(error_x=0.5, error_y=0.0, dt=0.1)
 
-    assert first.target.y == pytest.approx(-0.01)
-    assert second.target.y == pytest.approx(-0.02)
-    assert second.target.x == 0.5
-    assert second.target.z == 0.02
+    assert first.direction == pytest.approx((math.cos(0.05), -math.sin(0.05), 0.0))
+    assert second.direction == pytest.approx((math.cos(0.1), -math.sin(0.1), 0.0))
+    assert second.target.x == pytest.approx(0.5 * math.cos(0.1))
+    assert second.target.y == pytest.approx(-0.5 * math.sin(0.1))
+    assert second.target.z == pytest.approx(0.02)
 
 
-def test_vertical_image_error_moves_absolute_target_with_expected_sign() -> None:
-    controller = AbsoluteLookAtReferenceController(
-        LookAtPlane(),
-        ImageErrorReferenceConfig(vertical_rate=0.5, max_target_speed=1.0),
+def test_vertical_image_error_rotates_direction_with_expected_sign() -> None:
+    controller = SphericalLookAtReferenceController(
+        LookAtSphere(),
+        ImageErrorReferenceConfig(vertical_rate=1.0, max_angular_speed=2.0),
     )
 
     below_center = controller.update(error_x=0.0, error_y=0.5, dt=0.1)
 
-    assert below_center.target.z == pytest.approx(-0.025)
-    assert below_center.target.y == 0.0
+    assert below_center.direction == pytest.approx(
+        (math.cos(0.05), 0.0, -math.sin(0.05))
+    )
+    assert below_center.target.z == pytest.approx(-0.5 * math.sin(0.05))
 
 
-def test_target_velocity_is_vector_limited() -> None:
-    controller = AbsoluteLookAtReferenceController(
-        LookAtPlane(radius=1.0),
+def test_angular_rate_is_vector_limited() -> None:
+    controller = SphericalLookAtReferenceController(
+        LookAtSphere(elevation_limit=1.0),
         ImageErrorReferenceConfig(
             horizontal_rate=1.0,
             vertical_rate=1.0,
-            max_target_speed=0.1,
+            max_angular_speed=0.1,
             max_update_interval=1.0,
         ),
     )
 
     update = controller.update(error_x=1.0, error_y=-1.0, dt=1.0)
 
-    assert math.hypot(update.delta_y, update.delta_z) == pytest.approx(0.1)
+    assert math.hypot(update.delta_azimuth, update.delta_elevation) == pytest.approx(
+        0.1
+    )
+    assert math.dist(update.direction, (0.0, 0.0, 0.0)) == pytest.approx(1.0)
 
 
-def test_circular_saturation_has_no_hidden_windup() -> None:
-    controller = AbsoluteLookAtReferenceController(
-        LookAtPlane(radius=0.02),
+def test_elevation_saturation_has_no_hidden_windup() -> None:
+    controller = SphericalLookAtReferenceController(
+        LookAtSphere(elevation_limit=0.02),
         ImageErrorReferenceConfig(
             horizontal_rate=1.0,
             vertical_rate=1.0,
-            max_target_speed=1.0,
+            max_angular_speed=1.0,
         ),
     )
 
-    saturated = controller.update(error_x=1.0, error_y=0.0, dt=0.1)
-    inward = controller.update(error_x=-1.0, error_y=0.0, dt=0.01)
+    saturated = controller.update(error_x=0.0, error_y=-1.0, dt=0.1)
+    inward = controller.update(error_x=0.0, error_y=1.0, dt=0.01)
 
     assert saturated.saturated
-    assert saturated.target.y == pytest.approx(-0.02)
+    assert math.asin(saturated.direction[2]) == pytest.approx(0.02)
     assert not inward.saturated
-    assert inward.target.y == pytest.approx(-0.01)
+    assert math.asin(inward.direction[2]) == pytest.approx(0.01)
+
+
+def test_complete_horizontal_rotation_is_normalized_and_wrap_free() -> None:
+    controller = SphericalLookAtReferenceController(
+        LookAtSphere(),
+        ImageErrorReferenceConfig(
+            horizontal_rate=1.0,
+            vertical_rate=1.0,
+            max_angular_speed=1.0,
+        ),
+    )
+    previous = controller.direction
+
+    for _ in range(80):
+        update = controller.update(error_x=-1.0, error_y=0.0, dt=0.1)
+        assert math.dist(update.direction, (0.0, 0.0, 0.0)) == pytest.approx(1.0)
+        assert math.dist(update.direction, previous) < 0.101
+        previous = update.direction
+
+    assert controller.direction == pytest.approx(
+        (math.cos(8.0), math.sin(8.0), 0.0),
+        abs=1e-12,
+    )
 
 
 def test_centered_observations_freeze_the_absolute_reference() -> None:
-    controller = AbsoluteLookAtReferenceController(
-        LookAtPlane(),
+    controller = SphericalLookAtReferenceController(
+        LookAtSphere(),
         ImageErrorReferenceConfig(center_frames=3),
     )
     moved = controller.update(error_x=0.2, error_y=0.0, dt=0.02)
@@ -93,14 +122,14 @@ def test_centered_observations_freeze_the_absolute_reference() -> None:
     assert centered.target == moved.target
     assert held.reason == "centered"
     assert held.target == centered.target
-    assert held.delta_y == 0.0
-    assert held.delta_z == 0.0
+    assert held.delta_azimuth == 0.0
+    assert held.delta_elevation == 0.0
 
 
-def test_error_outside_exit_resumes_from_the_persistent_target() -> None:
-    controller = AbsoluteLookAtReferenceController(
-        LookAtPlane(),
-        ImageErrorReferenceConfig(center_frames=1, max_target_speed=1.0),
+def test_error_outside_exit_resumes_from_the_persistent_direction() -> None:
+    controller = SphericalLookAtReferenceController(
+        LookAtSphere(),
+        ImageErrorReferenceConfig(center_frames=1, max_angular_speed=2.0),
     )
     centered = controller.update(error_x=0.0, error_y=0.0, dt=0.02)
     resumed = controller.update(error_x=-0.1, error_y=0.0, dt=0.02)
@@ -111,7 +140,7 @@ def test_error_outside_exit_resumes_from_the_persistent_target() -> None:
 
 
 def test_missing_observation_and_stale_interval_freeze_without_mutation() -> None:
-    controller = AbsoluteLookAtReferenceController(LookAtPlane())
+    controller = SphericalLookAtReferenceController(LookAtSphere())
     moved = controller.update(error_x=0.2, error_y=0.0, dt=0.02)
 
     missing = controller.freeze()
@@ -123,39 +152,46 @@ def test_missing_observation_and_stale_interval_freeze_without_mutation() -> Non
     assert stale.reason == "stale_interval"
 
 
-def test_reset_returns_to_the_absolute_plane_center() -> None:
-    controller = AbsoluteLookAtReferenceController(
-        LookAtPlane(distance=0.6, center_y=0.03, center_z=-0.01),
+def test_reset_returns_to_the_absolute_forward_direction() -> None:
+    controller = SphericalLookAtReferenceController(
+        LookAtSphere(
+            distance=0.6,
+            origin_x=0.01,
+            origin_y=0.03,
+            origin_z=-0.01,
+        ),
     )
     controller.update(error_x=0.2, error_y=0.2, dt=0.02)
 
     target = controller.reset()
 
-    assert (target.x, target.y, target.z) == (0.6, 0.03, -0.01)
+    assert (target.x, target.y, target.z) == pytest.approx((0.61, 0.03, -0.01))
+    assert controller.direction == (1.0, 0.0, 0.0)
 
 
 @pytest.mark.parametrize(
-    "plane",
+    "sphere",
     [
-        LookAtPlane,
-        lambda: LookAtPlane(distance=0.0),
-        lambda: LookAtPlane(radius=-1.0),
-        lambda: LookAtPlane(center_y=math.nan),
+        LookAtSphere,
+        lambda: LookAtSphere(distance=0.0),
+        lambda: LookAtSphere(elevation_limit=0.0),
+        lambda: LookAtSphere(elevation_limit=math.pi / 2.0),
+        lambda: LookAtSphere(origin_y=math.nan),
     ],
 )
-def test_invalid_plane_values_are_rejected(plane) -> None:  # type: ignore[no-untyped-def]
-    if plane is LookAtPlane:
-        plane()
+def test_invalid_sphere_values_are_rejected(sphere) -> None:  # type: ignore[no-untyped-def]
+    if sphere is LookAtSphere:
+        sphere()
         return
     with pytest.raises(ValueError):
-        plane()
+        sphere()
 
 
 @pytest.mark.parametrize(
     "config",
     [
         lambda: ImageErrorReferenceConfig(horizontal_rate=0.0),
-        lambda: ImageErrorReferenceConfig(max_target_speed=math.inf),
+        lambda: ImageErrorReferenceConfig(max_angular_speed=math.inf),
         lambda: ImageErrorReferenceConfig(center_enter=-0.1),
         lambda: ImageErrorReferenceConfig(center_enter=0.1, center_exit=0.1),
         lambda: ImageErrorReferenceConfig(center_frames=0),
@@ -181,7 +217,7 @@ def test_invalid_updates_are_rejected_without_mutation(
     error_y: float,
     dt: float,
 ) -> None:
-    controller = AbsoluteLookAtReferenceController(LookAtPlane())
+    controller = SphericalLookAtReferenceController(LookAtSphere())
     before = controller.target
 
     with pytest.raises(ValueError):

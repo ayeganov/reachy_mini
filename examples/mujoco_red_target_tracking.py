@@ -17,10 +17,10 @@ import numpy.typing as npt
 
 from reachy_mini.daemon.backend.mujoco.backend import MujocoBackend
 from reachy_mini.daemon.tracking.look_at_reference import (
-    AbsoluteLookAtReferenceController,
     ImageErrorReferenceConfig,
-    LookAtPlane,
+    LookAtSphere,
     ReferenceUpdate,
+    SphericalLookAtReferenceController,
 )
 from reachy_mini.daemon.tracking.visual_servo import (
     TrackingLookAtTarget,
@@ -32,6 +32,9 @@ CONTROL_DT = 0.02
 SENSOR_TICKS = 2
 SIMULATION_Z_OFFSET = 0.177
 MARKER_RADIUS = 0.025
+DEFAULT_ORBIT_RADIUS = 0.5
+DEFAULT_VERTICAL_RANGE = 0.2
+ORBIT_PAD_SIZE = 640
 RED = np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
 APPROVED_MOTION = {
     "smoothing_alpha": 1.0,
@@ -43,14 +46,14 @@ APPROVED_MOTION = {
 }
 SCENARIOS = {
     "center": (0.0, 0.0),
-    "left": (0.2, 0.0),
-    "right": (-0.2, 0.0),
+    "left": (math.atan2(0.2, 0.5), 0.0),
+    "right": (-math.atan2(0.2, 0.5), 0.0),
     "top": (0.0, 0.2),
     "bottom": (0.0, -0.2),
-    "top_left": (0.1414, 0.1414),
-    "top_right": (-0.1414, 0.1414),
-    "bottom_left": (0.1414, -0.1414),
-    "bottom_right": (-0.1414, -0.1414),
+    "top_left": (math.atan2(0.1414, 0.5), 0.1414),
+    "top_right": (-math.atan2(0.1414, 0.5), 0.1414),
+    "bottom_left": (math.atan2(0.1414, 0.5), -0.1414),
+    "bottom_right": (-math.atan2(0.1414, 0.5), -0.1414),
 }
 
 
@@ -79,8 +82,35 @@ class ScenarioResult:
     ik_failures: int
     guard_hits: int
     profile_position_hits: int
-    maximum_target_radius: float
+    maximum_direction_norm_error: float
+    maximum_abs_elevation: float
     final_target: tuple[float, float, float]
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class OrbitStepResult:
+    """Rendered-camera outcome for one incremental marker azimuth."""
+
+    azimuth_degrees: float
+    marker_visible: bool
+    centered_at_s: float | None
+    held_center_s: float
+    body_yaw_degrees: float
+
+
+@dataclass(frozen=True)
+class OrbitSweepResult:
+    """Deterministic result for one incremental visual orbit sweep."""
+
+    requested_end_degrees: float
+    reached_degrees: float
+    steps: tuple[OrbitStepResult, ...]
+    ik_failures: int
+    guard_hits: int
+    profile_position_hits: int
+    maximum_direction_norm_error: float
+    maximum_abs_elevation: float
     reasons: tuple[str, ...]
 
 
@@ -118,9 +148,14 @@ class MujocoRedTargetHarness:
         self,
         width: int = 640,
         height: int = 360,
-        target_radius: float = 0.2,
+        orbit_radius: float = DEFAULT_ORBIT_RADIUS,
+        vertical_range: float = DEFAULT_VERTICAL_RANGE,
     ) -> None:
         """Initialize a neutral simulated robot and its eye-camera renderer."""
+        if not math.isfinite(orbit_radius) or orbit_radius <= 0.0:
+            raise ValueError("orbit_radius must be finite and positive")
+        if not math.isfinite(vertical_range) or vertical_range <= 0.0:
+            raise ValueError("vertical_range must be finite and positive")
         self.width = width
         self.height = height
         self.backend = MujocoBackend(scene="empty", headless=True)
@@ -145,19 +180,22 @@ class MujocoRedTargetHarness:
         self.studio_camera = mujoco.MjvCamera()
         mujoco.mjv_defaultCamera(self.studio_camera)
         self.studio_camera.type = mujoco.mjtCamera.mjCAMERA_FREE
-        self.studio_camera.lookat[:] = [0.25, 0.0, 0.15]
-        self.studio_camera.distance = 1.0
+        self.studio_camera.lookat[:] = [0.0, 0.0, 0.15]
+        self.studio_camera.distance = 1.4
         self.studio_camera.azimuth = 160.0
-        self.studio_camera.elevation = -15.0
+        self.studio_camera.elevation = -20.0
         self.studio_renderer: mujoco.Renderer | None = None
 
         head_pose = self.backend.get_present_head_pose()
-        self.look_at_plane = LookAtPlane(
-            center_z=float(head_pose[2, 3]),
-            radius=target_radius,
+        self.look_at_sphere = LookAtSphere(
+            distance=orbit_radius,
+            origin_x=float(head_pose[0, 3]),
+            origin_y=float(head_pose[1, 3]),
+            origin_z=float(head_pose[2, 3]),
+            elevation_limit=math.atan2(vertical_range, orbit_radius),
         )
-        self.reference = AbsoluteLookAtReferenceController(
-            plane=self.look_at_plane,
+        self.reference = SphericalLookAtReferenceController(
+            sphere=self.look_at_sphere,
             config=ImageErrorReferenceConfig(),
         )
         self.servo = VisualServoController(
@@ -174,8 +212,18 @@ class MujocoRedTargetHarness:
             ),
         )
 
-        self.marker_plane_center = self._neutral_marker_position()
-        self.marker_position = self.marker_plane_center.copy()
+        neutral_marker = self._neutral_marker_position()
+        self.marker_orbit_radius = orbit_radius
+        self.marker_height_limit = vertical_range
+        self.marker_orbit_center = np.array(
+            [
+                self.look_at_sphere.origin_x,
+                self.look_at_sphere.origin_y,
+                float(neutral_marker[2]),
+            ],
+            dtype=np.float64,
+        )
+        self.marker_position = neutral_marker
         self.marker_visible = True
         self.mode: Literal["vision", "oracle"] = "vision"
         self.last_detection: MarkerDetection | None = None
@@ -188,7 +236,8 @@ class MujocoRedTargetHarness:
         self.guard_hits = 0
         self.profile_position_hits = 0
         self.reasons: set[str] = set()
-        self.maximum_target_radius = 0.0
+        self.maximum_direction_norm_error = 0.0
+        self.maximum_abs_elevation = 0.0
 
     def close(self) -> None:
         """Release the renderer."""
@@ -215,50 +264,82 @@ class MujocoRedTargetHarness:
     def _neutral_marker_position(self) -> npt.NDArray[np.float64]:
         origin, rotation = self._camera_pose_robot_frame()
         forward = -rotation[:, 2]
-        if forward[0] <= 1e-9:
-            raise RuntimeError("eye camera does not face the positive target plane")
-        distance = (self.look_at_plane.distance - origin[0]) / forward[0]
-        return np.asarray(origin + distance * forward, dtype=np.float64)
+        horizontal_direction = forward[:2]
+        direction_squared = float(horizontal_direction @ horizontal_direction)
+        if direction_squared <= 1e-12:
+            raise RuntimeError("eye camera has no horizontal forward direction")
+        center = np.array(
+            [self.look_at_sphere.origin_x, self.look_at_sphere.origin_y],
+            dtype=np.float64,
+        )
+        offset = origin[:2] - center
+        linear = 2.0 * float(offset @ horizontal_direction)
+        constant = float(offset @ offset) - self.look_at_sphere.distance**2
+        discriminant = linear * linear - 4.0 * direction_squared * constant
+        if discriminant < 0.0:
+            raise RuntimeError("neutral camera ray does not reach the marker orbit")
+        root = math.sqrt(discriminant)
+        distances = (
+            (-linear - root) / (2.0 * direction_squared),
+            (-linear + root) / (2.0 * direction_squared),
+        )
+        positive_distances = [distance for distance in distances if distance > 0.0]
+        if not positive_distances:
+            raise RuntimeError("marker orbit is behind the neutral eye camera")
+        return np.asarray(origin + max(positive_distances) * forward, dtype=np.float64)
 
     def reset(self) -> None:
         """Reset marker and persistent reference without changing motion limits."""
-        self.marker_position = self.marker_plane_center.copy()
+        self.set_marker_orbit(0.0, 0.0)
         self.reference.reset()
         self.last_reference_update = self.reference.freeze("reset")
         self.last_detection = None
 
-    def set_marker_offset(self, y: float, z: float) -> None:
-        """Place the marker at a bounded offset from its neutral camera ray."""
-        length = math.hypot(y, z)
-        if length > self.look_at_plane.radius:
-            scale = self.look_at_plane.radius / length
-            y *= scale
-            z *= scale
-        self.marker_position = self.marker_plane_center + np.array([0.0, y, z])
+    @property
+    def marker_azimuth(self) -> float:
+        """Return marker azimuth around the fixed robot-frame orbit center."""
+        offset = self.marker_position - self.marker_orbit_center
+        return math.atan2(float(offset[1]), float(offset[0]))
 
-    def move_marker_from_pixel(self, u: float, v: float) -> None:
-        """Unproject an eye-frame cursor onto the marker's fixed robot-frame plane."""
-        origin, rotation = self._camera_pose_robot_frame()
-        fovy = math.radians(float(self.backend.model.cam_fovy[self.camera_id]))
-        focal = (self.height / 2.0) / math.tan(fovy / 2.0)
-        ray_camera = np.array(
+    @property
+    def marker_height(self) -> float:
+        """Return marker height relative to the neutral orbit."""
+        return float(self.marker_position[2] - self.marker_orbit_center[2])
+
+    def set_marker_orbit(self, azimuth: float, height: float) -> None:
+        """Place the marker directly in canonical robot-frame orbit coordinates."""
+        if not math.isfinite(azimuth) or not math.isfinite(height):
+            raise ValueError("marker orbit coordinates must be finite")
+        bounded_height = max(
+            -self.marker_height_limit,
+            min(self.marker_height_limit, height),
+        )
+        self.marker_position = self.marker_orbit_center + np.array(
             [
-                (u - self.width / 2.0) / focal,
-                -(v - self.height / 2.0) / focal,
-                -1.0,
-            ]
+                self.marker_orbit_radius * math.cos(azimuth),
+                self.marker_orbit_radius * math.sin(azimuth),
+                bounded_height,
+            ],
+            dtype=np.float64,
         )
-        ray_world = rotation @ ray_camera
-        if abs(float(ray_world[0])) <= 1e-9:
+
+    def move_marker_from_orbit_pad(self, u: float, v: float, size: int) -> None:
+        """Map one top-down pad position directly to marker azimuth."""
+        center = float(size) / 2.0
+        delta_x = u - center
+        delta_y = center - v
+        if math.hypot(delta_x, delta_y) <= 1e-9:
             return
-        distance = (self.look_at_plane.distance - origin[0]) / ray_world[0]
-        if distance <= 0.0:
-            return
-        point = origin + distance * ray_world
-        self.set_marker_offset(
-            y=float(point[1] - self.marker_plane_center[1]),
-            z=float(point[2] - self.marker_plane_center[2]),
+        self.set_marker_orbit(
+            math.atan2(delta_y, delta_x),
+            self.marker_height,
         )
+
+    def adjust_marker_height(self, delta: float) -> None:
+        """Move the marker vertically while retaining its world azimuth."""
+        if not math.isfinite(delta):
+            raise ValueError("marker height delta must be finite")
+        self.set_marker_orbit(self.marker_azimuth, self.marker_height + delta)
 
     def _add_marker(self, scene: mujoco.MjvScene) -> None:
         """Append the verification marker to one prepared render scene."""
@@ -297,6 +378,92 @@ class MujocoRedTargetHarness:
         self._add_marker(self.studio_renderer.scene)
         return np.asarray(self.studio_renderer.render(), dtype=np.uint8)
 
+    def orbit_pad_frame(self, size: int = ORBIT_PAD_SIZE) -> npt.NDArray[np.uint8]:
+        """Render a direct top-down azimuth control without camera unprojection."""
+        frame = np.full((size, size, 3), 24, dtype=np.uint8)
+        center = size // 2
+        radius = size // 2 - 54
+        cv2.circle(frame, (center, center), radius, (130, 130, 130), 2)
+        cv2.line(
+            frame,
+            (center - radius, center),
+            (center + radius, center),
+            (70, 70, 70),
+            1,
+        )
+        cv2.line(
+            frame,
+            (center, center - radius),
+            (center, center + radius),
+            (70, 70, 70),
+            1,
+        )
+        cv2.arrowedLine(
+            frame,
+            (center, center),
+            (center + 42, center),
+            (255, 255, 255),
+            3,
+            tipLength=0.3,
+        )
+        body_yaw = float(self.backend.get_present_head_joint_positions()[0])
+        body_end = (
+            round(center + 58 * math.cos(body_yaw)),
+            round(center - 58 * math.sin(body_yaw)),
+        )
+        cv2.arrowedLine(
+            frame,
+            (center, center),
+            body_end,
+            (255, 180, 60),
+            3,
+            tipLength=0.25,
+        )
+        marker = (
+            round(center + radius * math.cos(self.marker_azimuth)),
+            round(center - radius * math.sin(self.marker_azimuth)),
+        )
+        cv2.circle(frame, marker, 14, (0, 0, 255), -1)
+        cv2.circle(frame, marker, 16, (255, 255, 255), 2)
+        labels = (
+            ("front", (size - 92, center - 10)),
+            ("rear", (8, center - 10)),
+            ("left", (center - 20, 28)),
+            ("right", (center - 24, size - 16)),
+        )
+        for label, position in labels:
+            cv2.putText(
+                frame,
+                label,
+                position,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (190, 190, 190),
+                1,
+                cv2.LINE_AA,
+            )
+        cv2.putText(
+            frame,
+            "drag gradually | a/d: 5deg | w/s: height",
+            (12, size - 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            f"body yaw={math.degrees(body_yaw):+.1f}deg (limit +/-160deg)",
+            (12, size - 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 180, 60),
+            1,
+            cv2.LINE_AA,
+        )
+        return frame
+
     def observe(self, dt: float) -> MarkerDetection | None:
         """Render, detect, and update only the persistent absolute reference."""
         frame = self.render()
@@ -322,23 +489,19 @@ class MujocoRedTargetHarness:
             target = self.reference.target
             return target.x, target.y, target.z
         ray /= norm
-        head_origin = self.backend.get_present_head_pose()[:3, 3]
-        if ray[0] <= 1e-9:
-            target = self.reference.target
-            return target.x, target.y, target.z
-        distance = (self.look_at_plane.distance - head_origin[0]) / ray[0]
-        target_world = head_origin + distance * ray
-        offset_y = float(target_world[1] - self.look_at_plane.center_y)
-        offset_z = float(target_world[2] - self.look_at_plane.center_z)
-        radius = math.hypot(offset_y, offset_z)
-        if radius > self.look_at_plane.radius:
-            scale = self.look_at_plane.radius / radius
-            offset_y *= scale
-            offset_z *= scale
+        reference_origin = np.array(
+            [
+                self.look_at_sphere.origin_x,
+                self.look_at_sphere.origin_y,
+                self.look_at_sphere.origin_z,
+            ],
+            dtype=np.float64,
+        )
+        target_world = reference_origin + self.look_at_sphere.distance * ray
         return (
-            self.look_at_plane.distance,
-            self.look_at_plane.center_y + offset_y,
-            self.look_at_plane.center_z + offset_z,
+            float(target_world[0]),
+            float(target_world[1]),
+            float(target_world[2]),
         )
 
     def _metric_target(self) -> tuple[float, float, float]:
@@ -381,12 +544,14 @@ class MujocoRedTargetHarness:
         for _ in range(round(CONTROL_DT / self.backend.model.opt.timestep)):
             mujoco.mj_step(self.backend.model, self.backend.data)
         self._refresh_backend_state()
-        reference = self.reference.target
-        radius = math.hypot(
-            reference.y - self.look_at_plane.center_y,
-            reference.z - self.look_at_plane.center_z,
+        direction = self.reference.direction
+        norm_error = abs(math.dist(direction, (0.0, 0.0, 0.0)) - 1.0)
+        elevation = abs(math.asin(max(-1.0, min(1.0, float(direction[2])))))
+        self.maximum_direction_norm_error = max(
+            self.maximum_direction_norm_error,
+            norm_error,
         )
-        self.maximum_target_radius = max(self.maximum_target_radius, radius)
+        self.maximum_abs_elevation = max(self.maximum_abs_elevation, elevation)
         return record
 
     def annotated_frame(self) -> npt.NDArray[np.uint8]:
@@ -420,8 +585,8 @@ class MujocoRedTargetHarness:
         lines = (
             f"mode={self.mode} {detection_text}",
             f"look_at=({target[0]:+.3f}, {target[1]:+.3f}, {target[2]:+.3f})",
-            f"radius={self.look_at_plane.radius:.2f}m | drag: move marker | "
-            "v: vision | o: oracle | r: reset | q: quit",
+            f"ball az={math.degrees(self.marker_azimuth):+.1f}deg "
+            f"height={self.marker_height:+.2f}m | v/o: mode | r: reset | q: quit",
         )
         for row, text in enumerate(lines, start=1):
             cv2.putText(
@@ -439,14 +604,14 @@ class MujocoRedTargetHarness:
 
 def run_scenario(
     name: str,
-    marker_y: float,
-    marker_z: float,
+    marker_azimuth: float,
+    marker_height: float,
     *,
     maximum_seconds: float = 5.0,
 ) -> ScenarioResult:
     """Run one deterministic rendered-pixel vision scenario."""
     harness = MujocoRedTargetHarness()
-    harness.set_marker_offset(marker_y, marker_z)
+    harness.set_marker_orbit(marker_azimuth, marker_height)
     centered_at: float | None = None
     centered_ticks = 0
     final_error: tuple[float, float] | None = None
@@ -484,7 +649,8 @@ def run_scenario(
             ik_failures=harness.ik_failures,
             guard_hits=harness.guard_hits,
             profile_position_hits=harness.profile_position_hits,
-            maximum_target_radius=harness.maximum_target_radius,
+            maximum_direction_norm_error=harness.maximum_direction_norm_error,
+            maximum_abs_elevation=harness.maximum_abs_elevation,
             final_target=(reference.x, reference.y, reference.z),
             reasons=tuple(sorted(harness.reasons)),
         )
@@ -492,15 +658,103 @@ def run_scenario(
         harness.close()
 
 
-def run_interactive(target_radius: float = 0.2) -> None:
-    """Open the rendered eye camera and allow direct marker dragging."""
+def run_orbit_sweep(
+    end_degrees: float,
+    *,
+    step_degrees: float = 10.0,
+    maximum_step_seconds: float = 4.0,
+) -> OrbitSweepResult:
+    """Move the rendered marker incrementally and retain visual/body evidence."""
+    if not math.isfinite(end_degrees) or end_degrees == 0.0:
+        raise ValueError("end_degrees must be finite and non-zero")
+    if not math.isfinite(step_degrees) or step_degrees <= 0.0:
+        raise ValueError("step_degrees must be finite and positive")
+    if not math.isfinite(maximum_step_seconds) or maximum_step_seconds <= 0.0:
+        raise ValueError("maximum_step_seconds must be finite and positive")
+
+    harness = MujocoRedTargetHarness()
+    direction = math.copysign(1.0, end_degrees)
+    current_degrees = 0.0
+    reached_degrees = 0.0
+    steps: list[OrbitStepResult] = []
+    try:
+        while abs(current_degrees) < abs(end_degrees):
+            current_degrees = direction * min(
+                abs(end_degrees),
+                abs(current_degrees) + step_degrees,
+            )
+            harness.set_marker_orbit(math.radians(current_degrees), 0.0)
+            centered_at: float | None = None
+            centered_ticks = 0
+            marker_visible = True
+            for tick in range(round(maximum_step_seconds / CONTROL_DT)):
+                if tick % SENSOR_TICKS == 0:
+                    detection = harness.observe(CONTROL_DT * SENSOR_TICKS)
+                    if detection is None:
+                        marker_visible = False
+                        break
+                else:
+                    detection = harness.last_detection
+                record = harness.step()
+                if record["reason"] != "commanded":
+                    break
+                assert detection is not None
+                if (
+                    abs(detection.error_x) <= harness.reference.config.center_enter
+                    and abs(detection.error_y) <= harness.reference.config.center_enter
+                ):
+                    centered_ticks += 1
+                    if centered_at is None:
+                        centered_at = tick * CONTROL_DT
+                else:
+                    centered_ticks = 0
+                if centered_ticks * CONTROL_DT >= 0.5:
+                    break
+
+            centered_hold = centered_ticks * CONTROL_DT
+            body_yaw = float(harness.backend.get_present_head_joint_positions()[0])
+            steps.append(
+                OrbitStepResult(
+                    azimuth_degrees=current_degrees,
+                    marker_visible=marker_visible,
+                    centered_at_s=centered_at,
+                    held_center_s=centered_hold,
+                    body_yaw_degrees=math.degrees(body_yaw),
+                )
+            )
+            if not marker_visible or centered_at is None or centered_hold < 0.5:
+                break
+            reached_degrees = current_degrees
+
+        return OrbitSweepResult(
+            requested_end_degrees=end_degrees,
+            reached_degrees=reached_degrees,
+            steps=tuple(steps),
+            ik_failures=harness.ik_failures,
+            guard_hits=harness.guard_hits,
+            profile_position_hits=harness.profile_position_hits,
+            maximum_direction_norm_error=harness.maximum_direction_norm_error,
+            maximum_abs_elevation=harness.maximum_abs_elevation,
+            reasons=tuple(sorted(harness.reasons)),
+        )
+    finally:
+        harness.close()
+
+
+def run_interactive(
+    orbit_radius: float = DEFAULT_ORBIT_RADIUS,
+    vertical_range: float = DEFAULT_VERTICAL_RANGE,
+) -> None:
+    """Open the eye camera and direct robot-centered marker orbit control."""
     harness = MujocoRedTargetHarness(
         width=1280,
         height=720,
-        target_radius=target_radius,
+        orbit_radius=orbit_radius,
+        vertical_range=vertical_range,
     )
     window = "Reachy MuJoCo red-target tracking"
     studio_window = "Reachy MuJoCo third-person view"
+    orbit_window = "Reachy MuJoCo ball orbit"
     dragging = False
 
     def mouse(event: int, x: int, y: int, _flags: int, _param: object) -> None:
@@ -510,10 +764,11 @@ def run_interactive(target_radius: float = 0.2) -> None:
         elif event == cv2.EVENT_LBUTTONUP:
             dragging = False
         if dragging or event == cv2.EVENT_LBUTTONDOWN:
-            harness.move_marker_from_pixel(float(x), float(y))
+            harness.move_marker_from_orbit_pad(float(x), float(y), ORBIT_PAD_SIZE)
 
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(window, mouse)
+    cv2.namedWindow(orbit_window, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(orbit_window, mouse)
     sensor_tick = 0
     next_tick = time.monotonic()
     try:
@@ -524,6 +779,7 @@ def run_interactive(target_radius: float = 0.2) -> None:
             cv2.imshow(window, harness.annotated_frame())
             studio = cv2.cvtColor(harness.render_studio(), cv2.COLOR_RGB2BGR)
             cv2.imshow(studio_window, studio)
+            cv2.imshow(orbit_window, harness.orbit_pad_frame())
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
@@ -535,6 +791,20 @@ def run_interactive(target_radius: float = 0.2) -> None:
             elif key == ord("o"):
                 harness.mode = "oracle"
                 harness.reference.reset()
+            elif key == ord("w"):
+                harness.adjust_marker_height(0.02)
+            elif key == ord("s"):
+                harness.adjust_marker_height(-0.02)
+            elif key == ord("a"):
+                harness.set_marker_orbit(
+                    harness.marker_azimuth + math.radians(5.0),
+                    harness.marker_height,
+                )
+            elif key == ord("d"):
+                harness.set_marker_orbit(
+                    harness.marker_azimuth - math.radians(5.0),
+                    harness.marker_height,
+                )
             sensor_tick += 1
             next_tick += CONTROL_DT
             time.sleep(max(0.0, next_tick - time.monotonic()))
@@ -550,18 +820,44 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scenario", choices=tuple(SCENARIOS))
     parser.add_argument("--suite", action="store_true")
-    parser.add_argument("--radius", type=float, default=0.2)
+    parser.add_argument("--orbit-sweep", type=float)
+    parser.add_argument(
+        "--orbit-radius",
+        "--radius",
+        dest="orbit_radius",
+        type=float,
+        default=DEFAULT_ORBIT_RADIUS,
+    )
+    parser.add_argument(
+        "--vertical-range",
+        type=float,
+        default=DEFAULT_VERTICAL_RANGE,
+    )
     parser.add_argument("--artifact", type=Path)
     args = parser.parse_args()
-    if args.scenario is None and not args.suite:
-        run_interactive(target_radius=args.radius)
+    selected_runs = sum(
+        (
+            args.scenario is not None,
+            args.suite,
+            args.orbit_sweep is not None,
+        )
+    )
+    if selected_runs > 1:
+        parser.error("choose only one of --scenario, --suite, or --orbit-sweep")
+    if selected_runs == 0:
+        run_interactive(
+            orbit_radius=args.orbit_radius,
+            vertical_range=args.vertical_range,
+        )
         return
-    if args.suite:
+    if args.orbit_sweep is not None:
+        data: Any = asdict(run_orbit_sweep(args.orbit_sweep))
+    elif args.suite:
         results = [
-            run_scenario(name, marker_y, marker_z)
-            for name, (marker_y, marker_z) in SCENARIOS.items()
+            run_scenario(name, marker_azimuth, marker_height)
+            for name, (marker_azimuth, marker_height) in SCENARIOS.items()
         ]
-        data: Any = {"scenarios": [asdict(result) for result in results]}
+        data = {"scenarios": [asdict(result) for result in results]}
     else:
         assert args.scenario is not None
         data = asdict(run_scenario(args.scenario, *SCENARIOS[args.scenario]))

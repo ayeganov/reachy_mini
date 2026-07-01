@@ -82,12 +82,27 @@ class AnalyticalKinematics:
             # stay within the mechanical limits (max_body_yaw)
             # additionally it makes sure the the relative yaw between the body and the head
             # stays within the mechanical limits (max_relative_yaw)
+            max_relative_yaw = np.deg2rad(65)
+            max_body_yaw = np.deg2rad(160)
             reachy_joints = self.kin.inverse_kinematics_safe(
                 _pose,  # type: ignore[arg-type]
                 body_yaw=body_yaw,
-                max_relative_yaw=np.deg2rad(65),
-                max_body_yaw=np.deg2rad(160),
+                max_relative_yaw=max_relative_yaw,
+                max_body_yaw=max_body_yaw,
             )
+            if abs(float(reachy_joints[0]) - body_yaw) > np.pi:
+                continuous_body_yaw = self._continuous_body_yaw(
+                    target_pose=_pose,
+                    current_body_yaw=body_yaw,
+                    max_relative_yaw=max_relative_yaw,
+                    max_body_yaw=max_body_yaw,
+                )
+                if continuous_body_yaw is not None:
+                    stewart_joints = self.kin.inverse_kinematics(
+                        _pose,  # type: ignore[arg-type]
+                        continuous_body_yaw,
+                    )
+                    reachy_joints = [continuous_body_yaw] + stewart_joints
         else:
             # direct inverse kinematics solution with given body yaw
             # it does not modify the body yaw
@@ -95,6 +110,37 @@ class AnalyticalKinematics:
             reachy_joints = [body_yaw] + stewart_joints
 
         return np.array(reachy_joints)
+
+    @staticmethod
+    def _continuous_body_yaw(
+        target_pose: Annotated[NDArray[np.float64], (4, 4)],
+        current_body_yaw: float,
+        max_relative_yaw: float,
+        max_body_yaw: float,
+    ) -> float | None:
+        """Return the nearby rear-facing IK branch when mechanically reachable."""
+        target_yaw = float(np.arctan2(target_pose[1, 0], target_pose[0, 0]))
+        relative_yaw = float(
+            np.arctan2(
+                np.sin(target_yaw - current_body_yaw),
+                np.cos(target_yaw - current_body_yaw),
+            )
+        )
+        body_delta = relative_yaw - float(
+            np.clip(relative_yaw, -max_relative_yaw, max_relative_yaw)
+        )
+        body_yaw = float(
+            np.clip(current_body_yaw + body_delta, -max_body_yaw, max_body_yaw)
+        )
+        remaining_relative_yaw = float(
+            np.arctan2(
+                np.sin(target_yaw - body_yaw),
+                np.cos(target_yaw - body_yaw),
+            )
+        )
+        if abs(remaining_relative_yaw) > max_relative_yaw + 1e-9:
+            return None
+        return body_yaw
 
     def fk(
         self,

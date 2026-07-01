@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ from mujoco_red_target_tracking import (  # noqa: E402
     CONTROL_DT,
     SENSOR_TICKS,
     MujocoRedTargetHarness,
+    run_orbit_sweep,
     run_scenario,
 )
 
@@ -84,25 +86,25 @@ def test_harness_step_reads_only_latest_telemetry_record(
 
 
 @pytest.mark.parametrize(
-    ("name", "marker_y", "marker_z"),
+    ("name", "marker_azimuth", "marker_height"),
     [
         ("center", 0.0, 0.0),
-        ("left", 0.2, 0.0),
-        ("right", -0.2, 0.0),
+        ("left", math.atan2(0.2, 0.5), 0.0),
+        ("right", -math.atan2(0.2, 0.5), 0.0),
         ("top", 0.0, 0.2),
         ("bottom", 0.0, -0.2),
-        ("top_left", 0.1414, 0.1414),
-        ("top_right", -0.1414, 0.1414),
-        ("bottom_left", 0.1414, -0.1414),
-        ("bottom_right", -0.1414, -0.1414),
+        ("top_left", math.atan2(0.1414, 0.5), 0.1414),
+        ("top_right", -math.atan2(0.1414, 0.5), 0.1414),
+        ("bottom_left", math.atan2(0.1414, 0.5), -0.1414),
+        ("bottom_right", -math.atan2(0.1414, 0.5), -0.1414),
     ],
 )
 def test_rendered_marker_grid_centers_through_existing_look_at_path(
     name: str,
-    marker_y: float,
-    marker_z: float,
+    marker_azimuth: float,
+    marker_height: float,
 ) -> None:
-    result = run_scenario(name, marker_y, marker_z)
+    result = run_scenario(name, marker_azimuth, marker_height)
 
     assert result.centered_at_s is not None, result
     assert result.centered_at_s <= 2.5, result
@@ -111,12 +113,13 @@ def test_rendered_marker_grid_centers_through_existing_look_at_path(
     assert result.ik_failures == 0, result
     assert result.guard_hits == 0, result
     assert result.profile_position_hits == 0, result
-    assert result.maximum_target_radius <= 0.2 + 1e-12, result
+    assert result.maximum_direction_norm_error <= 1e-12, result
+    assert result.maximum_abs_elevation <= math.atan2(0.2, 0.5) + 1e-12, result
 
 
 def test_marker_loss_freezes_absolute_target_without_drift() -> None:
     harness = MujocoRedTargetHarness()
-    harness.set_marker_offset(-0.10, 0.0)
+    harness.set_marker_orbit(-0.2, 0.0)
     try:
         for tick in range(30):
             if tick % SENSOR_TICKS == 0:
@@ -141,11 +144,11 @@ def test_marker_loss_freezes_absolute_target_without_drift() -> None:
 def test_abrupt_horizontal_reversal_centers_without_reset_or_stuck_state() -> None:
     harness = MujocoRedTargetHarness()
     try:
-        harness.set_marker_offset(0.2, 0.0)
+        harness.set_marker_orbit(math.atan2(0.2, 0.5), 0.0)
         first_centered, first_hold = _drive_until_centered(harness)
         first_target = harness.reference.target
 
-        harness.set_marker_offset(-0.2, 0.0)
+        harness.set_marker_orbit(-math.atan2(0.2, 0.5), 0.0)
         second_centered, second_hold = _drive_until_centered(harness)
 
         assert first_centered is not None and first_centered <= 2.5
@@ -155,9 +158,76 @@ def test_abrupt_horizontal_reversal_centers_without_reset_or_stuck_state() -> No
         assert harness.reference.target.y < first_target.y
         assert harness.guard_hits == 0
         assert harness.profile_position_hits == 0
-        assert harness.maximum_target_radius <= 0.2 + 1e-12
+        assert harness.maximum_direction_norm_error <= 1e-12
     finally:
         harness.close()
+
+
+def test_marker_can_be_placed_at_every_azimuth_without_projection_error() -> None:
+    harness = MujocoRedTargetHarness()
+    try:
+        for azimuth in (
+            -2.0 * math.pi,
+            -math.pi,
+            -math.pi / 2.0,
+            0.0,
+            math.pi / 2.0,
+            math.pi,
+            2.0 * math.pi,
+        ):
+            harness.set_marker_orbit(azimuth, 0.1)
+            offset = harness.marker_position - harness.marker_orbit_center
+            assert math.hypot(float(offset[0]), float(offset[1])) == pytest.approx(
+                harness.marker_orbit_radius
+            )
+            assert float(offset[2]) == pytest.approx(0.1)
+            assert float(offset[0]) == pytest.approx(
+                harness.marker_orbit_radius * math.cos(azimuth)
+            )
+            assert float(offset[1]) == pytest.approx(
+                harness.marker_orbit_radius * math.sin(azimuth)
+            )
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    ("u", "v", "expected_azimuth"),
+    [
+        (640.0, 320.0, 0.0),
+        (320.0, 0.0, math.pi / 2.0),
+        (0.0, 320.0, math.pi),
+        (320.0, 640.0, -math.pi / 2.0),
+    ],
+)
+def test_orbit_pad_maps_directly_to_robot_frame_azimuth(
+    u: float,
+    v: float,
+    expected_azimuth: float,
+) -> None:
+    harness = MujocoRedTargetHarness()
+    try:
+        harness.move_marker_from_orbit_pad(u, v, 640)
+
+        assert harness.marker_azimuth == pytest.approx(expected_azimuth)
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("end_degrees", [200.0, -200.0])
+def test_slow_visual_orbit_engages_body_yaw_without_losing_marker(
+    end_degrees: float,
+) -> None:
+    result = run_orbit_sweep(end_degrees)
+
+    assert result.reached_degrees == end_degrees, result
+    assert all(step.marker_visible for step in result.steps), result
+    assert all(step.centered_at_s is not None for step in result.steps), result
+    assert all(step.held_center_s >= 0.5 for step in result.steps), result
+    assert abs(result.steps[-1].body_yaw_degrees) > 125.0, result
+    assert result.ik_failures == 0, result
+    assert result.guard_hits == 0, result
+    assert result.profile_position_hits == 0, result
 
 
 def test_oracle_and_vision_modes_both_submit_look_at_targets() -> None:
@@ -184,7 +254,7 @@ def test_oracle_compensates_camera_to_head_vertical_parallax() -> None:
 
         assert harness.marker_position[2] - oracle[2] == pytest.approx(0.0525)
         assert oracle[2] == pytest.approx(
-            harness.look_at_plane.center_z,
+            harness.look_at_sphere.origin_z,
             abs=1e-6,
         )
     finally:
