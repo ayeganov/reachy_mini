@@ -1271,11 +1271,14 @@ class VisualServoController:
             if self._look_at_reference_pose is None:
                 self._look_at_reference_pose = current_pose.copy()
             smoothed_look_at = self.look_at_filter.update(target)
+            ik_reference_pose = (
+                self._look_at_reference_pose if look_at is not None else current_pose
+            )
             target_result = self._ik_from_target_world_with_telemetry(
                 target_world=np.array(
                     [smoothed_look_at.x, smoothed_look_at.y, smoothed_look_at.z]
                 ),
-                current_head_pose=self._look_at_reference_pose,
+                current_head_pose=ik_reference_pose,
                 body_yaw=body_yaw,
             )
 

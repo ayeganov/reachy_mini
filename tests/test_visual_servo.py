@@ -1176,6 +1176,55 @@ def test_visual_servo_3d_look_at_keeps_fixed_reference_origin() -> None:
     )
 
 
+def test_visual_servo_detection_uses_current_pose_origin() -> None:
+    class FakeKinematics:
+        def __init__(self) -> None:
+            self.pose_origins: list[np.ndarray] = []
+
+        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
+            self.automatic_body_yaw = automatic_body_yaw
+
+        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+            self.pose_origins.append(pose[:3, 3].copy())
+            return np.zeros(7)
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+            self.pose_index = 0
+
+        def get_present_head_joint_positions(self) -> np.ndarray:
+            return np.zeros(7)
+
+        def get_present_head_pose(self) -> np.ndarray:
+            pose = np.eye(4)
+            if self.pose_index > 0:
+                pose[:3, 3] = np.array([0.05, -0.02, 0.03])
+            return pose
+
+        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+            self.pose_index += 1
+
+    backend = FakeBackend()
+    controller = VisualServoController(
+        backend=backend,  # type: ignore[arg-type]
+        config=VisualServoConfig(smoothing_alpha=1.0),
+    )
+    controller.submit(TrackingDetection(u=640.0, v=360.0, frame_id=0))
+    assert controller.step(dt=0.02)
+    controller.submit(TrackingDetection(u=640.0, v=360.0, frame_id=1))
+    assert controller.step(dt=0.02)
+
+    assert len(backend.head_kinematics.pose_origins) == 2
+    np.testing.assert_allclose(
+        backend.head_kinematics.pose_origins[1],
+        np.array([0.05, -0.02, 0.03]),
+        atol=1e-12,
+    )
+
+
 def test_visual_servo_restores_previous_automatic_body_yaw_on_stop() -> None:
     class FakeKinematics:
         def __init__(self) -> None:
