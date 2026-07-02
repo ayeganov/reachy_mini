@@ -91,6 +91,9 @@ class VisualServoConfigRequest(BaseModel):
     max_detection_age: FiniteFloat = Field(default=0.35, gt=0.0)
     smoothing_alpha: FiniteFloat = Field(default=0.35, gt=0.0, le=1.0)
     lookahead_distance: FiniteFloat = Field(default=0.5, gt=0.0)
+    image_error_max_correction: FiniteFloat = Field(
+        default=math.radians(8.0), gt=0.0, lt=math.pi / 2.0
+    )
     image_error_elevation_limit: FiniteFloat = Field(
         default=math.atan2(0.2, 0.5), gt=0.0, lt=math.pi / 2.0
     )

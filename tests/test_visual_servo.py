@@ -255,6 +255,7 @@ class _MotionTestBackend:
     def __init__(self, joints: np.ndarray | None = None) -> None:
         self.head_kinematics = _MotionTestKinematics(joints)
         self.current = np.zeros(7)
+        self.pose = np.eye(4)
         self.commands: list[np.ndarray] = []
         self.joint_reads = 0
         self.pose_reads = 0
@@ -266,7 +267,7 @@ class _MotionTestBackend:
 
     def get_present_head_pose(self) -> np.ndarray:
         self.pose_reads += 1
-        return np.eye(4)
+        return self.pose.copy()
 
     def set_target_head_joint_positions(self, command: np.ndarray) -> None:
         if self.fail_writes:
@@ -275,16 +276,20 @@ class _MotionTestBackend:
         self.commands.append(command.copy())
 
 
-def test_detection_target_has_absolute_elevation_limit_without_windup() -> None:
-    elevation_limit = 0.1
+def test_detection_target_is_stateless_and_clamps_absolute_elevation() -> None:
+    backend = _MotionTestBackend()
+    correction = 0.1
+    elevation_limit = 0.4
     controller = VisualServoController(
-        backend=_MotionTestBackend(),  # type: ignore[arg-type]
+        backend=backend,  # type: ignore[arg-type]
         config=VisualServoConfig(
             smoothing_alpha=1.0,
+            image_error_max_correction=correction,
             image_error_elevation_limit=elevation_limit,
         ),
     )
     started = time.time()
+    elevations = []
     for frame_id in range(20):
         controller.submit(
             TrackingDetection(
@@ -295,10 +300,12 @@ def test_detection_target_has_absolute_elevation_limit_without_windup() -> None:
             )
         )
         assert controller.step(dt=0.02)
+        target = controller.telemetry.query()["records"][-1]["smoothed_target"]
+        elevations.append(np.arctan2(target["z"], target["x"]))
 
-    saturated = controller.telemetry.query()["records"][-1]["smoothed_target"]
-    assert np.arctan2(saturated["z"], saturated["x"]) == pytest.approx(-elevation_limit)
+    assert elevations == pytest.approx([-correction] * 20)
 
+    backend.pose[:3, :3] = R.from_euler("y", 0.35).as_matrix()
     controller.submit(
         TrackingDetection(
             u=640.0,
@@ -308,8 +315,20 @@ def test_detection_target_has_absolute_elevation_limit_without_windup() -> None:
         )
     )
     assert controller.step(dt=0.02)
-    reversed_target = controller.telemetry.query()["records"][-1]["smoothed_target"]
-    assert np.arctan2(reversed_target["z"], reversed_target["x"]) > -elevation_limit
+    target = controller.telemetry.query()["records"][-1]["smoothed_target"]
+    assert np.arctan2(target["z"], target["x"]) == pytest.approx(-0.25)
+
+    controller.submit(
+        TrackingDetection(
+            u=640.0,
+            v=720.0,
+            timestamp=started + 0.42,
+            frame_id=21,
+        )
+    )
+    assert controller.step(dt=0.02)
+    target = controller.telemetry.query()["records"][-1]["smoothed_target"]
+    assert np.arctan2(target["z"], target["x"]) == pytest.approx(-elevation_limit)
 
 
 def test_visual_servo_records_profiled_look_at_command() -> None:

@@ -257,12 +257,19 @@ def test_tracking_start_validates_image_error_elevation_limit() -> None:
     with TestClient(app) as client:
         accepted = client.post(
             "/api/tracking/start",
-            json={"image_error_elevation_limit": 0.2},
+            json={
+                "image_error_max_correction": 0.1,
+                "image_error_elevation_limit": 0.2,
+            },
         )
         rejected = [
             client.post(
                 "/api/tracking/start",
-                json={"image_error_elevation_limit": value},
+                json={field: value},
+            )
+            for field in (
+                "image_error_max_correction",
+                "image_error_elevation_limit",
             )
             for value in (0.0, -0.1, np.pi / 2.0)
         ]
