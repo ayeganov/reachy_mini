@@ -240,7 +240,7 @@ def test_tracking_start_validates_look_at_profile_response_hz() -> None:
     assert all(response.status_code == 422 for response in rejected)
 
 
-def test_tracking_start_validates_image_error_correction() -> None:
+def test_tracking_start_validates_image_error_elevation_limit() -> None:
     class FakeKinematics:
         def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
             self.automatic_body_yaw = automatic_body_yaw
@@ -257,12 +257,12 @@ def test_tracking_start_validates_image_error_correction() -> None:
     with TestClient(app) as client:
         accepted = client.post(
             "/api/tracking/start",
-            json={"image_error_max_correction": 0.2},
+            json={"image_error_elevation_limit": 0.2},
         )
         rejected = [
             client.post(
                 "/api/tracking/start",
-                json={"image_error_max_correction": value},
+                json={"image_error_elevation_limit": value},
             )
             for value in (0.0, -0.1, np.pi / 2.0)
         ]

@@ -18,6 +18,11 @@ import numpy as np
 import numpy.typing as npt
 from scipy.spatial.transform import Rotation as R
 
+from .look_at_reference import (
+    ImageErrorReferenceConfig,
+    LookAtSphere,
+    SphericalLookAtReferenceController,
+)
 from .telemetry import VisualServoTelemetryBuffer, finite_json_value
 
 if TYPE_CHECKING:
@@ -85,7 +90,7 @@ class VisualServoConfig:
     max_detection_age: float = 0.35
     smoothing_alpha: float = 0.35
     lookahead_distance: float = 0.5
-    image_error_max_correction: float = np.deg2rad(8.0)
+    image_error_elevation_limit: float = np.arctan2(0.2, 0.5)
     joint_safety_margin: float = np.deg2rad(5.0)
     max_joint_velocity: float = np.deg2rad(80.0)
     max_joint_acceleration: float = np.deg2rad(300.0)
@@ -940,6 +945,8 @@ class VisualServoController:
         self._error: str | None = None
         self._look_at_reference_pose: npt.NDArray[np.float64] | None = None
         self._detection_reference_pose: npt.NDArray[np.float64] | None = None
+        self._detection_reference: SphericalLookAtReferenceController | None = None
+        self._last_detection_reference_time: float | None = None
         self._processed_detection: TrackingDetection | None = None
         self._detection_target_cache: TrackingLookAtTarget | None = None
         self._previous_automatic_body_yaw: bool | None = None
@@ -971,6 +978,8 @@ class VisualServoController:
         self._last_command_path = None
         self._look_at_reference_pose = None
         self._detection_reference_pose = None
+        self._detection_reference = None
+        self._last_detection_reference_time = None
         self._processed_detection = None
         self._detection_target_cache = None
         self._last_command_time = None
@@ -1002,6 +1011,8 @@ class VisualServoController:
         self._thread = None
         self._look_at_reference_pose = None
         self._detection_reference_pose = None
+        self._detection_reference = None
+        self._last_detection_reference_time = None
         self._processed_detection = None
         self._detection_target_cache = None
         self.look_at_filter.reset()
@@ -1265,16 +1276,24 @@ class VisualServoController:
                 self._processed_detection = None
                 self._detection_target_cache = None
                 self._detection_reference_pose = None
+                self._detection_reference = None
+                self._last_detection_reference_time = None
                 target = look_at
             else:
                 assert detection is not None
                 if self._detection_reference_pose is None:
                     self._detection_reference_pose = current_pose.copy()
-                target = self._look_at_target_from_detection(
-                    detection,
-                    current_pose,
-                    self._detection_reference_pose,
-                )
+                    self._detection_reference = SphericalLookAtReferenceController(
+                        sphere=LookAtSphere(
+                            distance=self.config.lookahead_distance,
+                            origin_x=float(current_pose[0, 3]),
+                            origin_y=float(current_pose[1, 3]),
+                            origin_z=float(current_pose[2, 3]),
+                            elevation_limit=self.config.image_error_elevation_limit,
+                        ),
+                        config=ImageErrorReferenceConfig(),
+                    )
+                target = self._look_at_target_from_detection(detection)
             if self._look_at_reference_pose is None:
                 self._look_at_reference_pose = current_pose.copy()
             smoothed_look_at = self.look_at_filter.update(target)
@@ -1402,41 +1421,35 @@ class VisualServoController:
     def _look_at_target_from_detection(
         self,
         detection: TrackingDetection,
-        current_head_pose: npt.NDArray[np.float64],
-        reference_head_pose: npt.NDArray[np.float64],
     ) -> TrackingLookAtTarget:
-        """Convert one distinct image error into one measured-gaze target."""
-        maximum = self.config.image_error_max_correction
-        if not np.isfinite(maximum) or not 0.0 < maximum < np.pi / 2.0:
-            raise ValueError("image_error_max_correction must be in (0, pi / 2)")
+        """Integrate one distinct image error into the absolute look direction."""
         if detection is self._processed_detection:
             assert self._detection_target_cache is not None
             return self._detection_target_cache
+        assert self._detection_reference is not None
         pixel = self.filter.update(detection)
         center = np.array(
             [float(detection.width) / 2.0, float(detection.height) / 2.0],
             dtype=np.float64,
         )
         error = (pixel - center) / center
-        if bool(np.all(np.abs(error) <= 0.03)):
-            error[:] = 0.0
-        correction = maximum * error
-        norm = float(np.linalg.norm(correction))
-        if norm > maximum:
-            correction *= maximum / norm
-        ray_camera = np.array(
-            [np.tan(correction[0]), np.tan(correction[1]), 1.0],
-            dtype=np.float64,
-        )
-        ray_camera /= np.linalg.norm(ray_camera)
-        world_from_camera = current_head_pose @ T_HEAD_CAM
-        target_world = reference_head_pose[:3, 3] + self.config.lookahead_distance * (
-            world_from_camera[:3, :3] @ ray_camera
-        )
+        previous_time = self._last_detection_reference_time
+        if previous_time is None:
+            update = self._detection_reference.update(
+                error[0], error[1], 1.0 / self.config.control_frequency
+            )
+        elif detection.timestamp <= previous_time:
+            update = self._detection_reference.freeze("non_monotonic_timestamp")
+        else:
+            update = self._detection_reference.update(
+                error[0], error[1], detection.timestamp - previous_time
+            )
+        if previous_time is None or detection.timestamp > previous_time:
+            self._last_detection_reference_time = detection.timestamp
         target = TrackingLookAtTarget(
-            x=float(target_world[0]),
-            y=float(target_world[1]),
-            z=float(target_world[2]),
+            x=update.target.x,
+            y=update.target.y,
+            z=update.target.z,
             timestamp=detection.timestamp,
             confidence=detection.confidence,
             frame_id=detection.frame_id,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import time
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -29,7 +28,6 @@ APPROVED_TRACKING_CONFIG = {
     "max_joint_jerk": 16.0,
     "look_at_profile_response_hz": 2.0,
 }
-DEFAULT_CORRECTION_DEGREES = 8.0
 STATE_PATH = "/state/full?with_head_pose=true&with_head_joints=true&with_body_yaw=true"
 
 
@@ -346,10 +344,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if not client.start(wait_timeout=args.timeout):
             raise RuntimeError("remote camera stream did not start")
         if args.follow:
-            tracking_config = {
-                **APPROVED_TRACKING_CONFIG,
-                "image_error_max_correction": math.radians(args.correction_degrees),
-            }
+            tracking_config = APPROVED_TRACKING_CONFIG
             _request_json(
                 "POST",
                 base_url,
@@ -479,7 +474,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "camera_host": camera_host,
         "detector_config": asdict(detector_config),
         "tracking_config": tracking_config if args.follow else None,
-        "correction_degrees": args.correction_degrees,
         "frame_count": frame_count,
         "detection_count": detection_count,
         "control_tick_count": control_tick_count,
@@ -519,11 +513,6 @@ def main() -> None:
     parser.add_argument("--follow", action="store_true")
     parser.add_argument("--duration", type=float, default=0.0)
     parser.add_argument("--timeout", type=float, default=5.0)
-    parser.add_argument(
-        "--correction-degrees",
-        type=float,
-        default=DEFAULT_CORRECTION_DEGREES,
-    )
     parser.add_argument("--output-prefix", type=Path)
     parser.add_argument(
         "--display",

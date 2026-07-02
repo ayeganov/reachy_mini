@@ -275,35 +275,41 @@ class _MotionTestBackend:
         self.commands.append(command.copy())
 
 
-def test_detection_target_is_bounded_from_current_gaze_and_cached() -> None:
-    correction = np.deg2rad(8.0)
+def test_detection_target_has_absolute_elevation_limit_without_windup() -> None:
+    elevation_limit = 0.1
     controller = VisualServoController(
         backend=_MotionTestBackend(),  # type: ignore[arg-type]
         config=VisualServoConfig(
             smoothing_alpha=1.0,
-            image_error_max_correction=correction,
+            image_error_elevation_limit=elevation_limit,
         ),
     )
-    detection = TrackingDetection(u=1280.0, v=360.0)
-    reference_pose = np.eye(4)
-    first = controller._look_at_target_from_detection(
-        detection, np.eye(4), reference_pose
-    )
-    turned_pose = np.eye(4)
-    turned_pose[:3, :3] = R.from_euler("z", 0.5).as_matrix()
+    started = time.time()
+    for frame_id in range(20):
+        controller.submit(
+            TrackingDetection(
+                u=640.0,
+                v=720.0,
+                timestamp=started + frame_id * 0.02,
+                frame_id=frame_id,
+            )
+        )
+        assert controller.step(dt=0.02)
 
-    repeated = controller._look_at_target_from_detection(
-        detection, turned_pose, reference_pose
-    )
-    latest = controller._look_at_target_from_detection(
-        TrackingDetection(u=1280.0, v=360.0),
-        turned_pose,
-        reference_pose,
-    )
+    saturated = controller.telemetry.query()["records"][-1]["smoothed_target"]
+    assert np.arctan2(saturated["z"], saturated["x"]) == pytest.approx(-elevation_limit)
 
-    assert repeated is first
-    assert np.arctan2(first.y, first.x) == pytest.approx(-correction)
-    assert np.arctan2(latest.y, latest.x) == pytest.approx(0.5 - correction)
+    controller.submit(
+        TrackingDetection(
+            u=640.0,
+            v=0.0,
+            timestamp=started + 0.4,
+            frame_id=20,
+        )
+    )
+    assert controller.step(dt=0.02)
+    reversed_target = controller.telemetry.query()["records"][-1]["smoothed_target"]
+    assert np.arctan2(reversed_target["z"], reversed_target["x"]) > -elevation_limit
 
 
 def test_visual_servo_records_profiled_look_at_command() -> None:
