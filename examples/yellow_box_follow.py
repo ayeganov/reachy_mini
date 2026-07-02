@@ -29,6 +29,7 @@ APPROVED_TRACKING_CONFIG = {
     "max_joint_jerk": 16.0,
     "look_at_profile_response_hz": 2.0,
     "image_error_max_correction": math.radians(8.0),
+    "image_error_elevation_limit": math.radians(15.0),
 }
 STATE_PATH = "/state/full?with_head_pose=true&with_head_joints=true&with_body_yaw=true"
 
