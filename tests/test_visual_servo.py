@@ -278,13 +278,14 @@ class _MotionTestBackend:
 
 def test_detection_target_is_stateless_and_clamps_absolute_elevation() -> None:
     backend = _MotionTestBackend()
-    correction = 0.1
+    vertical_fov = 0.2
     elevation_limit = 0.4
     controller = VisualServoController(
         backend=backend,  # type: ignore[arg-type]
         config=VisualServoConfig(
             smoothing_alpha=1.0,
-            image_error_max_correction=correction,
+            image_horizontal_fov=0.4,
+            image_vertical_fov=vertical_fov,
             image_error_elevation_limit=elevation_limit,
         ),
     )
@@ -303,15 +304,27 @@ def test_detection_target_is_stateless_and_clamps_absolute_elevation() -> None:
         target = controller.telemetry.query()["records"][-1]["smoothed_target"]
         elevations.append(np.arctan2(target["z"], target["x"]))
 
-    assert elevations == pytest.approx([-correction] * 20)
+    assert elevations == pytest.approx([-vertical_fov / 2.0] * 20)
+
+    controller.submit(
+        TrackingDetection(
+            u=1280.0,
+            v=360.0,
+            timestamp=started + 0.4,
+            frame_id=20,
+        )
+    )
+    assert controller.step(dt=0.02)
+    target = controller.telemetry.query()["records"][-1]["smoothed_target"]
+    assert np.arctan2(target["y"], target["x"]) == pytest.approx(-0.2)
 
     backend.pose[:3, :3] = R.from_euler("y", 0.35).as_matrix()
     controller.submit(
         TrackingDetection(
             u=640.0,
             v=0.0,
-            timestamp=started + 0.4,
-            frame_id=20,
+            timestamp=started + 0.42,
+            frame_id=21,
         )
     )
     assert controller.step(dt=0.02)
@@ -322,8 +335,8 @@ def test_detection_target_is_stateless_and_clamps_absolute_elevation() -> None:
         TrackingDetection(
             u=640.0,
             v=720.0,
-            timestamp=started + 0.42,
-            frame_id=21,
+            timestamp=started + 0.44,
+            frame_id=22,
         )
     )
     assert controller.step(dt=0.02)

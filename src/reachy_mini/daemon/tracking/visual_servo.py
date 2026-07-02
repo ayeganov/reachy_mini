@@ -85,7 +85,8 @@ class VisualServoConfig:
     max_detection_age: float = 0.35
     smoothing_alpha: float = 0.35
     lookahead_distance: float = 0.5
-    image_error_max_correction: float = np.deg2rad(8.0)
+    image_horizontal_fov: float = np.deg2rad(98.88965079926311)
+    image_vertical_fov: float = np.deg2rad(66.67916209122708)
     image_error_elevation_limit: float = np.arctan2(0.2, 0.5)
     joint_safety_margin: float = np.deg2rad(5.0)
     max_joint_velocity: float = np.deg2rad(80.0)
@@ -1418,12 +1419,12 @@ class VisualServoController:
         error = (pixel - center) / center
         if bool(np.all(np.abs(error) <= 0.03)):
             error[:] = 0.0
-        correction = self.config.image_error_max_correction * error
-        correction_norm = float(np.linalg.norm(correction))
-        if correction_norm > self.config.image_error_max_correction:
-            correction *= self.config.image_error_max_correction / correction_norm
         ray_camera = np.array(
-            [np.tan(correction[0]), np.tan(correction[1]), 1.0],
+            [
+                error[0] * np.tan(self.config.image_horizontal_fov / 2.0),
+                error[1] * np.tan(self.config.image_vertical_fov / 2.0),
+                1.0,
+            ],
             dtype=np.float64,
         )
         ray_world = (current_head_pose @ T_HEAD_CAM)[:3, :3] @ ray_camera

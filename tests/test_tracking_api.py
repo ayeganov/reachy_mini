@@ -258,7 +258,8 @@ def test_tracking_start_validates_image_error_elevation_limit() -> None:
         accepted = client.post(
             "/api/tracking/start",
             json={
-                "image_error_max_correction": 0.1,
+                "image_horizontal_fov": 1.5,
+                "image_vertical_fov": 1.0,
                 "image_error_elevation_limit": 0.2,
             },
         )
@@ -268,10 +269,11 @@ def test_tracking_start_validates_image_error_elevation_limit() -> None:
                 json={field: value},
             )
             for field in (
-                "image_error_max_correction",
+                "image_horizontal_fov",
+                "image_vertical_fov",
                 "image_error_elevation_limit",
             )
-            for value in (0.0, -0.1, np.pi / 2.0)
+            for value in (0.0, -0.1, np.pi)
         ]
 
     if app.state.visual_servo is not None:
