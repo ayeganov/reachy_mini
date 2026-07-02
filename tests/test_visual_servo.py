@@ -285,14 +285,20 @@ def test_detection_target_is_bounded_from_current_gaze_and_cached() -> None:
         ),
     )
     detection = TrackingDetection(u=1280.0, v=360.0)
-    first = controller._look_at_target_from_detection(detection, np.eye(4))
+    reference_pose = np.eye(4)
+    first = controller._look_at_target_from_detection(
+        detection, np.eye(4), reference_pose
+    )
     turned_pose = np.eye(4)
     turned_pose[:3, :3] = R.from_euler("z", 0.5).as_matrix()
 
-    repeated = controller._look_at_target_from_detection(detection, turned_pose)
+    repeated = controller._look_at_target_from_detection(
+        detection, turned_pose, reference_pose
+    )
     latest = controller._look_at_target_from_detection(
         TrackingDetection(u=1280.0, v=360.0),
         turned_pose,
+        reference_pose,
     )
 
     assert repeated is first
@@ -1176,16 +1182,16 @@ def test_visual_servo_3d_look_at_keeps_fixed_reference_origin() -> None:
     )
 
 
-def test_visual_servo_detection_uses_current_pose_origin() -> None:
+def test_visual_servo_detection_keeps_fixed_reference_across_target_gap() -> None:
     class FakeKinematics:
         def __init__(self) -> None:
-            self.pose_origins: list[np.ndarray] = []
+            self.poses: list[np.ndarray] = []
 
         def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
             self.automatic_body_yaw = automatic_body_yaw
 
         def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            self.pose_origins.append(pose[:3, 3].copy())
+            self.poses.append(pose.copy())
             return np.zeros(7)
 
     class FakeBackend:
@@ -1210,17 +1216,24 @@ def test_visual_servo_detection_uses_current_pose_origin() -> None:
     backend = FakeBackend()
     controller = VisualServoController(
         backend=backend,  # type: ignore[arg-type]
-        config=VisualServoConfig(smoothing_alpha=1.0),
+        config=VisualServoConfig(smoothing_alpha=1.0, max_detection_age=0.01),
     )
     controller.submit(TrackingDetection(u=640.0, v=360.0, frame_id=0))
     assert controller.step(dt=0.02)
+    controller.submit(TrackingDetection(u=640.0, v=360.0, frame_id=1, timestamp=0.0))
+    assert not controller.step(dt=0.02)
     controller.submit(TrackingDetection(u=640.0, v=360.0, frame_id=1))
     assert controller.step(dt=0.02)
 
-    assert len(backend.head_kinematics.pose_origins) == 2
+    assert len(backend.head_kinematics.poses) == 2
     np.testing.assert_allclose(
-        backend.head_kinematics.pose_origins[1],
-        np.array([0.05, -0.02, 0.03]),
+        backend.head_kinematics.poses[1][:3, 3],
+        backend.head_kinematics.poses[0][:3, 3],
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        backend.head_kinematics.poses[1][:3, 0],
+        np.array([1.0, 0.0, 0.0]),
         atol=1e-12,
     )
 

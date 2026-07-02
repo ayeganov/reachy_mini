@@ -939,6 +939,7 @@ class VisualServoController:
         self._command_count = 0
         self._error: str | None = None
         self._look_at_reference_pose: npt.NDArray[np.float64] | None = None
+        self._detection_reference_pose: npt.NDArray[np.float64] | None = None
         self._processed_detection: TrackingDetection | None = None
         self._detection_target_cache: TrackingLookAtTarget | None = None
         self._previous_automatic_body_yaw: bool | None = None
@@ -969,6 +970,7 @@ class VisualServoController:
         self.limiter.reset()
         self._last_command_path = None
         self._look_at_reference_pose = None
+        self._detection_reference_pose = None
         self._processed_detection = None
         self._detection_target_cache = None
         self._last_command_time = None
@@ -999,6 +1001,7 @@ class VisualServoController:
                 return
         self._thread = None
         self._look_at_reference_pose = None
+        self._detection_reference_pose = None
         self._processed_detection = None
         self._detection_target_cache = None
         self.look_at_filter.reset()
@@ -1261,19 +1264,26 @@ class VisualServoController:
             if look_at is not None:
                 self._processed_detection = None
                 self._detection_target_cache = None
+                self._detection_reference_pose = None
                 target = look_at
             else:
                 assert detection is not None
+                if self._detection_reference_pose is None:
+                    self._detection_reference_pose = current_pose.copy()
                 target = self._look_at_target_from_detection(
                     detection,
                     current_pose,
+                    self._detection_reference_pose,
                 )
             if self._look_at_reference_pose is None:
                 self._look_at_reference_pose = current_pose.copy()
             smoothed_look_at = self.look_at_filter.update(target)
             ik_reference_pose = (
-                self._look_at_reference_pose if look_at is not None else current_pose
+                self._look_at_reference_pose
+                if look_at is not None
+                else self._detection_reference_pose
             )
+            assert ik_reference_pose is not None
             target_result = self._ik_from_target_world_with_telemetry(
                 target_world=np.array(
                     [smoothed_look_at.x, smoothed_look_at.y, smoothed_look_at.z]
@@ -1393,6 +1403,7 @@ class VisualServoController:
         self,
         detection: TrackingDetection,
         current_head_pose: npt.NDArray[np.float64],
+        reference_head_pose: npt.NDArray[np.float64],
     ) -> TrackingLookAtTarget:
         """Convert one distinct image error into one measured-gaze target."""
         maximum = self.config.image_error_max_correction
@@ -1419,7 +1430,7 @@ class VisualServoController:
         )
         ray_camera /= np.linalg.norm(ray_camera)
         world_from_camera = current_head_pose @ T_HEAD_CAM
-        target_world = current_head_pose[:3, 3] + self.config.lookahead_distance * (
+        target_world = reference_head_pose[:3, 3] + self.config.lookahead_distance * (
             world_from_camera[:3, :3] @ ray_camera
         )
         target = TrackingLookAtTarget(
