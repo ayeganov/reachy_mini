@@ -240,6 +240,39 @@ def test_tracking_start_validates_look_at_profile_response_hz() -> None:
     assert all(response.status_code == 422 for response in rejected)
 
 
+def test_tracking_start_validates_image_error_correction() -> None:
+    class FakeKinematics:
+        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
+            self.automatic_body_yaw = automatic_body_yaw
+
+    class FakeBackend:
+        is_move_running = False
+
+        def __init__(self) -> None:
+            self.head_kinematics = FakeKinematics()
+
+    app = create_app(Args(autostart=False))
+    app.dependency_overrides[get_backend] = lambda: FakeBackend()
+
+    with TestClient(app) as client:
+        accepted = client.post(
+            "/api/tracking/start",
+            json={"image_error_max_correction": 0.2},
+        )
+        rejected = [
+            client.post(
+                "/api/tracking/start",
+                json={"image_error_max_correction": value},
+            )
+            for value in (0.0, -0.1, np.pi / 2.0)
+        ]
+
+    if app.state.visual_servo is not None:
+        app.state.visual_servo.stop()
+    assert accepted.status_code == 200
+    assert all(response.status_code == 422 for response in rejected)
+
+
 def test_wireless_startup_starts_visual_tracking() -> None:
     class FakeKinematics:
         def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:

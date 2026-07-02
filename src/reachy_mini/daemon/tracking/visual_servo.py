@@ -85,6 +85,7 @@ class VisualServoConfig:
     max_detection_age: float = 0.35
     smoothing_alpha: float = 0.35
     lookahead_distance: float = 0.5
+    image_error_max_correction: float = np.deg2rad(8.0)
     joint_safety_margin: float = np.deg2rad(5.0)
     max_joint_velocity: float = np.deg2rad(80.0)
     max_joint_acceleration: float = np.deg2rad(300.0)
@@ -938,6 +939,8 @@ class VisualServoController:
         self._command_count = 0
         self._error: str | None = None
         self._look_at_reference_pose: npt.NDArray[np.float64] | None = None
+        self._processed_detection: TrackingDetection | None = None
+        self._detection_target_cache: TrackingLookAtTarget | None = None
         self._previous_automatic_body_yaw: bool | None = None
         self._last_command_time: float | None = None
 
@@ -966,6 +969,8 @@ class VisualServoController:
         self.limiter.reset()
         self._last_command_path = None
         self._look_at_reference_pose = None
+        self._processed_detection = None
+        self._detection_target_cache = None
         self._last_command_time = None
         if self.config.automatic_body_yaw and hasattr(
             self.backend.head_kinematics, "set_automatic_body_yaw"
@@ -994,6 +999,8 @@ class VisualServoController:
                 return
         self._thread = None
         self._look_at_reference_pose = None
+        self._processed_detection = None
+        self._detection_target_cache = None
         self.look_at_filter.reset()
         self.look_at_profile.reset()
         self.look_at_guard.reset()
@@ -1183,27 +1190,19 @@ class VisualServoController:
             return False
 
         look_at = self.look_at_buffer.fresh(self.config)
-        detection = None
-        if look_at is None:
-            self._look_at_reference_pose = None
-            self.look_at_filter.reset()
-            self.look_at_profile.reset()
-            self.look_at_guard.reset()
-            detection = self.buffer.fresh(self.config)
-            if detection is None:
-                if self._last_command_path == "look_at":
-                    self._last_command_path = None
-                    self._last_command_time = None
-                self._last_reason = "no_fresh_detection"
-                self._append_telemetry(
-                    self._new_telemetry_record(
-                        dt=dt,
-                        target_type="none",
-                        reason="no_fresh_detection",
-                        start_monotonic=start_monotonic,
-                    )
+        detection = None if look_at is not None else self.buffer.fresh(self.config)
+        if look_at is None and detection is None:
+            self._reset_motion_state()
+            self._last_reason = "no_fresh_detection"
+            self._append_telemetry(
+                self._new_telemetry_record(
+                    dt=dt,
+                    target_type="none",
+                    reason="no_fresh_detection",
+                    start_monotonic=start_monotonic,
                 )
-                return False
+            )
+            return False
 
         target_type = "none"
         input_target: dict[str, Any] | None = None
@@ -1239,10 +1238,7 @@ class VisualServoController:
                     name="current",
                 )
             except ValueError:
-                self.look_at_profile.reset()
-                self.look_at_guard.reset()
-                self.limiter.reset()
-                self._last_command_time = None
+                self._reset_motion_state()
                 raise
             current_pose = np.array(
                 self.backend.get_present_head_pose(), dtype=np.float64
@@ -1258,37 +1254,32 @@ class VisualServoController:
                 input_target=input_target,
                 start_monotonic=start_monotonic,
             )
-            pixel: npt.NDArray[np.float64] | None = None
-            smoothed_look_at: TrackingLookAtTarget | None = None
             body_yaw = float(current_joints[0])
+            if self._last_command_path != target_type:
+                self.look_at_filter.reset()
+                self._look_at_reference_pose = current_pose.copy()
             if look_at is not None:
-                if self._look_at_reference_pose is None:
-                    self._look_at_reference_pose = current_pose.copy()
-                smoothed_look_at = self.look_at_filter.update(look_at)
-                target_result = self._ik_from_target_world_with_telemetry(
-                    target_world=np.array(
-                        [smoothed_look_at.x, smoothed_look_at.y, smoothed_look_at.z]
-                    ),
-                    current_head_pose=self._look_at_reference_pose,
-                    body_yaw=body_yaw,
-                )
+                self._processed_detection = None
+                self._detection_target_cache = None
+                target = look_at
             else:
                 assert detection is not None
-                pixel = self.filter.update(detection)
-                target_result = self._reachable_joints_from_pixel_with_telemetry(
-                    pixel=pixel,
-                    detection=detection,
-                    current_head_pose=current_pose,
-                    body_yaw=body_yaw,
+                target = self._look_at_target_from_detection(
+                    detection,
+                    current_pose,
                 )
-
-            record["smoothed_target"] = (
-                finite_json_value(pixel)
-                if detection is not None
-                else self._look_at_target(smoothed_look_at)
-                if smoothed_look_at is not None
-                else None
+            if self._look_at_reference_pose is None:
+                self._look_at_reference_pose = current_pose.copy()
+            smoothed_look_at = self.look_at_filter.update(target)
+            target_result = self._ik_from_target_world_with_telemetry(
+                target_world=np.array(
+                    [smoothed_look_at.x, smoothed_look_at.y, smoothed_look_at.z]
+                ),
+                current_head_pose=self._look_at_reference_pose,
+                body_yaw=body_yaw,
             )
+
+            record["smoothed_target"] = self._look_at_target(smoothed_look_at)
             record["current_joints"] = finite_json_value(current_joints)
             record["current_pose"] = finite_json_value(current_pose)
             record["ik_target"] = finite_json_value(target_result.ik_target)
@@ -1305,10 +1296,7 @@ class VisualServoController:
                 else max(0.0, time.time() - target_timestamp)
             )
             if target_result.joints is None:
-                if look_at is not None:
-                    self.look_at_profile.reset()
-                    self.look_at_guard.reset()
-                    self._last_command_time = None
+                self._reset_motion_state()
                 record["reason"] = "ik_failed"
                 self._last_reason = "ik_failed"
                 record["latency"]["processing_duration"] = (
@@ -1335,59 +1323,39 @@ class VisualServoController:
                 return False
             record["dt"] = command_dt
             record["monotonic_timestamp"] = command_time
-            if look_at is not None:
-                desired_joints, profile_hits = (
-                    self.look_at_profile.update_with_telemetry(
-                        desired=desired_joints,
-                        current=current_joints,
-                        dt=command_dt,
-                    )
+            desired_joints, profile_hits = self.look_at_profile.update_with_telemetry(
+                desired=desired_joints,
+                current=current_joints,
+                dt=command_dt,
+            )
+            record["profiled_command"] = finite_json_value(desired_joints)
+            record["profile_limit_hits"] = profile_hits
+            guard_hits, guard_velocity, guard_acceleration = self.look_at_guard.check(
+                command=desired_joints,
+                current=current_joints,
+                dt=command_dt,
+            )
+            record["limit_hits"] = guard_hits
+            if guard_hits:
+                self._reset_motion_state()
+                record["reason"] = "safety_rejected"
+                record["latency"]["processing_duration"] = (
+                    time.monotonic() - start_monotonic
                 )
-                record["profiled_command"] = finite_json_value(desired_joints)
-                record["profile_limit_hits"] = profile_hits
-                guard_hits, guard_velocity, guard_acceleration = (
-                    self.look_at_guard.check(
-                        command=desired_joints,
-                        current=current_joints,
-                        dt=command_dt,
-                    )
-                )
-                record["limit_hits"] = guard_hits
-                if guard_hits:
-                    self.look_at_profile.reset()
-                    self.look_at_guard.reset()
-                    self._last_command_time = None
-                    record["reason"] = "safety_rejected"
-                    record["latency"]["processing_duration"] = (
-                        time.monotonic() - start_monotonic
-                    )
-                    self._last_reason = "safety_rejected"
-                    self._append_telemetry(record)
-                    return False
-                command = desired_joints
-            else:
-                if self._last_command_path != "detection":
-                    self.limiter.reset()
-                command, limit_telemetry = self.limiter.limit_with_telemetry(
-                    desired=desired_joints,
-                    current=current_joints,
-                    dt=command_dt,
-                )
-                record["limit_hits"] = limit_telemetry["limit_hits"]
+                self._last_reason = "safety_rejected"
+                self._append_telemetry(record)
+                return False
+            command = desired_joints
             try:
                 self.backend.set_target_head_joint_positions(command)
             except Exception:
-                self.look_at_profile.reset()
-                self.look_at_guard.reset()
-                self.limiter.reset()
-                self._last_command_time = None
+                self._reset_motion_state()
                 raise
-            if look_at is not None:
-                self.look_at_guard.commit(
-                    command,
-                    guard_velocity,
-                    guard_acceleration,
-                )
+            self.look_at_guard.commit(
+                command,
+                guard_velocity,
+                guard_acceleration,
+            )
             self._last_command_path = target_type
             self._last_command_time = command_time
             self._last_command = command.copy()
@@ -1413,8 +1381,55 @@ class VisualServoController:
         self.look_at_guard.reset()
         self.limiter.reset()
         self._look_at_reference_pose = None
+        self._processed_detection = None
+        self._detection_target_cache = None
         self._last_command_path = None
         self._last_command_time = None
+
+    def _look_at_target_from_detection(
+        self,
+        detection: TrackingDetection,
+        current_head_pose: npt.NDArray[np.float64],
+    ) -> TrackingLookAtTarget:
+        """Convert one distinct image error into one measured-gaze target."""
+        maximum = self.config.image_error_max_correction
+        if not np.isfinite(maximum) or not 0.0 < maximum < np.pi / 2.0:
+            raise ValueError("image_error_max_correction must be in (0, pi / 2)")
+        if detection is self._processed_detection:
+            assert self._detection_target_cache is not None
+            return self._detection_target_cache
+        pixel = self.filter.update(detection)
+        center = np.array(
+            [float(detection.width) / 2.0, float(detection.height) / 2.0],
+            dtype=np.float64,
+        )
+        error = (pixel - center) / center
+        if bool(np.all(np.abs(error) <= 0.03)):
+            error[:] = 0.0
+        correction = maximum * error
+        norm = float(np.linalg.norm(correction))
+        if norm > maximum:
+            correction *= maximum / norm
+        ray_camera = np.array(
+            [np.tan(correction[0]), np.tan(correction[1]), 1.0],
+            dtype=np.float64,
+        )
+        ray_camera /= np.linalg.norm(ray_camera)
+        world_from_camera = current_head_pose @ T_HEAD_CAM
+        target_world = current_head_pose[:3, 3] + self.config.lookahead_distance * (
+            world_from_camera[:3, :3] @ ray_camera
+        )
+        target = TrackingLookAtTarget(
+            x=float(target_world[0]),
+            y=float(target_world[1]),
+            z=float(target_world[2]),
+            timestamp=detection.timestamp,
+            confidence=detection.confidence,
+            frame_id=detection.frame_id,
+        )
+        self._processed_detection = detection
+        self._detection_target_cache = target
+        return target
 
     def _try_acquire_motion_guard(self) -> Callable[[], None] | None:
         """Acquire backend motion ownership for one servo step."""

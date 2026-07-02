@@ -14,15 +14,14 @@ from typing import Any, Mapping
 import cv2
 import numpy as np
 import numpy.typing as npt
+from websockets.sync.client import ClientConnection, connect
 
-from reachy_mini.daemon.tracking.look_at_reference import LookAtReference
 from reachy_mini.daemon.tracking.telemetry import dump_jsonl
 from reachy_mini.media.receivers.zeromq_client import ZeroMQClient
-from reachy_mini.utils import create_head_pose
 
 DEFAULT_BASE_URL = "http://reachy-mini.local:8017/api"
 APPROVED_TRACKING_CONFIG = {
-    "max_detection_age": 2.0,
+    "max_detection_age": 0.35,
     "smoothing_alpha": 1.0,
     "joint_safety_margin": 0.1745329252,
     "max_joint_velocity": 0.60,
@@ -30,10 +29,7 @@ APPROVED_TRACKING_CONFIG = {
     "max_joint_jerk": 16.0,
     "look_at_profile_response_hz": 2.0,
 }
-CONTROL_PERIOD = 0.04
-LOOK_AT_DISTANCE = 0.5
-CENTER_DEADBAND = 0.03
-DEFAULT_CORRECTION_DEGREES = 2.75
+DEFAULT_CORRECTION_DEGREES = 8.0
 STATE_PATH = "/state/full?with_head_pose=true&with_head_joints=true&with_body_yaw=true"
 
 
@@ -80,56 +76,6 @@ class YellowBoxDetection:
             (self.u - width / 2.0) / (width / 2.0),
             (self.v - height / 2.0) / (height / 2.0),
         )
-
-
-def target_from_current_gaze(
-    detection: YellowBoxDetection,
-    *,
-    width: int,
-    height: int,
-    state: Mapping[str, Any],
-    origin: tuple[float, float, float],
-    correction_radians: float,
-) -> LookAtReference:
-    """Apply one bounded image-error correction to measured current gaze."""
-    if not math.isfinite(correction_radians) or correction_radians <= 0.0:
-        raise ValueError("correction_radians must be finite and positive")
-    pose = state.get("head_pose")
-    if not isinstance(pose, Mapping):
-        raise ValueError("robot state does not include head_pose")
-    matrix = create_head_pose(
-        x=float(pose["x"]),
-        y=float(pose["y"]),
-        z=float(pose["z"]),
-        roll=float(pose["roll"]),
-        pitch=float(pose["pitch"]),
-        yaw=float(pose["yaw"]),
-        degrees=False,
-    )
-    forward = matrix[:3, 0]
-    azimuth = math.atan2(float(forward[1]), float(forward[0]))
-    elevation = math.atan2(
-        float(forward[2]),
-        math.hypot(float(forward[0]), float(forward[1])),
-    )
-    error_x, error_y = detection.normalized_error(width, height)
-    if abs(error_x) <= CENTER_DEADBAND and abs(error_y) <= CENTER_DEADBAND:
-        error_x = error_y = 0.0
-    delta_azimuth = -correction_radians * error_x
-    delta_elevation = -correction_radians * error_y
-    correction = math.hypot(delta_azimuth, delta_elevation)
-    if correction > correction_radians:
-        scale = correction_radians / correction
-        delta_azimuth *= scale
-        delta_elevation *= scale
-    azimuth += delta_azimuth
-    elevation += delta_elevation
-    cos_elevation = math.cos(elevation)
-    return LookAtReference(
-        x=origin[0] + LOOK_AT_DISTANCE * cos_elevation * math.cos(azimuth),
-        y=origin[1] + LOOK_AT_DISTANCE * cos_elevation * math.sin(azimuth),
-        z=origin[2] + LOOK_AT_DISTANCE * math.sin(elevation),
-    )
 
 
 def detect_yellow_box(
@@ -313,11 +259,18 @@ def _return_neutral(base_url: str, timeout: float) -> None:
     time.sleep(2.5)
 
 
-def _target_payload(target: LookAtReference, frame_id: int) -> dict[str, Any]:
+def _detection_payload(
+    detection: YellowBoxDetection,
+    *,
+    width: int,
+    height: int,
+    frame_id: int,
+) -> dict[str, Any]:
     return {
-        "x": target.x,
-        "y": target.y,
-        "z": target.z,
+        "u": detection.u,
+        "v": detection.v,
+        "width": width,
+        "height": height,
         "confidence": 1.0,
         "frame_id": frame_id,
     }
@@ -364,9 +317,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         morphology_size=args.morphology_size,
     )
 
-    origin = _neutral_origin(state_before) if args.follow else None
+    if args.follow:
+        _neutral_origin(state_before)
 
     client = ZeroMQClient(host=camera_host, log_level="WARNING")
+    detection_stream: ClientConnection | None = None
     tracking_started = False
     telemetry: dict[str, Any] = {}
     frame_count = 0
@@ -378,12 +333,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     last_annotated: npt.NDArray[np.uint8] | None = None
     last_mask: npt.NDArray[np.uint8] | None = None
     last_frame_timestamp: object = None
-    last_control_frame_timestamp: object = None
     submitted_targets = 0
     request_latencies: list[float] = []
     reason = "preview" if not args.follow else "target_lost"
     started_at = time.monotonic()
-    next_control_tick = started_at
     stopped_by = "duration"
     run_error: Exception | None = None
     output_prefix = args.output_prefix or Path(
@@ -393,18 +346,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if not client.start(wait_timeout=args.timeout):
             raise RuntimeError("remote camera stream did not start")
         if args.follow:
+            tracking_config = {
+                **APPROVED_TRACKING_CONFIG,
+                "image_error_max_correction": math.radians(args.correction_degrees),
+            }
             _request_json(
                 "POST",
                 base_url,
                 "/tracking/start",
-                APPROVED_TRACKING_CONFIG,
+                tracking_config,
                 timeout=args.timeout,
             )
             tracking_started = True
+            websocket_url = base_url.replace("http://", "ws://", 1).replace(
+                "https://", "wss://", 1
+            )
+            detection_stream = connect(
+                f"{websocket_url}/tracking/ws/detections",
+                open_timeout=args.timeout,
+                close_timeout=args.timeout,
+            )
 
         while args.duration <= 0.0 or time.monotonic() - started_at < args.duration:
             packet = client.get_frame_with_metadata()
-            now = time.monotonic()
             new_frame = False
             if packet is not None:
                 frame, metadata = packet
@@ -424,48 +388,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             maximum_area_ratio,
                             last_detection.area_ratio,
                         )
-
-            if args.follow and now >= next_control_tick:
-                fresh_detection = (
-                    last_detection
-                    if last_frame_timestamp != last_control_frame_timestamp
-                    else None
-                )
-                if fresh_detection is None:
-                    reason = "target_lost"
-                else:
-                    request_started = time.monotonic()
-                    assert last_frame is not None
-                    state = _request_json(
-                        "GET",
-                        base_url,
-                        STATE_PATH,
-                        timeout=min(args.timeout, 1.5),
-                    )
-                    assert origin is not None
-                    target = target_from_current_gaze(
-                        fresh_detection,
-                        width=last_frame.shape[1],
-                        height=last_frame.shape[0],
-                        state=state,
-                        origin=origin,
-                        correction_radians=math.radians(args.correction_degrees),
-                    )
-                    _request_json(
-                        "POST",
-                        base_url,
-                        "/tracking/look_at",
-                        _target_payload(target, submitted_targets),
-                        timeout=min(args.timeout, 1.5),
-                    )
-                    request_latencies.append(time.monotonic() - request_started)
-                    submitted_targets += 1
-                    reason = "commanded"
-                last_control_frame_timestamp = last_frame_timestamp
-                control_tick_count += 1
-                next_control_tick += CONTROL_PERIOD
-                if next_control_tick <= now:
-                    next_control_tick = now + CONTROL_PERIOD
+                    if args.follow:
+                        control_tick_count += 1
+                        if last_detection is None:
+                            reason = "target_lost"
+                        else:
+                            assert detection_stream is not None
+                            request_started = time.monotonic()
+                            detection_stream.send(
+                                json.dumps(
+                                    _detection_payload(
+                                        last_detection,
+                                        width=last_frame.shape[1],
+                                        height=last_frame.shape[0],
+                                        frame_id=submitted_targets,
+                                    )
+                                )
+                            )
+                            response = json.loads(
+                                detection_stream.recv(timeout=args.timeout)
+                            )
+                            if response.get("status") != "accepted":
+                                raise RuntimeError(
+                                    f"detection stream rejected target: {response}"
+                                )
+                            request_latencies.append(time.monotonic() - request_started)
+                            submitted_targets += 1
+                            reason = "commanded"
 
             if new_frame and last_frame is not None:
                 last_annotated = annotate_frame(
@@ -489,6 +438,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         stopped_by = "error"
         run_error = exc
     finally:
+        if detection_stream is not None:
+            detection_stream.close()
         client.close()
         if args.display:
             cv2.destroyAllWindows()
@@ -527,7 +478,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "base_url": base_url,
         "camera_host": camera_host,
         "detector_config": asdict(detector_config),
-        "tracking_config": APPROVED_TRACKING_CONFIG if args.follow else None,
+        "tracking_config": tracking_config if args.follow else None,
         "correction_degrees": args.correction_degrees,
         "frame_count": frame_count,
         "detection_count": detection_count,
@@ -538,7 +489,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if last_detection is not None
         else None,
         "submitted_targets": submitted_targets,
-        "request_latency_ms": None
+        "stream_latency_ms": None
         if not request_latencies
         else {
             "median": float(np.median(request_latencies) * 1000.0),

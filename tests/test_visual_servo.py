@@ -275,6 +275,31 @@ class _MotionTestBackend:
         self.commands.append(command.copy())
 
 
+def test_detection_target_is_bounded_from_current_gaze_and_cached() -> None:
+    correction = np.deg2rad(8.0)
+    controller = VisualServoController(
+        backend=_MotionTestBackend(),  # type: ignore[arg-type]
+        config=VisualServoConfig(
+            smoothing_alpha=1.0,
+            image_error_max_correction=correction,
+        ),
+    )
+    detection = TrackingDetection(u=1280.0, v=360.0)
+    first = controller._look_at_target_from_detection(detection, np.eye(4))
+    turned_pose = np.eye(4)
+    turned_pose[:3, :3] = R.from_euler("z", 0.5).as_matrix()
+
+    repeated = controller._look_at_target_from_detection(detection, turned_pose)
+    latest = controller._look_at_target_from_detection(
+        TrackingDetection(u=1280.0, v=360.0),
+        turned_pose,
+    )
+
+    assert repeated is first
+    assert np.arctan2(first.y, first.x) == pytest.approx(-correction)
+    assert np.arctan2(latest.y, latest.x) == pytest.approx(0.5 - correction)
+
+
 def test_visual_servo_records_profiled_look_at_command() -> None:
     desired = np.array([0.1, *([0.3] * 6)])
     backend = _MotionTestBackend(desired)
@@ -324,14 +349,6 @@ def test_visual_servo_rejects_unsafe_profiled_body_yaw_without_writing() -> None
 def test_visual_servo_profile_fields_are_empty_without_profile_update() -> None:
     records = []
 
-    detection_backend = _MotionTestBackend()
-    detection_controller = VisualServoController(
-        backend=detection_backend  # type: ignore[arg-type]
-    )
-    detection_controller.submit(TrackingDetection(u=10.0, v=10.0))
-    assert detection_controller.step(dt=0.02)
-    records.extend(detection_controller.telemetry.query()["records"])
-
     idle_controller = VisualServoController(
         backend=_MotionTestBackend()  # type: ignore[arg-type]
     )
@@ -368,7 +385,6 @@ def test_visual_servo_profile_fields_are_empty_without_profile_update() -> None:
     records.extend(error_controller.telemetry.query()["records"])
 
     assert {record["reason"] for record in records} == {
-        "commanded",
         "no_fresh_detection",
         "move_running",
         "ik_failed",
@@ -393,7 +409,7 @@ def test_visual_servo_look_at_ik_failure_resets_guard_unseeded_and_recovers() ->
     np.testing.assert_allclose(controller.look_at_guard._velocity, 0.0)
     np.testing.assert_allclose(controller.look_at_guard._acceleration, 0.0)
     assert controller.limiter._last_command is None
-    assert controller._last_command_path == "look_at"
+    assert controller._last_command_path is None
 
     backend.current[0] += 0.00153398
     backend.head_kinematics.joints = backend.current.copy()
@@ -421,7 +437,7 @@ def test_visual_servo_no_target_gap_clears_look_at_motion_state() -> None:
     assert (backend.joint_reads, backend.pose_reads) == reads
 
 
-def test_visual_servo_detection_initializes_its_limiter_after_look_at() -> None:
+def test_visual_servo_detection_reuses_look_at_profile_after_look_at() -> None:
     backend = _MotionTestBackend()
     controller = VisualServoController(
         backend=backend,  # type: ignore[arg-type]
@@ -430,21 +446,13 @@ def test_visual_servo_detection_initializes_its_limiter_after_look_at() -> None:
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
     assert controller.step(dt=0.02)
     assert controller.limiter._last_command is None
-    original_limit = controller.limiter.limit_with_telemetry
-
-    def check_existing_state(
-        desired: np.ndarray, current: np.ndarray, dt: float
-    ) -> tuple[np.ndarray, dict[str, object]]:
-        assert controller.limiter._last_command is None
-        return original_limit(desired, current, dt)
-
-    controller.limiter.limit_with_telemetry = check_existing_state  # type: ignore[method-assign]
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0, timestamp=0.0))
     controller.submit(TrackingDetection(u=10.0, v=10.0))
 
     assert controller.step(dt=0.02)
-    assert controller.look_at_profile._position is None
-    assert controller.look_at_guard._last_command is None
+    assert controller.look_at_profile._position is not None
+    assert controller.look_at_guard._last_command is not None
+    assert controller.limiter._last_command is None
     assert controller._last_command_path == "detection"
 
 
@@ -617,7 +625,7 @@ def test_visual_servo_backend_write_failure_resets_state_and_recovers() -> None:
     assert controller._last_command_path == "look_at"
 
 
-def test_visual_servo_detection_backend_write_failure_resets_limiter_and_recovers() -> (
+def test_visual_servo_detection_backend_write_failure_resets_profile_and_recovers() -> (
     None
 ):
     config = VisualServoConfig()
@@ -632,17 +640,17 @@ def test_visual_servo_detection_backend_write_failure_resets_limiter_and_recover
 
     with pytest.raises(RuntimeError, match="write failed"):
         controller.step(dt=0.02)
+    assert controller.look_at_profile._position is None
+    assert controller.look_at_guard._last_command is None
     assert controller.limiter._last_command is None
     assert controller._last_command_path is None
 
     backend.current = np.full(7, 0.4)
     desired[0] = backend.current[0]
-    expected = JointCommandLimiter(config=config).limit(
-        desired, backend.current, dt=0.02
-    )
     assert controller.step(dt=0.02)
 
-    np.testing.assert_array_equal(backend.commands[0], expected)
+    assert controller.look_at_profile._position is not None
+    assert controller.look_at_guard._last_command is not None
     assert controller._last_command_path == "detection"
 
 
@@ -917,7 +925,7 @@ def test_look_at_filter_eases_successive_metric_targets() -> None:
     )
 
 
-def test_visual_servo_reduces_unreachable_pixel_until_ik_is_valid() -> None:
+def test_visual_servo_detection_ik_failure_recovers_on_new_detection() -> None:
     class FakeKinematics:
         def __init__(self) -> None:
             self.calls = 0
@@ -951,10 +959,11 @@ def test_visual_servo_reduces_unreachable_pixel_until_ik_is_valid() -> None:
     controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
     controller.submit(TrackingDetection(u=0.0, v=0.0, width=100, height=50))
 
-    commanded = controller.step(dt=0.02)
+    assert not controller.step(dt=0.02)
+    controller.submit(TrackingDetection(u=0.0, v=0.0, width=100, height=50))
 
-    assert commanded
-    assert backend.head_kinematics.calls > 1
+    assert controller.step(dt=0.02)
+    assert backend.head_kinematics.calls == 2
     assert backend.command is not None
 
 
@@ -1797,15 +1806,9 @@ def test_visual_servo_records_non_finite_ik_as_failure(
     assert backend.command_called is False
 
 
-def test_visual_servo_records_detection_projection_fallback() -> None:
+def test_visual_servo_records_detection_as_generated_look_at_target() -> None:
     class FakeKinematics:
-        def __init__(self) -> None:
-            self.calls = 0
-
         def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            self.calls += 1
-            if self.calls == 1:
-                return np.full(7, np.nan)
             return np.full(7, 0.2)
 
     class FakeBackend:
@@ -1828,13 +1831,10 @@ def test_visual_servo_records_detection_projection_fallback() -> None:
 
     assert controller.step(dt=0.02)
     record = controller.telemetry.query()["records"][0]
-    projection = record["projected_target"]
-    assert isinstance(projection, dict)
-    assert projection["requested_pixel"] == [32.5, 16.25]
-    assert projection["projected_pixel"] is not None
-    assert projection["scale_from_center"] is not None
-    assert projection["ik_attempts"] > 1
-    assert projection["ik_failures"] >= 1
+    assert record["input_target"]["kind"] == "detection"
+    assert record["smoothed_target"]["kind"] == "look_at"
+    assert record["profiled_command"] is not None
+    assert record["projected_target"] is None
 
 
 def test_visual_servo_run_loop_records_step_error() -> None:
