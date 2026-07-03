@@ -31,7 +31,6 @@ from model_detectors import (
     available_models,
     create_detector,
     normalize_target,
-    resolve_model_weights,
     select_detection,
     supported_targets_for_model,
 )
@@ -218,14 +217,9 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
             f"supported targets: {supported}"
         )
 
-    resolved_weights = (
-        resolve_model_weights(model_name, args.weights)
-        if detector is None
-        else args.weights
-    )
     load_started = time.monotonic()
     detector = detector or create_detector(
-        model_name, weights=resolved_weights, optimize=args.optimize
+        model_name, weights=args.weights, optimize=args.optimize
     )
     detector_load_duration = time.monotonic() - load_started
     if args.display and not opencv_gui_available():
@@ -428,7 +422,7 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
         "target": target,
         "selection": args.selection,
         "min_confidence": args.min_confidence,
-        "weights": None if resolved_weights is None else str(resolved_weights),
+        "weights": None if args.weights is None else str(args.weights),
         "optimized": bool(args.optimize),
         "base_url": base_url,
         "camera_host": camera_host,
@@ -478,7 +472,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--weights",
         type=Path,
-        help="checkpoint path (defaults to a matching file in ../../reachy_rf_detr)",
+        help="optional checkpoint path (required for yolo-face)",
     )
     parser.add_argument("--optimize", action="store_true")
     parser.add_argument("--list-models", action="store_true")

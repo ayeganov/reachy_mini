@@ -246,13 +246,6 @@ MODEL_DESCRIPTIONS = {
     "rfdetr-large": "RF-DETR Large COCO detector",
 }
 
-LOCAL_MODEL_DIRECTORY = Path(__file__).resolve().parents[3] / "reachy_rf_detr"
-LOCAL_MODEL_FILENAMES = {
-    "yolo-face": "yolov8n-face.pt",
-    "rfdetr-nano": "rf-detr-nano.pth",
-    "rfdetr-large": "rf-detr-large.pth",
-}
-
 
 def available_models() -> dict[str, str]:
     """Return registered model names and descriptions."""
@@ -272,30 +265,6 @@ def supported_targets_for_model(model_name: str) -> frozenset[str]:
     raise ValueError(f"unknown model {model_name!r}")
 
 
-def resolve_model_weights(
-    model_name: str,
-    weights: Path | None,
-) -> Path | None:
-    """Resolve explicit weights or a checkpoint in the sibling model repository."""
-    if model_name == "yellow" and weights is not None:
-        raise ValueError("the yellow detector does not accept model weights")
-    if weights is not None:
-        if not weights.is_file():
-            raise ValueError(f"model weights do not exist: {weights}")
-        return weights
-    filename = LOCAL_MODEL_FILENAMES.get(model_name)
-    if filename is None:
-        return None
-    local_weights = LOCAL_MODEL_DIRECTORY / filename
-    if local_weights.is_file():
-        return local_weights
-    if model_name == "yolo-face":
-        raise ValueError(
-            f"--weights is required for yolo-face when {local_weights} is unavailable"
-        )
-    return None
-
-
 def create_detector(
     model_name: str,
     *,
@@ -303,15 +272,23 @@ def create_detector(
     optimize: bool = False,
 ) -> Detector:
     """Create one detector from the built-in registry."""
-    weights = resolve_model_weights(model_name, weights)
     if model_name == "yellow":
+        if weights is not None:
+            raise ValueError("the yellow detector does not accept model weights")
         return YellowDetector()
     if model_name == "yolo-face":
-        assert weights is not None
+        if weights is None:
+            raise ValueError("--weights is required for yolo-face")
+        if not weights.is_file():
+            raise ValueError(f"model weights do not exist: {weights}")
         return YoloFaceDetector(weights=weights)
     if model_name == "rfdetr-nano":
+        if weights is not None and not weights.is_file():
+            raise ValueError(f"model weights do not exist: {weights}")
         return RfDetrDetector(size="nano", weights=weights, optimize=optimize)
     if model_name == "rfdetr-large":
+        if weights is not None and not weights.is_file():
+            raise ValueError(f"model weights do not exist: {weights}")
         return RfDetrDetector(size="large", weights=weights, optimize=optimize)
     raise ValueError(f"unknown model {model_name!r}")
 
