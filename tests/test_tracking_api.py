@@ -261,6 +261,8 @@ def test_tracking_start_validates_image_error_elevation_limit() -> None:
                 "image_horizontal_fov": 1.5,
                 "image_vertical_fov": 1.0,
                 "image_error_elevation_limit": 0.2,
+                "image_error_upward_elevation_limit": 0.3,
+                "image_error_downward_elevation_limit": 0.1,
             },
         )
         rejected = [
@@ -272,6 +274,8 @@ def test_tracking_start_validates_image_error_elevation_limit() -> None:
                 "image_horizontal_fov",
                 "image_vertical_fov",
                 "image_error_elevation_limit",
+                "image_error_upward_elevation_limit",
+                "image_error_downward_elevation_limit",
             )
             for value in (0.0, -0.1, np.pi)
         ]

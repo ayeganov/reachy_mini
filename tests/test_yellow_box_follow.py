@@ -87,6 +87,12 @@ def test_detection_payload_contains_only_current_centroid() -> None:
 
 def test_tracking_config_drops_stale_centroids_quickly() -> None:
     assert APPROVED_TRACKING_CONFIG["max_detection_age"] == 0.35
+    assert APPROVED_TRACKING_CONFIG[
+        "image_error_upward_elevation_limit"
+    ] == pytest.approx(np.deg2rad(20.0))
+    assert APPROVED_TRACKING_CONFIG[
+        "image_error_downward_elevation_limit"
+    ] == pytest.approx(np.deg2rad(15.0))
 
 
 @pytest.mark.parametrize(

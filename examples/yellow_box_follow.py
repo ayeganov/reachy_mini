@@ -31,6 +31,8 @@ APPROVED_TRACKING_CONFIG = {
     "image_horizontal_fov": math.radians(98.88965079926311),
     "image_vertical_fov": math.radians(66.67916209122708),
     "image_error_elevation_limit": math.radians(15.0),
+    "image_error_upward_elevation_limit": math.radians(20.0),
+    "image_error_downward_elevation_limit": math.radians(15.0),
 }
 STATE_PATH = "/state/full?with_head_pose=true&with_head_joints=true&with_body_yaw=true"
 

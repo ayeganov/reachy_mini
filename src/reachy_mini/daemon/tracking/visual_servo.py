@@ -88,6 +88,8 @@ class VisualServoConfig:
     image_horizontal_fov: float = np.deg2rad(98.88965079926311)
     image_vertical_fov: float = np.deg2rad(66.67916209122708)
     image_error_elevation_limit: float = np.arctan2(0.2, 0.5)
+    image_error_upward_elevation_limit: float | None = None
+    image_error_downward_elevation_limit: float | None = None
     joint_safety_margin: float = np.deg2rad(5.0)
     max_joint_velocity: float = np.deg2rad(80.0)
     max_joint_acceleration: float = np.deg2rad(300.0)
@@ -1429,11 +1431,17 @@ class VisualServoController:
         )
         ray_world = (current_head_pose @ T_HEAD_CAM)[:3, :3] @ ray_camera
         azimuth = float(np.arctan2(ray_world[1], ray_world[0]))
+        upward_limit = self.config.image_error_upward_elevation_limit
+        if upward_limit is None:
+            upward_limit = self.config.image_error_elevation_limit
+        downward_limit = self.config.image_error_downward_elevation_limit
+        if downward_limit is None:
+            downward_limit = self.config.image_error_elevation_limit
         elevation = float(
             np.clip(
                 np.arctan2(ray_world[2], np.hypot(ray_world[0], ray_world[1])),
-                -self.config.image_error_elevation_limit,
-                self.config.image_error_elevation_limit,
+                -downward_limit,
+                upward_limit,
             )
         )
         direction = np.array(

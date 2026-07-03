@@ -344,6 +344,35 @@ def test_detection_target_is_stateless_and_clamps_absolute_elevation() -> None:
     assert np.arctan2(target["z"], target["x"]) == pytest.approx(-elevation_limit)
 
 
+def test_detection_target_supports_asymmetric_elevation_limits() -> None:
+    backend = _MotionTestBackend()
+    controller = VisualServoController(
+        backend=backend,  # type: ignore[arg-type]
+        config=VisualServoConfig(
+            smoothing_alpha=1.0,
+            image_vertical_fov=1.0,
+            image_error_elevation_limit=0.4,
+            image_error_upward_elevation_limit=0.3,
+            image_error_downward_elevation_limit=0.2,
+        ),
+    )
+    pose = np.eye(4)
+
+    upward = controller._look_at_target_from_detection(
+        TrackingDetection(u=640.0, v=0.0, frame_id=1),
+        pose,
+        pose,
+    )
+    downward = controller._look_at_target_from_detection(
+        TrackingDetection(u=640.0, v=720.0, frame_id=2),
+        pose,
+        pose,
+    )
+
+    assert np.arctan2(upward.z, upward.x) == pytest.approx(0.3)
+    assert np.arctan2(downward.z, downward.x) == pytest.approx(-0.2)
+
+
 def test_visual_servo_records_profiled_look_at_command() -> None:
     desired = np.array([0.1, *([0.3] * 6)])
     backend = _MotionTestBackend(desired)
