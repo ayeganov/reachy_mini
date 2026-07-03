@@ -39,7 +39,6 @@ from websockets.sync.client import ClientConnection, connect
 from yellow_box_follow import (
     APPROVED_TRACKING_CONFIG,
     STATE_PATH,
-    _neutral_origin,
     _request_json,
     _return_neutral,
 )
@@ -149,8 +148,8 @@ def mode_banner(args: argparse.Namespace) -> str:
     """Describe whether this invocation can move the robot."""
     if args.follow:
         return (
-            f"FOLLOW ENABLED: commanding the robot to track {args.target!r} "
-            f"with {args.model}. Press Ctrl-C to stop."
+            f"FOLLOW ENABLED: moving the robot to neutral, then commanding it "
+            f"to track {args.target!r} with {args.model}. Press Ctrl-C to stop."
         )
     return (
         f"PREVIEW ONLY: detecting {args.target!r} with {args.model}, but sending "
@@ -172,6 +171,12 @@ def _preflight(base_url: str, timeout: float) -> tuple[dict[str, Any], ...]:
     if bool(tracking_status.get("running")):
         raise RuntimeError("tracking is already running")
     return daemon_status, motor_status, tracking_status, state
+
+
+def _establish_neutral_start(base_url: str, timeout: float) -> dict[str, Any]:
+    """Move to neutral and return the fresh measured state before tracking."""
+    _return_neutral(base_url, timeout)
+    return _request_json("GET", base_url, STATE_PATH, timeout=timeout)
 
 
 def _finish_tracking(
@@ -238,7 +243,7 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
     if not isinstance(camera_host, str) or not camera_host:
         raise RuntimeError("robot daemon did not report a camera host")
     if args.follow:
-        _neutral_origin(state_before)
+        state_before = _establish_neutral_start(base_url, args.timeout)
 
     client = ZeroMQClient(
         config=ZeroMQClientConfig(host=camera_host, audio_enabled=False),

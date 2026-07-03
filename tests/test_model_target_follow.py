@@ -26,6 +26,7 @@ from model_detectors import (  # noqa: E402
     supported_targets_for_model,
 )
 from model_target_follow import (  # noqa: E402
+    _establish_neutral_start,
     _finish_tracking,
     annotate_frame,
     build_parser,
@@ -312,6 +313,55 @@ def test_mode_banner_makes_preview_and_follow_behavior_explicit() -> None:
     assert "ZERO robot targets" in mode_banner(preview)
     assert "--follow" in mode_banner(preview)
     assert "FOLLOW ENABLED" in mode_banner(follow)
+    assert "moving the robot to neutral" in mode_banner(follow)
+
+
+def test_follow_start_moves_to_neutral_before_reading_start_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    neutral_state = {
+        "head_pose": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "roll": 0.0,
+            "pitch": 0.0,
+            "yaw": 0.0,
+        },
+        "body_yaw": 0.0,
+    }
+
+    def fake_return_neutral(base_url: str, timeout: float) -> None:
+        calls.append(("move", base_url, timeout))
+
+    def fake_request(
+        method: str,
+        base_url: str,
+        path: str,
+        payload: object = None,
+        timeout: float = 5.0,
+    ) -> dict[str, object]:
+        calls.append(("read", method, base_url, path, payload, timeout))
+        return neutral_state
+
+    monkeypatch.setattr("model_target_follow._return_neutral", fake_return_neutral)
+    monkeypatch.setattr("model_target_follow._request_json", fake_request)
+
+    result = _establish_neutral_start("http://robot/api", 3.0)
+
+    assert result == neutral_state
+    assert calls == [
+        ("move", "http://robot/api", 3.0),
+        (
+            "read",
+            "GET",
+            "http://robot/api",
+            "/state/full?with_head_pose=true&with_head_joints=true&with_body_yaw=true",
+            None,
+            3.0,
+        ),
+    ]
 
 
 def test_display_failure_happens_before_robot_preflight(
