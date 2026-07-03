@@ -53,8 +53,8 @@ class Detector(Protocol):
     """Boundary implemented by every host-side detector adapter."""
 
     @property
-    def supported_targets(self) -> frozenset[str]:
-        """Return normalized target labels accepted by this detector."""
+    def supported_targets(self) -> frozenset[str] | None:
+        """Return accepted labels, or None when arbitrary text is supported."""
 
     def detect(
         self,
@@ -74,12 +74,14 @@ def normalize_target(target: str) -> str:
 def _validate_request(
     target: str,
     min_confidence: float,
-    supported_targets: frozenset[str],
+    supported_targets: frozenset[str] | None,
 ) -> str:
     normalized = normalize_target(target)
     if not 0.0 <= min_confidence <= 1.0:
         raise ValueError("min_confidence must be in [0, 1]")
-    if normalized not in supported_targets:
+    if not normalized:
+        raise ValueError("target must not be empty")
+    if supported_targets is not None and normalized not in supported_targets:
         supported = ", ".join(sorted(supported_targets))
         raise ValueError(
             f"target {target!r} is not supported; supported targets: {supported}"
@@ -169,6 +171,62 @@ class YoloFaceDetector:
         ]
 
 
+class YoloEDetector:
+    """Adapter for YOLOE-26 open-vocabulary detection and segmentation."""
+
+    supported_targets = None
+
+    def __init__(
+        self,
+        *,
+        weights: Path | str = "yoloe-26x-seg.pt",
+        model: Any | None = None,
+    ) -> None:
+        """Load YOLOE-26X unless a test model was provided."""
+        if model is None:
+            from ultralytics import YOLOE
+
+            model = YOLOE(str(weights))
+        self.model: Any = model
+        self.configured_target: str | None = None
+
+    def detect(
+        self,
+        frame_bgr: Frame,
+        *,
+        target: str,
+        min_confidence: float,
+    ) -> list[ImageDetection]:
+        """Return boxes matching one arbitrary text target."""
+        normalized = _validate_request(target, min_confidence, self.supported_targets)
+        _validate_frame(frame_bgr)
+        if normalized != self.configured_target:
+            self.model.set_classes([normalized])
+            self.configured_target = normalized
+        result = self.model.predict(
+            frame_bgr,
+            verbose=False,
+            conf=min_confidence,
+        )[0]
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
+            return []
+        xyxy = _to_numpy(boxes.xyxy)
+        confidence = _to_numpy(boxes.conf)
+        return [
+            ImageDetection(
+                x1=float(bounds[0]),
+                y1=float(bounds[1]),
+                x2=float(bounds[2]),
+                y2=float(bounds[3]),
+                confidence=float(score),
+                label=normalized,
+            )
+            for bounds, score in zip(xyxy, confidence, strict=True)
+            if float(score) >= min_confidence
+        ]
+
+
 class RfDetrDetector:
     """Adapter for COCO-trained RF-DETR Nano or Large models."""
 
@@ -244,6 +302,7 @@ MODEL_DESCRIPTIONS = {
     "yolo-face": "YOLO face detector",
     "rfdetr-nano": "RF-DETR Nano COCO detector",
     "rfdetr-large": "RF-DETR Large COCO detector",
+    "yoloe-26x": "YOLOE-26X open-vocabulary detector",
 }
 
 
@@ -252,8 +311,8 @@ def available_models() -> dict[str, str]:
     return dict(MODEL_DESCRIPTIONS)
 
 
-def supported_targets_for_model(model_name: str) -> frozenset[str]:
-    """Return labels without loading model weights."""
+def supported_targets_for_model(model_name: str) -> frozenset[str] | None:
+    """Return fixed labels, or None for open-vocabulary models."""
     if model_name == "yellow":
         return YellowDetector.supported_targets
     if model_name == "yolo-face":
@@ -262,6 +321,8 @@ def supported_targets_for_model(model_name: str) -> frozenset[str]:
         from rfdetr.util.coco_classes import COCO_CLASSES
 
         return frozenset(normalize_target(value) for value in COCO_CLASSES.values())
+    if model_name == "yoloe-26x":
+        return None
     raise ValueError(f"unknown model {model_name!r}")
 
 
@@ -290,6 +351,11 @@ def create_detector(
         if weights is not None and not weights.is_file():
             raise ValueError(f"model weights do not exist: {weights}")
         return RfDetrDetector(size="large", weights=weights, optimize=optimize)
+    if model_name == "yoloe-26x":
+        if weights is not None and not weights.is_file():
+            raise ValueError(f"model weights do not exist: {weights}")
+        checkpoint: Path | str = weights or "yoloe-26x-seg.pt"
+        return YoloEDetector(weights=checkpoint)
     raise ValueError(f"unknown model {model_name!r}")
 
 

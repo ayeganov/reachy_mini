@@ -17,6 +17,7 @@ from model_detectors import (  # noqa: E402
     ImageDetection,
     RfDetrDetector,
     YellowDetector,
+    YoloEDetector,
     YoloFaceDetector,
     available_models,
     create_detector,
@@ -143,6 +144,49 @@ def test_yolo_face_adapter_normalizes_output_and_filters_confidence() -> None:
     assert results == [_detection(10.0, 20.0, 50.0, 80.0, confidence=0.9)]
 
 
+class _FakeYoloE:
+    def __init__(self) -> None:
+        self.configured_classes: list[list[str]] = []
+
+    def set_classes(self, classes: list[str]) -> None:
+        self.configured_classes.append(classes)
+
+    def predict(
+        self, frame: np.ndarray, *, verbose: bool, conf: float
+    ) -> list[SimpleNamespace]:
+        assert frame.shape == (100, 200, 3)
+        assert verbose is False
+        assert conf == 0.5
+        boxes = SimpleNamespace(
+            xyxy=np.array([[10.0, 20.0, 50.0, 80.0], [1.0, 2.0, 3.0, 4.0]]),
+            conf=np.array([0.9, 0.4]),
+        )
+        return [SimpleNamespace(boxes=boxes)]
+
+
+def test_yoloe_adapter_accepts_arbitrary_target_and_configures_it_once() -> None:
+    model = _FakeYoloE()
+    detector = YoloEDetector(model=model)
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+
+    first = detector.detect(frame, target="  FACE ", min_confidence=0.5)
+    second = detector.detect(frame, target="face", min_confidence=0.5)
+
+    assert first == second == [_detection(10.0, 20.0, 50.0, 80.0, confidence=0.9)]
+    assert model.configured_classes == [["face"]]
+
+
+def test_yoloe_adapter_rejects_empty_target() -> None:
+    detector = YoloEDetector(model=_FakeYoloE())
+
+    with pytest.raises(ValueError, match="target must not be empty"):
+        detector.detect(
+            np.zeros((100, 200, 3), dtype=np.uint8),
+            target="  ",
+            min_confidence=0.5,
+        )
+
+
 class _FakeRfDetr:
     def predict(self, frame: np.ndarray, *, threshold: float) -> SimpleNamespace:
         assert frame.shape == (100, 200, 3)
@@ -178,8 +222,10 @@ def test_registry_exposes_models_without_loading_weights() -> None:
         "yolo-face",
         "rfdetr-nano",
         "rfdetr-large",
+        "yoloe-26x",
     }
     assert supported_targets_for_model("yolo-face") == frozenset({"face"})
+    assert supported_targets_for_model("yoloe-26x") is None
     assert isinstance(create_detector("yellow"), YellowDetector)
 
 

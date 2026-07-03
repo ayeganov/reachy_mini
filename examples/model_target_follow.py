@@ -1,10 +1,11 @@
 # /// script
 # requires-python = ">=3.13"
 # dependencies = [
+#   "clip @ git+https://github.com/ultralytics/CLIP.git@16be45c7062240d445cce764f2afd9454a91ef7e",
 #   "omegaconf>=2.3,<3",
 #   "reachy-mini",
 #   "rfdetr>=1.3,<2",
-#   "ultralytics>=8.3.241,<9",
+#   "ultralytics>=8.4,<9",
 # ]
 # [tool.uv.sources]
 # reachy-mini = { path = "..", editable = true }
@@ -210,7 +211,9 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
     model_name = str(args.model)
     target = normalize_target(args.target)
     supported_targets = supported_targets_for_model(model_name)
-    if target not in supported_targets:
+    if not target:
+        raise ValueError("target must not be empty")
+    if supported_targets is not None and target not in supported_targets:
         supported = ", ".join(sorted(supported_targets))
         raise ValueError(
             f"model {model_name!r} does not support target {target!r}; "
@@ -505,8 +508,12 @@ def main() -> None:
             print(f"{name}\t{description}")
         return
     if args.list_targets:
-        for target in sorted(supported_targets_for_model(args.model)):
-            print(target)
+        targets = supported_targets_for_model(args.model)
+        if targets is None:
+            print("any non-empty text label")
+        else:
+            for target in sorted(targets):
+                print(target)
         return
     if not 0.0 <= args.min_confidence <= 1.0:
         parser.error("--min-confidence must be in [0, 1]")
