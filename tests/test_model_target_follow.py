@@ -21,6 +21,7 @@ from model_detectors import (  # noqa: E402
     available_models,
     create_detector,
     normalize_target,
+    resolve_model_weights,
     select_detection,
     supported_targets_for_model,
 )
@@ -30,6 +31,7 @@ from model_target_follow import (  # noqa: E402
     build_parser,
     detection_payload,
     latency_summary,
+    mode_banner,
     opencv_gui_available,
     run,
 )
@@ -182,9 +184,47 @@ def test_registry_exposes_models_without_loading_weights() -> None:
     assert isinstance(create_detector("yellow"), YellowDetector)
 
 
-def test_registry_requires_face_weights() -> None:
+def test_registry_requires_face_weights_when_local_checkpoint_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("model_detectors.LOCAL_MODEL_DIRECTORY", tmp_path)
+
     with pytest.raises(ValueError, match="--weights is required"):
         create_detector("yolo-face")
+
+
+@pytest.mark.parametrize(
+    ("model_name", "filename"),
+    [
+        ("yolo-face", "yolov8n-face.pt"),
+        ("rfdetr-nano", "rf-detr-nano.pth"),
+        ("rfdetr-large", "rf-detr-large.pth"),
+    ],
+)
+def test_model_weights_are_discovered_in_sibling_repository(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    model_name: str,
+    filename: str,
+) -> None:
+    monkeypatch.setattr("model_detectors.LOCAL_MODEL_DIRECTORY", tmp_path)
+    expected = tmp_path / filename
+    expected.touch()
+
+    assert resolve_model_weights(model_name, None) == expected
+
+
+def test_explicit_missing_model_weights_are_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="model weights do not exist"):
+        resolve_model_weights("rfdetr-nano", tmp_path / "missing.pth")
+
+
+def test_yellow_detector_rejects_model_weights(tmp_path: Path) -> None:
+    weights = tmp_path / "unused.pth"
+    weights.touch()
+
+    with pytest.raises(ValueError, match="does not accept model weights"):
+        create_detector("yellow", weights=weights)
 
 
 def test_detection_payload_contains_only_current_centroid() -> None:
@@ -238,6 +278,20 @@ def test_parser_defaults_to_safe_headless_preview() -> None:
     assert args.follow is False
     assert args.display is False
     assert args.return_neutral is True
+
+
+def test_mode_banner_makes_preview_and_follow_behavior_explicit() -> None:
+    preview = build_parser().parse_args(
+        ["--model", "rfdetr-nano", "--target", "cell phone"]
+    )
+    follow = build_parser().parse_args(
+        ["--model", "rfdetr-nano", "--target", "cell phone", "--follow"]
+    )
+
+    assert "PREVIEW ONLY" in mode_banner(preview)
+    assert "ZERO robot targets" in mode_banner(preview)
+    assert "--follow" in mode_banner(preview)
+    assert "FOLLOW ENABLED" in mode_banner(follow)
 
 
 def test_display_failure_happens_before_robot_preflight(

@@ -31,6 +31,7 @@ from model_detectors import (
     available_models,
     create_detector,
     normalize_target,
+    resolve_model_weights,
     select_detection,
     supported_targets_for_model,
 )
@@ -144,6 +145,19 @@ def opencv_gui_available() -> bool:
     return "GUI:                           NONE" not in cv2.getBuildInformation()
 
 
+def mode_banner(args: argparse.Namespace) -> str:
+    """Describe whether this invocation can move the robot."""
+    if args.follow:
+        return (
+            f"FOLLOW ENABLED: commanding the robot to track {args.target!r} "
+            f"with {args.model}. Press Ctrl-C to stop."
+        )
+    return (
+        f"PREVIEW ONLY: detecting {args.target!r} with {args.model}, but sending "
+        "ZERO robot targets. Add --follow to enable movement."
+    )
+
+
 def _preflight(base_url: str, timeout: float) -> tuple[dict[str, Any], ...]:
     daemon_status = _request_json("GET", base_url, "/daemon/status", timeout=timeout)
     motor_status = _request_json("GET", base_url, "/motors/status", timeout=timeout)
@@ -204,9 +218,14 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
             f"supported targets: {supported}"
         )
 
+    resolved_weights = (
+        resolve_model_weights(model_name, args.weights)
+        if detector is None
+        else args.weights
+    )
     load_started = time.monotonic()
     detector = detector or create_detector(
-        model_name, weights=args.weights, optimize=args.optimize
+        model_name, weights=resolved_weights, optimize=args.optimize
     )
     detector_load_duration = time.monotonic() - load_started
     if args.display and not opencv_gui_available():
@@ -409,7 +428,7 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
         "target": target,
         "selection": args.selection,
         "min_confidence": args.min_confidence,
-        "weights": None if args.weights is None else str(args.weights),
+        "weights": None if resolved_weights is None else str(resolved_weights),
         "optimized": bool(args.optimize),
         "base_url": base_url,
         "camera_host": camera_host,
@@ -456,13 +475,21 @@ def build_parser() -> argparse.ArgumentParser:
         default="largest",
     )
     parser.add_argument("--min-confidence", type=float, default=0.5)
-    parser.add_argument("--weights", type=Path)
+    parser.add_argument(
+        "--weights",
+        type=Path,
+        help="checkpoint path (defaults to a matching file in ../../reachy_rf_detr)",
+    )
     parser.add_argument("--optimize", action="store_true")
     parser.add_argument("--list-models", action="store_true")
     parser.add_argument("--list-targets", action="store_true")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--camera-host")
-    parser.add_argument("--follow", action="store_true")
+    parser.add_argument(
+        "--follow",
+        action="store_true",
+        help="send detections to the robot (default: preview only, no movement)",
+    )
     parser.add_argument("--duration", type=float, default=0.0)
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--output-prefix", type=Path)
@@ -491,6 +518,7 @@ def main() -> None:
         parser.error("--min-confidence must be in [0, 1]")
     if args.duration < 0.0:
         parser.error("--duration must be non-negative")
+    print(mode_banner(args), flush=True)
     summary = run(args)
     print(json.dumps(summary, indent=2, allow_nan=False))
 
