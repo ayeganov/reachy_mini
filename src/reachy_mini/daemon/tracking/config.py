@@ -13,16 +13,11 @@ class VisualServoConfig(BaseModel):
     control_frequency: FiniteFloat = Field(default=50.0, gt=0.0)
     min_confidence: FiniteFloat = Field(default=0.3, ge=0.0, le=1.0)
     max_detection_age: FiniteFloat = Field(default=0.35, gt=0.0)
-    smoothing_alpha: FiniteFloat = Field(default=1.0, gt=0.0, le=1.0)
-    lookahead_distance: FiniteFloat = Field(default=0.5, gt=0.0)
     image_horizontal_fov: FiniteFloat = Field(
         default=math.radians(98.88965079926311), gt=0.0, lt=math.pi
     )
     image_vertical_fov: FiniteFloat = Field(
         default=math.radians(66.67916209122708), gt=0.0, lt=math.pi
-    )
-    image_error_elevation_limit: FiniteFloat = Field(
-        default=math.radians(15.0), gt=0.0, lt=math.pi / 2.0
     )
     image_error_upward_elevation_limit: FiniteFloat = Field(
         default=math.radians(20.0), gt=0.0, lt=math.pi / 2.0

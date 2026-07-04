@@ -37,7 +37,6 @@ DEFAULT_VERTICAL_RANGE = 0.2
 ORBIT_PAD_SIZE = 640
 RED = np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
 APPROVED_MOTION = {
-    "smoothing_alpha": 1.0,
     "joint_safety_margin": 0.1745329252,
     "max_joint_velocity": 0.6,
     "max_joint_acceleration": 2.4,
@@ -201,7 +200,6 @@ class MujocoRedTargetHarness:
         self.servo = VisualServoController(
             backend=self.backend,
             config=VisualServoConfig(
-                smoothing_alpha=APPROVED_MOTION["smoothing_alpha"],
                 joint_safety_margin=APPROVED_MOTION["joint_safety_margin"],
                 max_joint_velocity=APPROVED_MOTION["max_joint_velocity"],
                 max_joint_acceleration=APPROVED_MOTION["max_joint_acceleration"],

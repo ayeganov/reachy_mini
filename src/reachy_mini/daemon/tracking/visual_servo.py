@@ -1,8 +1,7 @@
 """Robot-side visual servo controller for 2D detections.
 
 This module keeps perception and actuation separated: a remote computer may send
-2D detections, but all smoothing, safety projection, and motor target updates
-run locally beside the daemon.
+2D detections, but target conversion and motor updates run locally beside the daemon.
 """
 
 from __future__ import annotations
@@ -30,9 +29,7 @@ if TYPE_CHECKING:
     from reachy_mini.daemon.backend.abstract import Backend
 
 
-T_HEAD_CAM = np.eye(4, dtype=np.float64)
-T_HEAD_CAM[:3, 3] = [0.0437, 0.0, 0.0512]
-T_HEAD_CAM[:3, :3] = np.array(
+R_HEAD_CAM = np.array(
     [
         [0.0, 0.0, 1.0],
         [-1.0, 0.0, 0.0],
@@ -69,13 +66,12 @@ class TrackingLookAtTarget:
 
 @dataclass(frozen=True)
 class JointTargetTelemetry:
-    """IK and projection metadata for one desired joint target."""
+    """IK metadata for one desired joint target."""
 
     joints: npt.NDArray[np.float64] | None
     ik_target: npt.NDArray[np.float64] | None
     ik_joints: npt.NDArray[np.float64] | None
     ik_failed: bool
-    projected_target: dict[str, Any] | None = None
 
 
 class DetectionBuffer:
@@ -154,65 +150,6 @@ class LookAtTargetBuffer:
         return target
 
 
-class PixelTargetFilter:
-    """Exponential smoothing for incoming pixel targets."""
-
-    def __init__(self, alpha: float) -> None:
-        """Initialize the filter."""
-        if not 0.0 < alpha <= 1.0:
-            raise ValueError("alpha must be in (0, 1]")
-        self.alpha = alpha
-        self._value: npt.NDArray[np.float64] | None = None
-
-    def reset(self) -> None:
-        """Clear the filter state."""
-        self._value = None
-
-    def update(self, detection: TrackingDetection) -> npt.NDArray[np.float64]:
-        """Update the filter and return the smoothed pixel position."""
-        value = np.array([detection.u, detection.v], dtype=np.float64)
-        center = np.array(
-            [float(detection.width) / 2.0, float(detection.height) / 2.0],
-            dtype=np.float64,
-        )
-        if self._value is None:
-            self._value = self.alpha * value + (1.0 - self.alpha) * center
-        else:
-            self._value = self.alpha * value + (1.0 - self.alpha) * self._value
-        return self._value.copy()
-
-
-class LookAtTargetFilter:
-    """Exponential smoothing for incoming metric look-at targets."""
-
-    def __init__(self, alpha: float) -> None:
-        """Initialize the filter."""
-        if not 0.0 < alpha <= 1.0:
-            raise ValueError("alpha must be in (0, 1]")
-        self.alpha = alpha
-        self._value: npt.NDArray[np.float64] | None = None
-
-    def reset(self) -> None:
-        """Clear the filter state."""
-        self._value = None
-
-    def update(self, target: TrackingLookAtTarget) -> TrackingLookAtTarget:
-        """Update the filter and return the smoothed metric target."""
-        value = np.array([target.x, target.y, target.z], dtype=np.float64)
-        if self._value is None:
-            self._value = value
-        else:
-            self._value = self.alpha * value + (1.0 - self.alpha) * self._value
-        return TrackingLookAtTarget(
-            x=float(self._value[0]),
-            y=float(self._value[1]),
-            z=float(self._value[2]),
-            timestamp=target.timestamp,
-            confidence=target.confidence,
-            frame_id=target.frame_id,
-        )
-
-
 class VisualServoController:
     """Daemon-local latest-detection visual servo controller."""
 
@@ -220,27 +157,22 @@ class VisualServoController:
         self,
         backend: "Backend",
         config: VisualServoConfig | None = None,
-        logger: logging.Logger | None = None,
     ) -> None:
         """Initialize the controller."""
         self.backend = backend
         self.config = config or VisualServoConfig()
         self.buffer = DetectionBuffer()
         self.look_at_buffer = LookAtTargetBuffer()
-        self.filter = PixelTargetFilter(self.config.smoothing_alpha)
-        self.look_at_filter = LookAtTargetFilter(self.config.smoothing_alpha)
         self.look_at_profile = LookAtJointCommandProfile(config=self.config)
         self.look_at_guard = JointCommandSafetyGuard(config=self.config)
         self.telemetry = VisualServoTelemetryBuffer(
             capacity=self.config.telemetry_capacity
         )
         self._telemetry_sequence = 0
-        self.logger = logger or logging.getLogger(__name__)
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._last_command: npt.NDArray[np.float64] | None = None
         self._last_reason = "not_started"
-        self._last_detection_time: float | None = None
         self._last_target_type: str | None = None
         self._last_command_path: str | None = None
         self._command_count = 0
@@ -272,8 +204,6 @@ class VisualServoController:
         if self.running:
             return
         self._stop_event.clear()
-        self.filter.reset()
-        self.look_at_filter.reset()
         self.look_at_profile.reset()
         self.look_at_guard.reset()
         self._last_command_path = None
@@ -315,7 +245,6 @@ class VisualServoController:
         self._detection_reference_pose = None
         self._processed_detection = None
         self._detection_target_cache = None
-        self.look_at_filter.reset()
         self.look_at_profile.reset()
         self.look_at_guard.reset()
         self._last_command_path = None
@@ -381,18 +310,15 @@ class VisualServoController:
             "dt": dt,
             "target_type": target_type,
             "input_target": input_target,
-            "smoothed_target": None,
+            "look_at_target": None,
             "current_joints": None,
             "current_pose": None,
             "ik_target": None,
             "ik_joints": None,
-            "projected_target": None,
             "profiled_command": None,
             "profile_limit_hits": [],
             "recovery": [],
             "final_command": None,
-            "actual_joints": None,
-            "actual_joints_source": "none",
             "reason": reason,
             "motion_state": self._motion_state,
             "ik_failed": False,
@@ -409,14 +335,10 @@ class VisualServoController:
                 else monotonic_now - start_monotonic,
             },
             "backend": self._backend_telemetry(),
-            "backend_extra": {},
             "error": None,
         }
         self._telemetry_sequence += 1
         return record
-
-    def _append_telemetry(self, record: dict[str, Any]) -> None:
-        self.telemetry.append(record)
 
     def _backend_telemetry(self) -> dict[str, Any]:
         ready = getattr(self.backend, "ready", None)
@@ -475,7 +397,7 @@ class VisualServoController:
                     start_monotonic=start,
                 )
                 record["error"] = str(exc)
-                self._append_telemetry(record)
+                self.telemetry.append(record)
                 log = logging.getLogger(__name__)
                 log.exception("Visual servo step failed")
 
@@ -505,7 +427,7 @@ class VisualServoController:
             else:
                 self._hold_committed_motion()
             self._last_reason = "control_stall"
-            self._append_telemetry(
+            self.telemetry.append(
                 self._new_telemetry_record(
                     dt=dt,
                     target_type="none",
@@ -539,7 +461,7 @@ class VisualServoController:
         release_motion_guard = self._try_acquire_motion_guard()
         if release_motion_guard is None:
             self._last_reason = "move_running"
-            self._append_telemetry(
+            self.telemetry.append(
                 self._new_telemetry_record(
                     dt=dt,
                     target_type=target_type,
@@ -563,8 +485,6 @@ class VisualServoController:
             current_pose = np.array(
                 self.backend.get_present_head_pose(), dtype=np.float64
             )
-            if target_timestamp is not None:
-                self._last_detection_time = target_timestamp
             if target_type != "none":
                 self._last_target_type = target_type
             record = self._new_telemetry_record(
@@ -576,7 +496,6 @@ class VisualServoController:
             )
             body_yaw = float(current_joints[0])
             if self._last_command_path != target_type:
-                self.look_at_filter.reset()
                 self._look_at_reference_pose = current_pose.copy()
             if look_at is not None:
                 self._processed_detection = None
@@ -594,7 +513,6 @@ class VisualServoController:
                 )
             if self._look_at_reference_pose is None:
                 self._look_at_reference_pose = current_pose.copy()
-            smoothed_look_at = self.look_at_filter.update(target)
             ik_reference_pose = (
                 self._look_at_reference_pose
                 if look_at is not None
@@ -602,22 +520,17 @@ class VisualServoController:
             )
             assert ik_reference_pose is not None
             target_result = self._ik_from_target_world_with_telemetry(
-                target_world=np.array(
-                    [smoothed_look_at.x, smoothed_look_at.y, smoothed_look_at.z]
-                ),
+                target_world=np.array([target.x, target.y, target.z]),
                 current_head_pose=ik_reference_pose,
                 body_yaw=body_yaw,
             )
 
-            record["smoothed_target"] = self._look_at_target(smoothed_look_at)
+            record["look_at_target"] = self._look_at_target(target)
             record["current_joints"] = finite_json_value(current_joints)
             record["current_pose"] = finite_json_value(current_pose)
             record["ik_target"] = finite_json_value(target_result.ik_target)
             record["ik_joints"] = finite_json_value(target_result.ik_joints)
             record["ik_failed"] = target_result.ik_failed
-            record["projected_target"] = finite_json_value(
-                target_result.projected_target
-            )
             record["body_yaw"]["current"] = body_yaw
             record["body_yaw"]["ik_input"] = body_yaw
             record["latency"]["target_age"] = (
@@ -634,7 +547,7 @@ class VisualServoController:
                     record["latency"]["processing_duration"] = (
                         time.monotonic() - start_monotonic
                     )
-                    self._append_telemetry(record)
+                    self.telemetry.append(record)
                     return False
                 command_time = time.monotonic()
                 command_dt = dt
@@ -650,7 +563,7 @@ class VisualServoController:
                         time.monotonic() - start_monotonic
                     )
                     self._last_reason = "control_stall"
-                    self._append_telemetry(record)
+                    self.telemetry.append(record)
                     return False
                 self._reset_target_state()
                 command, profile_hits = self.look_at_profile.stop_with_telemetry(
@@ -694,7 +607,7 @@ class VisualServoController:
                     time.monotonic() - start_monotonic
                 )
                 self._last_reason = "control_stall"
-                self._append_telemetry(record)
+                self.telemetry.append(record)
                 return False
             record["dt"] = command_dt
             record["monotonic_timestamp"] = command_time
@@ -731,7 +644,7 @@ class VisualServoController:
         if self._last_command is None:
             self._motion_state = "idle"
             self._last_reason = "no_fresh_detection"
-            self._append_telemetry(
+            self.telemetry.append(
                 self._new_telemetry_record(
                     dt=dt,
                     target_type="none",
@@ -744,7 +657,7 @@ class VisualServoController:
         release_motion_guard = self._try_acquire_motion_guard()
         if release_motion_guard is None:
             self._last_reason = "move_running"
-            self._append_telemetry(
+            self.telemetry.append(
                 self._new_telemetry_record(
                     dt=dt,
                     target_type="none",
@@ -780,7 +693,7 @@ class VisualServoController:
                 record["monotonic_timestamp"] = command_time
                 record["current_joints"] = finite_json_value(current_joints)
                 record["motion_state"] = self._motion_state
-                self._append_telemetry(record)
+                self.telemetry.append(record)
                 return False
             record = self._new_telemetry_record(
                 dt=command_dt,
@@ -846,7 +759,7 @@ class VisualServoController:
                 time.monotonic() - start_monotonic
             )
             self._last_reason = "safety_rejected"
-            self._append_telemetry(record)
+            self.telemetry.append(record)
             return False
         try:
             self.backend.set_target_head_joint_positions(command)
@@ -862,18 +775,14 @@ class VisualServoController:
         reason = "recovering" if recovery else success_reason
         self._last_reason = reason
         record["final_command"] = finite_json_value(command)
-        record["actual_joints"] = finite_json_value(current_joints)
-        record["actual_joints_source"] = "present_read_before_command"
         record["reason"] = reason
         record["motion_state"] = self._motion_state
         record["latency"]["processing_duration"] = time.monotonic() - start_monotonic
-        self._append_telemetry(record)
+        self.telemetry.append(record)
         return True
 
     def _reset_target_state(self) -> None:
         """Clear stale perception state without erasing committed motion."""
-        self.filter.reset()
-        self.look_at_filter.reset()
         self._look_at_reference_pose = None
         self._detection_reference_pose = None
         self._processed_detection = None
@@ -912,7 +821,7 @@ class VisualServoController:
         if detection is self._processed_detection:
             assert self._detection_target_cache is not None
             return self._detection_target_cache
-        pixel = self.filter.update(detection)
+        pixel = np.array([detection.u, detection.v], dtype=np.float64)
         center = np.array(
             [float(detection.width) / 2.0, float(detection.height) / 2.0],
             dtype=np.float64,
@@ -928,14 +837,10 @@ class VisualServoController:
             ],
             dtype=np.float64,
         )
-        ray_world = (current_head_pose @ T_HEAD_CAM)[:3, :3] @ ray_camera
+        ray_world = current_head_pose[:3, :3] @ R_HEAD_CAM @ ray_camera
         azimuth = float(np.arctan2(ray_world[1], ray_world[0]))
         upward_limit = self.config.image_error_upward_elevation_limit
-        if upward_limit is None:
-            upward_limit = self.config.image_error_elevation_limit
         downward_limit = self.config.image_error_downward_elevation_limit
-        if downward_limit is None:
-            downward_limit = self.config.image_error_elevation_limit
         elevation = float(
             np.clip(
                 np.arctan2(ray_world[2], np.hypot(ray_world[0], ray_world[1])),
@@ -951,9 +856,7 @@ class VisualServoController:
             ],
             dtype=np.float64,
         )
-        target_world = reference_head_pose[:3, 3] + (
-            self.config.lookahead_distance * direction
-        )
+        target_world = reference_head_pose[:3, 3] + direction
         target = TrackingLookAtTarget(
             x=float(target_world[0]),
             y=float(target_world[1]),
@@ -1015,172 +918,6 @@ class VisualServoController:
             ik_failed=failed,
         )
 
-    def _ik_from_target_world(
-        self,
-        target_world: npt.NDArray[np.float64],
-        current_head_pose: npt.NDArray[np.float64],
-        body_yaw: float,
-    ) -> npt.NDArray[np.float64] | None:
-        return self._ik_from_target_world_with_telemetry(
-            target_world=target_world,
-            current_head_pose=current_head_pose,
-            body_yaw=body_yaw,
-        ).joints
-
-    def _reachable_joints_from_pixel_with_telemetry(
-        self,
-        pixel: npt.NDArray[np.float64],
-        detection: TrackingDetection,
-        current_head_pose: npt.NDArray[np.float64],
-        body_yaw: float,
-    ) -> JointTargetTelemetry:
-        attempts = 0
-        failures = 0
-        requested_pixel = pixel.copy()
-        initial = self._ik_from_pixel_with_telemetry(
-            pixel=pixel,
-            detection=detection,
-            current_head_pose=current_head_pose,
-            body_yaw=body_yaw,
-        )
-        attempts += 1
-        failures += int(initial.ik_failed)
-        if initial.joints is not None:
-            return JointTargetTelemetry(
-                joints=initial.joints,
-                ik_target=initial.ik_target,
-                ik_joints=initial.ik_joints,
-                ik_failed=False,
-                projected_target={
-                    "requested_pixel": requested_pixel.tolist(),
-                    "projected_pixel": pixel.tolist(),
-                    "scale_from_center": 1.0,
-                    "ik_attempts": attempts,
-                    "ik_failures": failures,
-                },
-            )
-
-        center = np.array(
-            [float(detection.width) / 2.0, float(detection.height) / 2.0],
-            dtype=np.float64,
-        )
-        center_result = self._ik_from_pixel_with_telemetry(
-            pixel=center,
-            detection=detection,
-            current_head_pose=current_head_pose,
-            body_yaw=body_yaw,
-        )
-        attempts += 1
-        failures += int(center_result.ik_failed)
-        if center_result.joints is None:
-            return JointTargetTelemetry(
-                joints=None,
-                ik_target=center_result.ik_target,
-                ik_joints=center_result.ik_joints,
-                ik_failed=True,
-                projected_target={
-                    "requested_pixel": requested_pixel.tolist(),
-                    "projected_pixel": None,
-                    "scale_from_center": None,
-                    "ik_attempts": attempts,
-                    "ik_failures": failures,
-                },
-            )
-
-        best = center_result
-        best_pixel = center.copy()
-        best_scale = 0.0
-        low = 0.0
-        high = 1.0
-        for _ in range(8):
-            mid = (low + high) / 2.0
-            candidate = center + mid * (pixel - center)
-            candidate_result = self._ik_from_pixel_with_telemetry(
-                pixel=candidate,
-                detection=detection,
-                current_head_pose=current_head_pose,
-                body_yaw=body_yaw,
-            )
-            attempts += 1
-            failures += int(candidate_result.ik_failed)
-            if candidate_result.joints is not None:
-                best = candidate_result
-                best_pixel = candidate
-                best_scale = mid
-                low = mid
-            else:
-                high = mid
-        return JointTargetTelemetry(
-            joints=best.joints,
-            ik_target=best.ik_target,
-            ik_joints=best.ik_joints,
-            ik_failed=best.ik_failed,
-            projected_target={
-                "requested_pixel": requested_pixel.tolist(),
-                "projected_pixel": best_pixel.tolist(),
-                "scale_from_center": best_scale,
-                "ik_attempts": attempts,
-                "ik_failures": failures,
-            },
-        )
-
-    def _reachable_joints_from_pixel(
-        self,
-        pixel: npt.NDArray[np.float64],
-        detection: TrackingDetection,
-        current_head_pose: npt.NDArray[np.float64],
-        body_yaw: float,
-    ) -> npt.NDArray[np.float64] | None:
-        return self._reachable_joints_from_pixel_with_telemetry(
-            pixel=pixel,
-            detection=detection,
-            current_head_pose=current_head_pose,
-            body_yaw=body_yaw,
-        ).joints
-
-    def _ik_from_pixel_with_telemetry(
-        self,
-        pixel: npt.NDArray[np.float64],
-        detection: TrackingDetection,
-        current_head_pose: npt.NDArray[np.float64],
-        body_yaw: float,
-    ) -> JointTargetTelemetry:
-        target_pose = self._pose_from_pixel(
-            pixel=pixel,
-            detection=detection,
-            current_head_pose=current_head_pose,
-        )
-        joints = self.backend.head_kinematics.ik(target_pose, body_yaw=body_yaw)
-        if joints is None:
-            return JointTargetTelemetry(
-                joints=None,
-                ik_target=target_pose,
-                ik_joints=None,
-                ik_failed=True,
-            )
-        joints_array = np.array(joints, dtype=np.float64)
-        failed = not self._valid_joints(joints_array)
-        return JointTargetTelemetry(
-            joints=None if failed else joints_array,
-            ik_target=target_pose,
-            ik_joints=joints_array,
-            ik_failed=failed,
-        )
-
-    def _ik_from_pixel(
-        self,
-        pixel: npt.NDArray[np.float64],
-        detection: TrackingDetection,
-        current_head_pose: npt.NDArray[np.float64],
-        body_yaw: float,
-    ) -> npt.NDArray[np.float64] | None:
-        return self._ik_from_pixel_with_telemetry(
-            pixel=pixel,
-            detection=detection,
-            current_head_pose=current_head_pose,
-            body_yaw=body_yaw,
-        ).joints
-
     @staticmethod
     def _valid_joints(joints: npt.NDArray[np.float64] | None) -> bool:
         return (
@@ -1188,44 +925,6 @@ class VisualServoController:
             and joints.shape == (7,)
             and bool(np.all(np.isfinite(joints)))
         )
-
-    def _pose_from_pixel(
-        self,
-        pixel: npt.NDArray[np.float64],
-        detection: TrackingDetection,
-        current_head_pose: npt.NDArray[np.float64],
-    ) -> npt.NDArray[np.float64]:
-        ray_cam = self._camera_ray(pixel, detection.width, detection.height)
-        T_world_cam = current_head_pose @ T_HEAD_CAM
-        ray_world = T_world_cam[:3, :3] @ ray_cam
-        ray_world /= np.linalg.norm(ray_world)
-
-        camera_origin = T_world_cam[:3, 3]
-        target_world = camera_origin + self.config.lookahead_distance * ray_world
-        return self._look_at_pose(
-            current_head_pose=current_head_pose,
-            target_world=target_world,
-        )
-
-    @staticmethod
-    def _camera_ray(
-        pixel: npt.NDArray[np.float64],
-        width: int,
-        height: int,
-    ) -> npt.NDArray[np.float64]:
-        fx = float(width)
-        fy = float(height)
-        cx = float(width) / 2.0
-        cy = float(height) / 2.0
-        ray = np.array(
-            [
-                (pixel[0] - cx) / fx,
-                (pixel[1] - cy) / fy,
-                1.0,
-            ],
-            dtype=np.float64,
-        )
-        return ray / np.linalg.norm(ray)
 
     @staticmethod
     def _look_at_pose(

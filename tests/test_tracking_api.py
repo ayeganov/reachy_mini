@@ -36,7 +36,6 @@ def test_tracking_start_uses_hardware_approved_defaults() -> None:
     assert response.status_code == 200
     assert config.control_frequency == 50.0
     assert config.max_detection_age == 0.35
-    assert config.smoothing_alpha == 1.0
     assert config.joint_safety_margin == 0.1745329252
     assert config.max_joint_velocity == 0.60
     assert config.max_joint_acceleration == 2.40
@@ -278,7 +277,7 @@ def test_tracking_start_validates_look_at_profile_response_hz() -> None:
     assert all(response.status_code == 422 for response in rejected)
 
 
-def test_tracking_start_validates_image_error_elevation_limit() -> None:
+def test_tracking_start_validates_camera_and_elevation_limits() -> None:
     class FakeKinematics:
         def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
             self.automatic_body_yaw = automatic_body_yaw
@@ -298,7 +297,6 @@ def test_tracking_start_validates_image_error_elevation_limit() -> None:
             json={
                 "image_horizontal_fov": 1.5,
                 "image_vertical_fov": 1.0,
-                "image_error_elevation_limit": 0.2,
                 "image_error_upward_elevation_limit": 0.3,
                 "image_error_downward_elevation_limit": 0.1,
             },
@@ -311,7 +309,6 @@ def test_tracking_start_validates_image_error_elevation_limit() -> None:
             for field in (
                 "image_horizontal_fov",
                 "image_vertical_fov",
-                "image_error_elevation_limit",
                 "image_error_upward_elevation_limit",
                 "image_error_downward_elevation_limit",
             )

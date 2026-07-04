@@ -21,8 +21,6 @@ from reachy_mini.daemon.tracking.telemetry import (
 )
 from reachy_mini.daemon.tracking.visual_servo import (
     DetectionBuffer,
-    LookAtTargetFilter,
-    PixelTargetFilter,
     TrackingDetection,
     TrackingLookAtTarget,
     VisualServoController,
@@ -379,10 +377,8 @@ def test_detection_target_is_stateless_and_clamps_absolute_elevation() -> None:
     controller = VisualServoController(
         backend=backend,  # type: ignore[arg-type]
         config=VisualServoConfig(
-            smoothing_alpha=1.0,
             image_horizontal_fov=0.4,
             image_vertical_fov=vertical_fov,
-            image_error_elevation_limit=elevation_limit,
             image_error_upward_elevation_limit=elevation_limit,
             image_error_downward_elevation_limit=elevation_limit,
         ),
@@ -399,7 +395,7 @@ def test_detection_target_is_stateless_and_clamps_absolute_elevation() -> None:
             )
         )
         assert controller.step(dt=0.02)
-        target = controller.telemetry.query()["records"][-1]["smoothed_target"]
+        target = controller.telemetry.query()["records"][-1]["look_at_target"]
         elevations.append(np.arctan2(target["z"], target["x"]))
 
     assert elevations == pytest.approx([-vertical_fov / 2.0] * 20)
@@ -413,7 +409,7 @@ def test_detection_target_is_stateless_and_clamps_absolute_elevation() -> None:
         )
     )
     assert controller.step(dt=0.02)
-    target = controller.telemetry.query()["records"][-1]["smoothed_target"]
+    target = controller.telemetry.query()["records"][-1]["look_at_target"]
     assert np.arctan2(target["y"], target["x"]) == pytest.approx(-0.2)
 
     backend.pose[:3, :3] = R.from_euler("y", 0.35).as_matrix()
@@ -426,7 +422,7 @@ def test_detection_target_is_stateless_and_clamps_absolute_elevation() -> None:
         )
     )
     assert controller.step(dt=0.02)
-    target = controller.telemetry.query()["records"][-1]["smoothed_target"]
+    target = controller.telemetry.query()["records"][-1]["look_at_target"]
     assert np.arctan2(target["z"], target["x"]) == pytest.approx(-0.25)
 
     controller.submit(
@@ -438,7 +434,7 @@ def test_detection_target_is_stateless_and_clamps_absolute_elevation() -> None:
         )
     )
     assert controller.step(dt=0.02)
-    target = controller.telemetry.query()["records"][-1]["smoothed_target"]
+    target = controller.telemetry.query()["records"][-1]["look_at_target"]
     assert np.arctan2(target["z"], target["x"]) == pytest.approx(-elevation_limit)
 
 
@@ -447,9 +443,7 @@ def test_detection_target_supports_asymmetric_elevation_limits() -> None:
     controller = VisualServoController(
         backend=backend,  # type: ignore[arg-type]
         config=VisualServoConfig(
-            smoothing_alpha=1.0,
             image_vertical_fov=1.0,
-            image_error_elevation_limit=0.4,
             image_error_upward_elevation_limit=0.3,
             image_error_downward_elevation_limit=0.2,
         ),
@@ -1033,58 +1027,6 @@ def test_detection_buffer_rejects_stale_and_low_confidence_detection() -> None:
     assert buffer.fresh(config=config, now=now) is None
 
 
-def test_pixel_filter_eases_first_detection_from_image_center() -> None:
-    target_filter = PixelTargetFilter(alpha=0.5)
-
-    filtered = target_filter.update(
-        TrackingDetection(u=0.0, v=0.0, width=100, height=50)
-    )
-
-    np.testing.assert_allclose(filtered, np.array([25.0, 12.5]))
-
-
-def test_look_at_filter_eases_successive_metric_targets() -> None:
-    target_filter = LookAtTargetFilter(alpha=0.25)
-
-    first = target_filter.update(
-        TrackingLookAtTarget(
-            x=0.5,
-            y=0.0,
-            z=0.0,
-            timestamp=10.0,
-            confidence=0.8,
-            frame_id=1,
-        )
-    )
-    second = target_filter.update(
-        TrackingLookAtTarget(
-            x=0.5,
-            y=0.3,
-            z=0.2,
-            timestamp=11.0,
-            confidence=0.7,
-            frame_id=2,
-        )
-    )
-
-    assert first == TrackingLookAtTarget(
-        x=0.5,
-        y=0.0,
-        z=0.0,
-        timestamp=10.0,
-        confidence=0.8,
-        frame_id=1,
-    )
-    assert second == TrackingLookAtTarget(
-        x=0.5,
-        y=0.075,
-        z=0.05,
-        timestamp=11.0,
-        confidence=0.7,
-        frame_id=2,
-    )
-
-
 def test_visual_servo_detection_ik_failure_recovers_on_new_detection() -> None:
     class FakeKinematics:
         def __init__(self) -> None:
@@ -1168,7 +1110,7 @@ def test_visual_servo_commands_from_3d_look_at_target() -> None:
     assert backend.head_kinematics.last_pose is not None
 
 
-def test_visual_servo_records_smoothed_look_at_target() -> None:
+def test_visual_servo_uses_latest_look_at_target_without_hidden_filtering() -> None:
     class FakeKinematics:
         def __init__(self) -> None:
             self.forward_axes: list[np.ndarray] = []
@@ -1199,7 +1141,6 @@ def test_visual_servo_records_smoothed_look_at_target() -> None:
     controller = VisualServoController(
         backend=backend,  # type: ignore[arg-type]
         config=VisualServoConfig(
-            smoothing_alpha=0.5,
             max_joint_velocity=1e9,
             max_joint_acceleration=1e9,
             max_joint_jerk=1e9,
@@ -1228,18 +1169,18 @@ def test_visual_servo_records_smoothed_look_at_target() -> None:
 
     records = controller.telemetry.query()["records"]
     assert records[0]["input_target"]["y"] == 0.0  # type: ignore[index]
-    assert records[0]["smoothed_target"]["y"] == 0.0  # type: ignore[index]
+    assert records[0]["look_at_target"]["y"] == 0.0  # type: ignore[index]
     assert records[1]["input_target"]["y"] == 0.2  # type: ignore[index]
-    assert records[1]["smoothed_target"] == {
+    assert records[1]["look_at_target"] == {
         "kind": "look_at",
         "x": 0.5,
-        "y": 0.1,
-        "z": 0.1,
+        "y": 0.2,
+        "z": 0.2,
         "timestamp": records[1]["input_target"]["timestamp"],  # type: ignore[index]
         "confidence": 1.0,
         "frame_id": 2,
     }
-    expected_forward = np.array([0.5, 0.1, 0.1], dtype=np.float64)
+    expected_forward = np.array([0.5, 0.2, 0.2], dtype=np.float64)
     expected_forward /= np.linalg.norm(expected_forward)
     np.testing.assert_allclose(
         backend.head_kinematics.forward_axes[1], expected_forward
@@ -1370,7 +1311,7 @@ def test_visual_servo_detection_refreshes_reference_across_target_gap() -> None:
     backend = FakeBackend()
     controller = VisualServoController(
         backend=backend,  # type: ignore[arg-type]
-        config=VisualServoConfig(smoothing_alpha=1.0, max_detection_age=0.01),
+        config=VisualServoConfig(max_detection_age=0.01),
     )
     controller.submit(TrackingDetection(u=640.0, v=360.0, frame_id=0))
     assert controller.step(dt=0.02)
@@ -1852,7 +1793,6 @@ def test_visual_servo_records_no_fresh_detection_without_backend_reads() -> None
     assert record["target_type"] == "none"
     assert record["current_joints"] is None
     assert record["current_pose"] is None
-    assert record["actual_joints"] is None
     assert record["final_command"] is None
 
 
@@ -1922,8 +1862,6 @@ def test_visual_servo_records_commanded_look_at_tick() -> None:
     assert record["target_type"] == "look_at"
     assert record["input_target"]["kind"] == "look_at"  # type: ignore[index]
     assert record["current_joints"] == [0.0] * 7
-    assert record["actual_joints"] == [0.0] * 7
-    assert record["actual_joints_source"] == "present_read_before_command"
     assert record["final_command"] is not None
     assert record["ik_joints"] == [0.0, *([0.2] * 6)]
     assert record["ik_target"] is not None
@@ -2007,9 +1945,8 @@ def test_visual_servo_records_detection_as_generated_look_at_target() -> None:
     assert controller.step(dt=0.02)
     record = controller.telemetry.query()["records"][0]
     assert record["input_target"]["kind"] == "detection"
-    assert record["smoothed_target"]["kind"] == "look_at"
+    assert record["look_at_target"]["kind"] == "look_at"
     assert record["profiled_command"] is not None
-    assert record["projected_target"] is None
 
 
 def test_visual_servo_run_loop_records_step_error() -> None:
