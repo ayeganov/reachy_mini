@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 
 
 class VisualServoConfig(BaseModel):
-    """Runtime configuration with the hardware-approved defaults."""
+    """Runtime configuration for daemon-owned visual tracking."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -20,10 +20,10 @@ class VisualServoConfig(BaseModel):
         default=math.radians(66.67916209122708), gt=0.0, lt=math.pi
     )
     image_error_upward_elevation_limit: FiniteFloat = Field(
-        default=math.radians(20.0), gt=0.0, lt=math.pi / 2.0
+        default=math.radians(30.0), gt=0.0, lt=math.pi / 2.0
     )
     image_error_downward_elevation_limit: FiniteFloat = Field(
-        default=math.radians(15.0), gt=0.0, lt=math.pi / 2.0
+        default=math.radians(25.0), gt=0.0, lt=math.pi / 2.0
     )
     joint_safety_margin: FiniteFloat = Field(default=0.1745329252, ge=0.0)
     max_joint_velocity: FiniteFloat = Field(default=0.60, gt=0.0)

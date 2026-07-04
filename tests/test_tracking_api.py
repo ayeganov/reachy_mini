@@ -12,7 +12,7 @@ from reachy_mini.daemon.app.routers.tracking import _get_or_create_visual_servo
 from reachy_mini.daemon.tracking.visual_servo import VisualServoController
 
 
-def test_tracking_start_uses_hardware_approved_defaults() -> None:
+def test_tracking_start_uses_centralized_defaults() -> None:
     class FakeKinematics:
         automatic_body_yaw = False
 
@@ -43,8 +43,8 @@ def test_tracking_start_uses_hardware_approved_defaults() -> None:
     assert config.look_at_profile_response_hz == 2.0
     assert config.image_horizontal_fov == math.radians(98.88965079926311)
     assert config.image_vertical_fov == math.radians(66.67916209122708)
-    assert config.image_error_upward_elevation_limit == math.radians(20.0)
-    assert config.image_error_downward_elevation_limit == math.radians(15.0)
+    assert config.image_error_upward_elevation_limit == math.radians(30.0)
+    assert config.image_error_downward_elevation_limit == math.radians(25.0)
 
 
 def test_tracking_status_route_is_registered() -> None:
