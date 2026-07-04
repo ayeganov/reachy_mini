@@ -23,7 +23,7 @@ from mujoco_red_target_tracking import (  # noqa: E402
 )
 
 from reachy_mini.daemon.tracking.visual_servo import (  # noqa: E402
-    TrackingLookAtTarget,
+    TrackingDetection,
 )
 
 
@@ -41,7 +41,7 @@ def _drive_until_centered(
             detection = harness.last_detection
             assert detection is not None
         record = harness.step()
-        assert record["target_type"] == "look_at"
+        assert record["target_type"] == "detection"
         assert record["reason"] == "commanded"
         assert record["limit_hits"] == []
         assert not any(
@@ -103,7 +103,7 @@ def test_harness_step_reads_only_latest_telemetry_record(
         ("bottom_right", -math.atan2(0.1414, 0.5), -0.1414),
     ],
 )
-def test_rendered_marker_grid_centers_through_existing_look_at_path(
+def test_rendered_marker_grid_centers_through_production_detection_path(
     name: str,
     marker_azimuth: float,
     marker_height: float,
@@ -113,6 +113,7 @@ def test_rendered_marker_grid_centers_through_existing_look_at_path(
     assert result.centered_at_s is not None, result
     assert result.centered_at_s <= 2.5, result
     assert result.held_center_s >= 0.5, result
+    assert result.target_types == ("detection",), result
     assert result.reasons == ("commanded",), result
     assert result.ik_failures == 0, result
     assert result.guard_hits == 0, result
@@ -121,7 +122,7 @@ def test_rendered_marker_grid_centers_through_existing_look_at_path(
     assert result.maximum_abs_elevation <= math.atan2(0.2, 0.5) + 1e-12, result
 
 
-def test_marker_loss_freezes_absolute_target_without_drift() -> None:
+def test_marker_loss_expires_detection_and_stops_without_fault() -> None:
     harness = MujocoRedTargetHarness()
     harness.set_marker_orbit(-0.2, 0.0)
     try:
@@ -129,16 +130,17 @@ def test_marker_loss_freezes_absolute_target_without_drift() -> None:
             if tick % SENSOR_TICKS == 0:
                 assert harness.observe(CONTROL_DT * SENSOR_TICKS) is not None
             harness.step()
-        before = harness.reference.target
+        before = harness.last_target
 
         harness.marker_visible = False
+        reasons = set()
         for tick in range(30):
             if tick % SENSOR_TICKS == 0:
                 assert harness.observe(CONTROL_DT * SENSOR_TICKS) is None
-            harness.step()
+            reasons.add(str(harness.step()["reason"]))
 
-        assert harness.reference.target == before
-        assert harness.last_reference_update.reason == "no_observation"
+        assert harness.last_target == before
+        assert reasons <= {"stopping_no_target", "holding_no_target"}
         assert harness.guard_hits == 0
         assert harness.profile_position_hits == 0
     finally:
@@ -154,13 +156,13 @@ def test_mujoco_target_gap_preserves_command_motion_state() -> None:
                 assert harness.observe(CONTROL_DT * SENSOR_TICKS) is not None
             harness.step()
 
-        target = harness.reference.target
-        harness.servo.submit_look_at(
-            TrackingLookAtTarget(
-                x=target.x,
-                y=target.y,
-                z=target.z,
+        harness.servo.submit(
+            TrackingDetection(
+                u=harness.width / 2.0,
+                v=harness.height / 2.0,
                 timestamp=0.0,
+                width=harness.width,
+                height=harness.height,
             )
         )
         gap_reasons = []
@@ -175,6 +177,7 @@ def test_mujoco_target_gap_preserves_command_motion_state() -> None:
                 mujoco.mj_step(harness.backend.model, harness.backend.data)
             harness._refresh_backend_state()
 
+        assert harness.observe(CONTROL_DT * SENSOR_TICKS) is not None
         resumed = harness.step()
 
         assert set(gap_reasons) <= {"stopping_no_target", "holding_no_target"}
@@ -189,7 +192,7 @@ def test_abrupt_horizontal_reversal_centers_without_reset_or_stuck_state() -> No
     try:
         harness.set_marker_orbit(math.atan2(0.2, 0.5), 0.0)
         first_centered, first_hold = _drive_until_centered(harness)
-        first_target = harness.reference.target
+        first_target = harness.last_target
 
         harness.set_marker_orbit(-math.atan2(0.2, 0.5), 0.0)
         second_centered, second_hold = _drive_until_centered(harness)
@@ -198,7 +201,7 @@ def test_abrupt_horizontal_reversal_centers_without_reset_or_stuck_state() -> No
         assert first_hold >= 0.5
         assert second_centered is not None and second_centered <= 3.5
         assert second_hold >= 0.5
-        assert harness.reference.target.y < first_target.y
+        assert harness.last_target[1] < first_target[1]
         assert harness.guard_hits == 0
         assert harness.profile_position_hits == 0
         assert harness.maximum_direction_norm_error <= 1e-12
@@ -273,32 +276,24 @@ def test_slow_visual_orbit_engages_body_yaw_without_losing_marker(
     assert result.profile_position_hits == 0, result
 
 
-def test_oracle_and_vision_modes_both_submit_look_at_targets() -> None:
+def test_harness_submits_rendered_centroid_as_detection() -> None:
     harness = MujocoRedTargetHarness()
     try:
-        harness.observe(CONTROL_DT * SENSOR_TICKS)
-        vision_record = harness.step()
-        harness.mode = "oracle"
-        oracle_record = harness.step()
+        detection = harness.observe(CONTROL_DT * SENSOR_TICKS)
+        assert detection is not None
 
-        assert vision_record["target_type"] == "look_at"
-        assert oracle_record["target_type"] == "look_at"
-        assert vision_record["input_target"]["kind"] == "look_at"
-        assert oracle_record["input_target"]["kind"] == "look_at"
-    finally:
-        harness.close()
+        record = harness.step()
 
-
-def test_oracle_compensates_camera_to_head_vertical_parallax() -> None:
-    harness = MujocoRedTargetHarness()
-    try:
-        harness.mode = "oracle"
-        oracle = harness._metric_target()
-
-        assert harness.marker_position[2] - oracle[2] == pytest.approx(0.0525)
-        assert oracle[2] == pytest.approx(
-            harness.look_at_sphere.origin_z,
-            abs=1e-6,
-        )
+        assert record["target_type"] == "detection"
+        assert record["input_target"] == {
+            "kind": "detection",
+            "u": detection.u,
+            "v": detection.v,
+            "timestamp": record["input_target"]["timestamp"],
+            "confidence": 1.0,
+            "frame_id": 0,
+            "width": harness.width,
+            "height": harness.height,
+        }
     finally:
         harness.close()
