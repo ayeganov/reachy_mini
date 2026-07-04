@@ -3,6 +3,7 @@
 # dependencies = [
 #   "clip @ git+https://github.com/ultralytics/CLIP.git@16be45c7062240d445cce764f2afd9454a91ef7e",
 #   "omegaconf>=2.3,<3",
+#   "pyzmq>=25,<28",
 #   "reachy-mini",
 #   "rfdetr>=1.3,<2",
 #   "ultralytics>=8.4,<9",
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 from dataclasses import asdict
@@ -26,6 +28,10 @@ import av
 import cv2
 import numpy as np
 import numpy.typing as npt
+from detection_visualization import (
+    DEFAULT_VISUALIZATION_ENDPOINT,
+    DetectionVisualizationPublisher,
+)
 from model_detectors import (
     Detector,
     ImageDetection,
@@ -125,6 +131,16 @@ def annotate_frame(
         2,
         cv2.LINE_AA,
     )
+    cv2.putText(
+        annotated,
+        f"red: selected | green: other {target} matches",
+        (16, 58),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
     return annotated
 
 
@@ -137,11 +153,6 @@ def latency_summary(samples: list[float]) -> dict[str, float] | None:
         "p95": float(np.percentile(samples, 95) * 1000.0),
         "maximum": float(max(samples) * 1000.0),
     }
-
-
-def opencv_gui_available() -> bool:
-    """Return whether the imported OpenCV build includes a GUI backend."""
-    return "GUI:                           NONE" not in cv2.getBuildInformation()
 
 
 def mode_banner(args: argparse.Namespace) -> str:
@@ -218,6 +229,8 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
     supported_targets = supported_targets_for_model(model_name)
     if not target:
         raise ValueError("target must not be empty")
+    if not math.isfinite(args.visualization_fps) or args.visualization_fps <= 0.0:
+        raise ValueError("visualization_fps must be positive and finite")
     if supported_targets is not None and target not in supported_targets:
         supported = ", ".join(sorted(supported_targets))
         raise ValueError(
@@ -230,10 +243,6 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
         model_name, weights=args.weights, optimize=args.optimize
     )
     detector_load_duration = time.monotonic() - load_started
-    if args.display and not opencv_gui_available():
-        raise RuntimeError(
-            "this environment has a headless OpenCV build; rerun with --no-display"
-        )
 
     base_url = args.base_url.rstrip("/")
     daemon_status, _motor_status, tracking_before, state_before = _preflight(
@@ -250,6 +259,7 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
         log_level="WARNING",
     )
     detection_stream: ClientConnection | None = None
+    visualization: DetectionVisualizationPublisher | None = None
     tracking_started = False
     telemetry: dict[str, Any] = {}
     frame_count = 0
@@ -262,6 +272,8 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
     last_selected: ImageDetection | None = None
     inference_latencies: list[float] = []
     stream_latencies: list[float] = []
+    visualization_period = 1.0 / args.visualization_fps
+    last_visualization_at = float("-inf")
     reason = "preview" if not args.follow else "target_lost"
     started_at = 0.0
     warmup_latency: float | None = None
@@ -273,6 +285,13 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
     )
 
     try:
+        if args.visualize:
+            visualization = DetectionVisualizationPublisher(args.visualization_endpoint)
+            print(
+                f"Publishing target-filtered detections at "
+                f"{args.visualization_endpoint}",
+                flush=True,
+            )
         if not client.start(wait_timeout=args.timeout):
             raise RuntimeError("remote camera stream did not start")
 
@@ -375,13 +394,14 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
                         reason=reason,
                         follow=args.follow,
                     )
+                    now = time.monotonic()
+                    if (
+                        visualization is not None
+                        and now - last_visualization_at >= visualization_period
+                    ):
+                        visualization.publish(last_annotated)
+                        last_visualization_at = now
 
-            if args.display:
-                if new_frame and last_annotated is not None:
-                    cv2.imshow("Reachy attention", last_annotated)
-                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
-                    stopped_by = "operator"
-                    break
             if not new_frame:
                 time.sleep(0.002)
     except KeyboardInterrupt:
@@ -406,11 +426,11 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
             client.close()
         except Exception as exc:
             cleanup_error = cleanup_error or exc
-        if args.display:
+        if visualization is not None:
             try:
-                cv2.destroyAllWindows()
-            except cv2.error:
-                pass
+                visualization.close()
+            except Exception as exc:
+                cleanup_error = cleanup_error or exc
         if run_error is None and cleanup_error is not None:
             run_error = cleanup_error
 
@@ -449,6 +469,12 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
         "last_selected": (asdict(last_selected) if last_selected is not None else None),
         "inference_latency_ms": latency_summary(inference_latencies),
         "stream_latency_ms": latency_summary(stream_latencies),
+        "visualization_endpoint": (
+            args.visualization_endpoint if args.visualize else None
+        ),
+        "visualization_frames": (
+            visualization.published_frames if visualization is not None else 0
+        ),
         "stopped_by": stopped_by,
         "error": None if run_error is None else repr(run_error),
         "state_before": state_before,
@@ -496,8 +522,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--output-prefix", type=Path)
     parser.add_argument(
-        "--display", action=argparse.BooleanOptionalAction, default=False
+        "--visualize",
+        action="store_true",
+        help="publish annotated frames for model_detection_viewer.py",
     )
+    parser.add_argument(
+        "--visualization-endpoint",
+        default=DEFAULT_VISUALIZATION_ENDPOINT,
+    )
+    parser.add_argument("--visualization-fps", type=float, default=15.0)
     parser.add_argument(
         "--return-neutral", action=argparse.BooleanOptionalAction, default=True
     )
@@ -524,6 +557,8 @@ def main() -> None:
         parser.error("--min-confidence must be in [0, 1]")
     if args.duration < 0.0:
         parser.error("--duration must be non-negative")
+    if not math.isfinite(args.visualization_fps) or args.visualization_fps <= 0.0:
+        parser.error("--visualization-fps must be positive and finite")
     print(mode_banner(args), flush=True)
     summary = run(args)
     print(json.dumps(summary, indent=2, allow_nan=False))

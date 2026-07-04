@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,8 +32,6 @@ from model_target_follow import (  # noqa: E402
     detection_payload,
     latency_summary,
     mode_banner,
-    opencv_gui_available,
-    run,
 )
 
 
@@ -297,7 +294,9 @@ def test_parser_defaults_to_safe_headless_preview() -> None:
     assert args.target == "face"
     assert args.selection == "largest"
     assert args.follow is False
-    assert args.display is False
+    assert args.visualize is False
+    assert args.visualization_endpoint == "ipc:///tmp/reachy-model-target-viewer"
+    assert args.visualization_fps == 15.0
     assert args.return_neutral is True
 
 
@@ -364,28 +363,6 @@ def test_follow_start_moves_to_neutral_before_reading_start_state(
     ]
 
 
-def test_display_failure_happens_before_robot_preflight(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("model_target_follow.opencv_gui_available", lambda: False)
-
-    def unexpected_preflight(base_url: str, timeout: float) -> tuple[object, ...]:
-        del base_url, timeout
-        raise AssertionError("robot preflight must not run")
-
-    monkeypatch.setattr("model_target_follow._preflight", unexpected_preflight)
-    args = Namespace(
-        model="yellow",
-        target="yellow",
-        weights=None,
-        optimize=False,
-        display=True,
-    )
-
-    with pytest.raises(RuntimeError, match="headless OpenCV"):
-        run(args)
-
-
 def test_tracking_stop_and_neutral_survive_telemetry_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -422,7 +399,3 @@ def test_tracking_stop_and_neutral_survive_telemetry_failure(
         ("POST", "/tracking/stop"),
         ("POST", "neutral"),
     ]
-
-
-def test_active_opencv_build_is_detectable() -> None:
-    assert isinstance(opencv_gui_available(), bool)
