@@ -295,6 +295,40 @@ class LookAtJointCommandProfile:
         self._body_yaw_velocity = 0.0
         self._body_yaw_acceleration = 0.0
 
+    @property
+    def stationary(self) -> bool:
+        """Return whether the retained command trajectory is at rest."""
+        return bool(
+            np.max(np.abs(self._velocity), initial=0.0) <= 1e-10
+            and np.max(np.abs(self._acceleration), initial=0.0) <= 1e-8
+            and abs(self._body_yaw_velocity) <= 1e-10
+            and abs(self._body_yaw_acceleration) <= 1e-8
+        )
+
+    def hold(self, command: npt.NDArray[np.float64]) -> None:
+        """Retain one command as stationary trajectory state."""
+        command_vector = _finite_joint_vector(command, length=7, name="command")
+        self._body_yaw_position = float(command_vector[0])
+        self._position = command_vector[1:7].copy()
+        self._body_yaw_velocity = 0.0
+        self._body_yaw_acceleration = 0.0
+        self._velocity.fill(0.0)
+        self._acceleration.fill(0.0)
+
+    def stop_with_telemetry(
+        self,
+        current: npt.NDArray[np.float64],
+        dt: float,
+    ) -> tuple[npt.NDArray[np.float64], list[dict[str, float | int | str]]]:
+        """Advance the retained trajectory toward a bounded stationary hold."""
+        current_vector = _finite_joint_vector(current, length=7, name="current")
+        if self._position is None or self._body_yaw_position is None:
+            return current_vector, []
+        retained_position = np.concatenate(
+            (np.array([self._body_yaw_position]), self._position.copy())
+        )
+        return self.update_with_telemetry(retained_position, current_vector, dt)
+
     @staticmethod
     def _advance_motion(
         position: float,
@@ -1068,6 +1102,8 @@ class VisualServoController:
         self._detection_target_cache: TrackingLookAtTarget | None = None
         self._previous_automatic_body_yaw: bool | None = None
         self._last_command_time: float | None = None
+        self._motion_state = "idle"
+        self._motion_fault: str | None = None
 
     @property
     def running(self) -> bool:
@@ -1098,6 +1134,9 @@ class VisualServoController:
         self._processed_detection = None
         self._detection_target_cache = None
         self._last_command_time = None
+        self._last_command = None
+        self._motion_state = "idle"
+        self._motion_fault = None
         if self.config.automatic_body_yaw and hasattr(
             self.backend.head_kinematics, "set_automatic_body_yaw"
         ):
@@ -1134,6 +1173,9 @@ class VisualServoController:
         self.limiter.reset()
         self._last_command_path = None
         self._last_command_time = None
+        self._last_command = None
+        self._motion_state = "idle"
+        self._motion_fault = None
         self._restore_automatic_body_yaw()
         self._last_reason = "stopped"
         self._error = None
@@ -1169,6 +1211,8 @@ class VisualServoController:
             "last_command": None
             if self._last_command is None
             else self._last_command.tolist(),
+            "motion_state": self._motion_state,
+            "motion_fault": self._motion_fault,
             "error": self._error,
         }
 
@@ -1198,10 +1242,12 @@ class VisualServoController:
             "projected_target": None,
             "profiled_command": None,
             "profile_limit_hits": [],
+            "recovery": [],
             "final_command": None,
             "actual_joints": None,
             "actual_joints_source": "none",
             "reason": reason,
+            "motion_state": self._motion_state,
             "ik_failed": False,
             "limit_hits": [],
             "body_yaw": {
@@ -1304,7 +1350,10 @@ class VisualServoController:
             raise ValueError("dt must be finite and positive")
         start_monotonic = time.monotonic()
         if dt > 2.0 / self.config.control_frequency:
-            self._reset_motion_state()
+            if self._last_command is None:
+                self._reset_motion_state()
+            else:
+                self._hold_committed_motion()
             self._last_reason = "control_stall"
             self._append_telemetry(
                 self._new_telemetry_record(
@@ -1315,21 +1364,18 @@ class VisualServoController:
                 )
             )
             return False
+        if self._motion_fault is not None:
+            self._last_reason = self._motion_fault
+            return False
 
         look_at = self.look_at_buffer.fresh(self.config)
         detection = None if look_at is not None else self.buffer.fresh(self.config)
         if look_at is None and detection is None:
-            self._reset_motion_state()
-            self._last_reason = "no_fresh_detection"
-            self._append_telemetry(
-                self._new_telemetry_record(
-                    dt=dt,
-                    target_type="none",
-                    reason="no_fresh_detection",
-                    start_monotonic=start_monotonic,
-                )
+            return self._step_without_target(
+                dt,
+                start_monotonic=start_monotonic,
+                use_command_elapsed=use_command_elapsed,
             )
-            return False
 
         target_type = "none"
         input_target: dict[str, Any] | None = None
@@ -1433,14 +1479,44 @@ class VisualServoController:
                 else max(0.0, time.time() - target_timestamp)
             )
             if target_result.joints is None:
-                self._reset_motion_state()
-                record["reason"] = "ik_failed"
-                self._last_reason = "ik_failed"
-                record["latency"]["processing_duration"] = (
-                    time.monotonic() - start_monotonic
+                if self._last_command is None:
+                    self._reset_motion_state()
+                    record["reason"] = "ik_failed"
+                    self._last_reason = "ik_failed"
+                    record["motion_state"] = self._motion_state
+                    record["latency"]["processing_duration"] = (
+                        time.monotonic() - start_monotonic
+                    )
+                    self._append_telemetry(record)
+                    return False
+                command_time = time.monotonic()
+                command_dt = dt
+                if use_command_elapsed and self._last_command_time is not None:
+                    command_dt = command_time - self._last_command_time
+                self._reset_target_state()
+                command, profile_hits = self.look_at_profile.stop_with_telemetry(
+                    current_joints, command_dt
                 )
-                self._append_telemetry(record)
-                return False
+                record["dt"] = command_dt
+                record["monotonic_timestamp"] = command_time
+                record["profiled_command"] = finite_json_value(command)
+                record["profile_limit_hits"] = profile_hits
+                stationary = self.look_at_profile.stationary
+                return self._write_profiled_command(
+                    command=command,
+                    current_joints=current_joints,
+                    command_dt=command_dt,
+                    command_time=command_time,
+                    record=record,
+                    target_type="none",
+                    success_reason=(
+                        "holding_ik_failed" if stationary else "stopping_ik_failed"
+                    ),
+                    motion_state=(
+                        "holding_ik_failed" if stationary else "stopping_ik_failed"
+                    ),
+                    start_monotonic=start_monotonic,
+                )
 
             desired_joints = np.array(target_result.joints, dtype=np.float64)
             command_time = time.monotonic()
@@ -1448,7 +1524,10 @@ class VisualServoController:
             if use_command_elapsed and self._last_command_time is not None:
                 command_dt = command_time - self._last_command_time
             if command_dt > 2.0 / self.config.control_frequency:
-                self._reset_motion_state()
+                if self._last_command is None:
+                    self._reset_motion_state()
+                else:
+                    self._hold_committed_motion()
                 record["dt"] = command_dt
                 record["monotonic_timestamp"] = command_time
                 record["reason"] = "control_stall"
@@ -1467,61 +1546,190 @@ class VisualServoController:
             )
             record["profiled_command"] = finite_json_value(desired_joints)
             record["profile_limit_hits"] = profile_hits
-            guard_hits, guard_velocity, guard_acceleration = self.look_at_guard.check(
+            return self._write_profiled_command(
                 command=desired_joints,
-                current=current_joints,
-                dt=command_dt,
+                current_joints=current_joints,
+                command_dt=command_dt,
+                command_time=command_time,
+                record=record,
+                target_type=target_type,
+                success_reason="commanded",
+                motion_state="tracking",
+                start_monotonic=start_monotonic,
             )
-            record["limit_hits"] = guard_hits
-            if guard_hits:
-                self._reset_motion_state()
-                record["reason"] = "safety_rejected"
-                record["latency"]["processing_duration"] = (
-                    time.monotonic() - start_monotonic
-                )
-                self._last_reason = "safety_rejected"
-                self._append_telemetry(record)
-                return False
-            command = desired_joints
-            try:
-                self.backend.set_target_head_joint_positions(command)
-            except Exception:
-                self._reset_motion_state()
-                raise
-            self.look_at_guard.commit(
-                command,
-                guard_velocity,
-                guard_acceleration,
-            )
-            self._last_command_path = target_type
-            self._last_command_time = command_time
-            self._last_command = command.copy()
-            self._command_count += 1
-            self._last_reason = "commanded"
-            record["final_command"] = finite_json_value(command)
-            record["actual_joints"] = finite_json_value(current_joints)
-            record["actual_joints_source"] = "present_read_before_command"
-            record["reason"] = "commanded"
-            record["latency"]["processing_duration"] = (
-                time.monotonic() - start_monotonic
-            )
-            self._append_telemetry(record)
-            return True
         finally:
             release_motion_guard()
 
-    def _reset_motion_state(self) -> None:
-        """Reset controller-owned motion state without backend I/O."""
+    def _step_without_target(
+        self,
+        dt: float,
+        *,
+        start_monotonic: float,
+        use_command_elapsed: bool,
+    ) -> bool:
+        """Bring committed command motion to a bounded hold without a target."""
+        self._reset_target_state()
+        if self._last_command is None:
+            self._motion_state = "idle"
+            self._last_reason = "no_fresh_detection"
+            self._append_telemetry(
+                self._new_telemetry_record(
+                    dt=dt,
+                    target_type="none",
+                    reason="no_fresh_detection",
+                    start_monotonic=start_monotonic,
+                )
+            )
+            return False
+
+        release_motion_guard = self._try_acquire_motion_guard()
+        if release_motion_guard is None:
+            self._last_reason = "move_running"
+            self._append_telemetry(
+                self._new_telemetry_record(
+                    dt=dt,
+                    target_type="none",
+                    reason="move_running",
+                    start_monotonic=start_monotonic,
+                )
+            )
+            return False
+
+        try:
+            try:
+                current_joints = _finite_joint_vector(
+                    self.backend.get_present_head_joint_positions(),
+                    length=7,
+                    name="current",
+                )
+            except ValueError:
+                self._reset_motion_state()
+                raise
+            command_time = time.monotonic()
+            command_dt = dt
+            if use_command_elapsed and self._last_command_time is not None:
+                command_dt = command_time - self._last_command_time
+            record = self._new_telemetry_record(
+                dt=command_dt,
+                target_type="none",
+                reason="stopping_no_target",
+                start_monotonic=start_monotonic,
+            )
+            record["monotonic_timestamp"] = command_time
+            record["current_joints"] = finite_json_value(current_joints)
+            command, profile_hits = self.look_at_profile.stop_with_telemetry(
+                current_joints, command_dt
+            )
+            record["profiled_command"] = finite_json_value(command)
+            record["profile_limit_hits"] = profile_hits
+            stationary = self.look_at_profile.stationary
+            return self._write_profiled_command(
+                command=command,
+                current_joints=current_joints,
+                command_dt=command_dt,
+                command_time=command_time,
+                record=record,
+                target_type="none",
+                success_reason=(
+                    "holding_no_target" if stationary else "stopping_no_target"
+                ),
+                motion_state=(
+                    "holding_no_target" if stationary else "stopping_no_target"
+                ),
+                start_monotonic=start_monotonic,
+            )
+        finally:
+            release_motion_guard()
+
+    def _write_profiled_command(
+        self,
+        *,
+        command: npt.NDArray[np.float64],
+        current_joints: npt.NDArray[np.float64],
+        command_dt: float,
+        command_time: float,
+        record: dict[str, Any],
+        target_type: str,
+        success_reason: str,
+        motion_state: str,
+        start_monotonic: float,
+    ) -> bool:
+        """Guard, write, and commit one profile-generated command."""
+        guard_hits, guard_velocity, guard_acceleration, recovery = (
+            self.look_at_guard.check_with_telemetry(
+                command=command,
+                current=current_joints,
+                dt=command_dt,
+            )
+        )
+        record["limit_hits"] = guard_hits
+        record["recovery"] = recovery
+        if guard_hits:
+            self._motion_state = "fault"
+            self._motion_fault = "safety_rejected"
+            record["motion_state"] = self._motion_state
+            record["reason"] = "safety_rejected"
+            record["latency"]["processing_duration"] = (
+                time.monotonic() - start_monotonic
+            )
+            self._last_reason = "safety_rejected"
+            self._append_telemetry(record)
+            return False
+        try:
+            self.backend.set_target_head_joint_positions(command)
+        except Exception:
+            self._reset_motion_state()
+            raise
+        self.look_at_guard.commit(command, guard_velocity, guard_acceleration)
+        self._last_command_path = None if target_type == "none" else target_type
+        self._last_command_time = command_time
+        self._last_command = command.copy()
+        self._command_count += 1
+        self._motion_state = "recovering" if recovery else motion_state
+        reason = "recovering" if recovery else success_reason
+        self._last_reason = reason
+        record["final_command"] = finite_json_value(command)
+        record["actual_joints"] = finite_json_value(current_joints)
+        record["actual_joints_source"] = "present_read_before_command"
+        record["reason"] = reason
+        record["motion_state"] = self._motion_state
+        record["latency"]["processing_duration"] = time.monotonic() - start_monotonic
+        self._append_telemetry(record)
+        return True
+
+    def _reset_target_state(self) -> None:
+        """Clear stale perception state without erasing committed motion."""
         self.filter.reset()
         self.look_at_filter.reset()
-        self.look_at_profile.reset()
-        self.look_at_guard.reset()
-        self.limiter.reset()
         self._look_at_reference_pose = None
+        self._detection_reference_pose = None
         self._processed_detection = None
         self._detection_target_cache = None
         self._last_command_path = None
+
+    def _hold_committed_motion(self) -> None:
+        """Retain the last backend command as a stationary motion anchor."""
+        if self._last_command is None:
+            self._reset_motion_state()
+            return
+        self._reset_target_state()
+        self.look_at_profile.hold(self._last_command)
+        self.look_at_guard.reset(self._last_command)
+        self.limiter.reset()
         self._last_command_time = None
+        self._motion_state = "holding_no_target"
+        self._motion_fault = None
+
+    def _reset_motion_state(self) -> None:
+        """Reset controller-owned motion state without backend I/O."""
+        self._reset_target_state()
+        self.look_at_profile.reset()
+        self.look_at_guard.reset()
+        self.limiter.reset()
+        self._last_command_time = None
+        self._last_command = None
+        self._motion_state = "idle"
+        self._motion_fault = None
 
     def _look_at_target_from_detection(
         self,

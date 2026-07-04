@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 os.environ.setdefault("MUJOCO_GL", "egl")
-pytest.importorskip("mujoco")
+mujoco = pytest.importorskip("mujoco")
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "examples"))
 
@@ -20,6 +20,10 @@ from mujoco_red_target_tracking import (  # noqa: E402
     MujocoRedTargetHarness,
     run_orbit_sweep,
     run_scenario,
+)
+
+from reachy_mini.daemon.tracking.visual_servo import (  # noqa: E402
+    TrackingLookAtTarget,
 )
 
 
@@ -137,6 +141,45 @@ def test_marker_loss_freezes_absolute_target_without_drift() -> None:
         assert harness.last_reference_update.reason == "no_observation"
         assert harness.guard_hits == 0
         assert harness.profile_position_hits == 0
+    finally:
+        harness.close()
+
+
+def test_mujoco_target_gap_preserves_command_motion_state() -> None:
+    harness = MujocoRedTargetHarness()
+    harness.set_marker_orbit(math.atan2(0.2, 0.5), 0.0)
+    try:
+        for tick in range(12):
+            if tick % SENSOR_TICKS == 0:
+                assert harness.observe(CONTROL_DT * SENSOR_TICKS) is not None
+            harness.step()
+
+        target = harness.reference.target
+        harness.servo.submit_look_at(
+            TrackingLookAtTarget(
+                x=target.x,
+                y=target.y,
+                z=target.z,
+                timestamp=0.0,
+            )
+        )
+        gap_reasons = []
+        for _ in range(6):
+            assert harness.servo.step(dt=CONTROL_DT)
+            record = harness.servo.telemetry.latest()
+            assert record is not None
+            gap_reasons.append(record["reason"])
+            assert harness.backend.target_head_joint_positions is not None
+            harness.backend.data.ctrl[:7] = harness.backend.target_head_joint_positions
+            for _ in range(round(CONTROL_DT / harness.backend.model.opt.timestep)):
+                mujoco.mj_step(harness.backend.model, harness.backend.data)
+            harness._refresh_backend_state()
+
+        resumed = harness.step()
+
+        assert set(gap_reasons) <= {"stopping_no_target", "holding_no_target"}
+        assert resumed["reason"] == "commanded"
+        assert resumed["limit_hits"] == []
     finally:
         harness.close()
 

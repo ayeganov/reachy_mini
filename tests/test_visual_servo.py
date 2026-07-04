@@ -484,6 +484,10 @@ def test_visual_servo_rejects_unsafe_profiled_body_yaw_without_writing() -> None
         "acceleration",
         "jerk",
     }
+    assert controller.status()["motion_state"] == "fault"
+    retained_records = len(controller.telemetry.query()["records"])
+    assert not controller.step(dt=0.02)
+    assert len(controller.telemetry.query()["records"]) == retained_records
 
 
 def test_visual_servo_profile_fields_are_empty_without_profile_update() -> None:
@@ -534,31 +538,35 @@ def test_visual_servo_profile_fields_are_empty_without_profile_update() -> None:
     assert all(record["profile_limit_hits"] == [] for record in records)
 
 
-def test_visual_servo_look_at_ik_failure_resets_guard_unseeded_and_recovers() -> None:
+def test_visual_servo_look_at_ik_failure_stops_motion_and_recovers() -> None:
     backend = _MotionTestBackend()
     controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
     assert controller.step(dt=0.02)
+    command_count = len(backend.commands)
     backend.current = np.full(7, 0.1)
     backend.head_kinematics.joints = np.full(7, np.nan)
 
-    assert not controller.step(dt=0.02)
+    assert controller.step(dt=0.02)
 
-    assert controller.look_at_profile._position is None
-    assert controller.look_at_guard._last_command is None
-    np.testing.assert_allclose(controller.look_at_guard._velocity, 0.0)
-    np.testing.assert_allclose(controller.look_at_guard._acceleration, 0.0)
+    assert len(backend.commands) == command_count + 1
+    assert controller.look_at_profile._position is not None
+    assert controller.look_at_guard._last_command is not None
     assert controller.limiter._last_command is None
     assert controller._last_command_path is None
+    record = controller.telemetry.query()["records"][-1]
+    assert record["ik_failed"] is True
+    assert record["reason"] in {"stopping_ik_failed", "holding_ik_failed"}
 
     backend.current[0] += 0.00153398
     backend.head_kinematics.joints = backend.current.copy()
     assert controller.step(dt=0.02)
-    np.testing.assert_array_equal(backend.commands[-1], backend.current)
-    assert controller.telemetry.query()["records"][-1]["reason"] == "commanded"
+    recovered = controller.telemetry.query()["records"][-1]
+    assert recovered["reason"] == "commanded"
+    assert recovered["limit_hits"] == []
 
 
-def test_visual_servo_no_target_gap_clears_look_at_motion_state() -> None:
+def test_visual_servo_no_target_gap_preserves_look_at_motion_state() -> None:
     backend = _MotionTestBackend()
     controller = VisualServoController(
         backend=backend,  # type: ignore[arg-type]
@@ -569,12 +577,75 @@ def test_visual_servo_no_target_gap_clears_look_at_motion_state() -> None:
     reads = (backend.joint_reads, backend.pose_reads)
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0, timestamp=0.0))
 
-    assert not controller.step(dt=0.02)
+    assert controller.step(dt=0.02)
 
-    assert controller.look_at_profile._position is None
-    assert controller.look_at_guard._last_command is None
+    assert controller.look_at_profile._position is not None
+    assert controller.look_at_guard._last_command is not None
     assert controller._last_command_path is None
-    assert (backend.joint_reads, backend.pose_reads) == reads
+    assert backend.joint_reads == reads[0] + 1
+    assert backend.pose_reads == reads[1]
+    assert controller.telemetry.query()["records"][-1]["reason"] in {
+        "stopping_no_target",
+        "holding_no_target",
+    }
+
+
+def test_visual_servo_recovers_after_hardware_boundary_dropout() -> None:
+    config = _acceptance_profile_config()
+    config.max_detection_age = 0.01
+    desired = np.zeros(7)
+    desired[6] = -0.8
+    backend = _MotionTestBackend(desired)
+    controller = VisualServoController(
+        backend=backend,
+        config=config,  # type: ignore[arg-type]
+    )
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+    assert controller.step(dt=0.02)
+    commands_before_gap = len(backend.commands)
+
+    backend.current[6] = -1.227184630308513
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0, timestamp=0.0))
+    assert controller.step(dt=0.02)
+    assert len(backend.commands) == commands_before_gap + 1
+
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+    for _ in range(20):
+        assert controller.step(dt=0.02)
+        backend.current = backend.commands[-1].copy()
+
+    records = controller.telemetry.query(limit=100)["records"]
+    assert not any(record["reason"] == "safety_rejected" for record in records)
+    for command in backend.commands:
+        assert np.all(command >= controller.look_at_guard.limits[:, 0])
+        assert np.all(command <= controller.look_at_guard.limits[:, 1])
+
+
+def test_visual_servo_commits_monotonic_soft_boundary_recovery() -> None:
+    config = _acceptance_profile_config()
+    desired = np.zeros(7)
+    desired[6] = -0.8
+    backend = _MotionTestBackend(desired)
+    backend.current[6] = -1.227184630308513
+    controller = VisualServoController(
+        backend=backend,
+        config=config,  # type: ignore[arg-type]
+    )
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+    violations = []
+
+    for _ in range(30):
+        assert controller.step(dt=0.02)
+        record = controller.telemetry.query()["records"][-1]
+        if record["recovery"]:
+            recovery = record["recovery"][0]
+            assert recovery["violation_after"] < recovery["violation_before"]
+            violations.append(recovery["violation_after"])
+        backend.current = backend.commands[-1].copy()
+
+    assert violations
+    assert violations == sorted(violations, reverse=True)
+    assert controller.telemetry.query()["records"][-1]["reason"] == "commanded"
 
 
 def test_visual_servo_detection_reuses_look_at_profile_after_look_at() -> None:
@@ -657,6 +728,23 @@ def test_visual_servo_resets_without_io_after_a_control_stall() -> None:
     record = controller.telemetry.query()["records"][0]
     assert record["reason"] == "control_stall"
     assert record["dt"] == 0.041
+
+
+def test_visual_servo_control_stall_preserves_committed_command_anchor() -> None:
+    backend = _MotionTestBackend()
+    controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+    assert controller.step(dt=0.02)
+    committed = backend.commands[-1].copy()
+    command_count = len(backend.commands)
+
+    assert not controller.step(dt=0.041)
+
+    np.testing.assert_array_equal(controller.look_at_profile._position, committed[1:])
+    np.testing.assert_array_equal(controller.look_at_guard._last_command, committed)
+    assert controller.look_at_profile.stationary
+    assert len(backend.commands) == command_count
+    assert controller.status()["motion_state"] == "holding_no_target"
 
 
 def test_visual_servo_look_at_commands_obey_elapsed_time_limits_under_jitter() -> None:
@@ -1316,7 +1404,7 @@ def test_visual_servo_3d_look_at_keeps_fixed_reference_origin() -> None:
     )
 
 
-def test_visual_servo_detection_keeps_fixed_reference_across_target_gap() -> None:
+def test_visual_servo_detection_refreshes_reference_across_target_gap() -> None:
     class FakeKinematics:
         def __init__(self) -> None:
             self.poses: list[np.ndarray] = []
@@ -1355,14 +1443,14 @@ def test_visual_servo_detection_keeps_fixed_reference_across_target_gap() -> Non
     controller.submit(TrackingDetection(u=640.0, v=360.0, frame_id=0))
     assert controller.step(dt=0.02)
     controller.submit(TrackingDetection(u=640.0, v=360.0, frame_id=1, timestamp=0.0))
-    assert not controller.step(dt=0.02)
+    assert controller.step(dt=0.02)
     controller.submit(TrackingDetection(u=640.0, v=360.0, frame_id=1))
     assert controller.step(dt=0.02)
 
     assert len(backend.head_kinematics.poses) == 2
     np.testing.assert_allclose(
         backend.head_kinematics.poses[1][:3, 3],
-        backend.head_kinematics.poses[0][:3, 3],
+        np.array([0.05, -0.02, 0.03]),
         atol=1e-12,
     )
     np.testing.assert_allclose(
