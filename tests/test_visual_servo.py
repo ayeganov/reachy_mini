@@ -180,6 +180,73 @@ def test_joint_command_safety_guard_ignores_only_numerical_limit_noise() -> None
     assert any(hit["kind"] == "jerk" for hit in hits_for_jerk(8.00002))
 
 
+def test_joint_command_safety_guard_accepts_inward_recovery_band_progress() -> None:
+    config = _acceptance_profile_config()
+    guard = JointCommandSafetyGuard(config=config)
+    current = np.zeros(7)
+    current[6] = -1.227184630308513
+    command = current.copy()
+    command[6] += config.max_joint_jerk * 0.02**3
+
+    hits, _velocity, _acceleration, recovery = guard.check_with_telemetry(
+        command, current, 0.02
+    )
+
+    assert hits == []
+    assert recovery == [
+        {
+            "joint_index": 6,
+            "kind": "lower",
+            "hard_limit": pytest.approx(guard.limits[6, 0]),
+            "soft_limit": pytest.approx(
+                guard.limits[6, 0] + config.joint_safety_margin
+            ),
+            "reference": pytest.approx(current[6]),
+            "command": pytest.approx(command[6]),
+            "violation_before": pytest.approx(
+                guard.limits[6, 0] + config.joint_safety_margin - current[6]
+            ),
+            "violation_after": pytest.approx(
+                guard.limits[6, 0] + config.joint_safety_margin - command[6]
+            ),
+        }
+    ]
+
+
+def test_joint_command_safety_guard_rejects_invalid_recovery_band_motion() -> None:
+    config = VisualServoConfig(
+        joint_safety_margin=0.1745329252,
+        max_joint_velocity=100.0,
+        max_joint_acceleration=100.0,
+        max_joint_jerk=100.0,
+    )
+    current = np.zeros(7)
+    current[6] = -1.227184630308513
+    lower_hard = JointCommandSafetyGuard(config=config).limits[6, 0]
+    lower_soft = lower_hard + config.joint_safety_margin
+
+    cases = (
+        (current, np.array([*current[:6], current[6] - 0.0001]), "recovery_outward"),
+        (
+            np.zeros(7),
+            np.array([*([0.0] * 6), lower_soft - 0.0001]),
+            "lower_position",
+        ),
+        (
+            current,
+            np.array([*current[:6], lower_hard - 0.0001]),
+            "lower_hard_position",
+        ),
+    )
+
+    for reference, command, expected_kind in cases:
+        guard = JointCommandSafetyGuard(config=config)
+        hits, _velocity, _acceleration, _recovery = guard.check_with_telemetry(
+            command, reference, 0.02
+        )
+        assert expected_kind in {hit["kind"] for hit in hits}
+
+
 def test_look_at_joint_profile_reset_clears_motion_state() -> None:
     profile = LookAtJointCommandProfile(config=_acceptance_profile_config())
     profile.update_with_telemetry(np.array([0.0, *([0.3] * 6)]), np.zeros(7), dt=0.02)

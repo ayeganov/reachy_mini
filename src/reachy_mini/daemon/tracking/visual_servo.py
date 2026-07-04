@@ -667,6 +667,23 @@ class JointCommandSafetyGuard:
         npt.NDArray[np.float64],
     ]:
         """Return violations and derivative state without changing the command."""
+        hits, velocity, acceleration, _recovery = self.check_with_telemetry(
+            command, current, dt
+        )
+        return hits, velocity, acceleration
+
+    def check_with_telemetry(
+        self,
+        command: npt.NDArray[np.float64],
+        current: npt.NDArray[np.float64],
+        dt: float,
+    ) -> tuple[
+        list[dict[str, float | int | str]],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        list[dict[str, float | int | str]],
+    ]:
+        """Return violations, derivative state, and inward recovery progress."""
         if not np.isfinite(dt) or dt <= 0.0:
             raise ValueError("dt must be finite and positive")
         command_vector = _finite_joint_vector(command, length=7, name="command")
@@ -676,30 +693,133 @@ class JointCommandSafetyGuard:
         acceleration = (velocity - self._velocity) / dt
         jerk = (acceleration - self._acceleration) / dt
         margin = self.config.joint_safety_margin
-        lower = self.limits[:, 0] + margin
-        upper = self.limits[:, 1] - margin
+        hard_lower = self.limits[:, 0]
+        hard_upper = self.limits[:, 1]
+        soft_lower = hard_lower + margin
+        soft_upper = hard_upper - margin
         position_tolerance = 1e-9
         hits: list[dict[str, float | int | str]] = []
+        recovery: list[dict[str, float | int | str]] = []
+
+        reference_violation = np.maximum(soft_lower - reference, 0.0) + np.maximum(
+            reference - soft_upper, 0.0
+        )
+        command_violation = np.maximum(soft_lower - command_vector, 0.0) + np.maximum(
+            command_vector - soft_upper, 0.0
+        )
 
         for index, value in enumerate(command_vector):
-            if value < lower[index] - position_tolerance:
+            if reference[index] < hard_lower[index] - position_tolerance:
                 hits.append(
                     {
                         "joint_index": index,
-                        "kind": "lower_position",
-                        "value": float(value),
-                        "limit": float(lower[index]),
+                        "kind": "reference_lower_hard_position",
+                        "value": float(reference[index]),
+                        "limit": float(hard_lower[index]),
                     }
                 )
-            if value > upper[index] + position_tolerance:
+            if reference[index] > hard_upper[index] + position_tolerance:
                 hits.append(
                     {
                         "joint_index": index,
-                        "kind": "upper_position",
-                        "value": float(value),
-                        "limit": float(upper[index]),
+                        "kind": "reference_upper_hard_position",
+                        "value": float(reference[index]),
+                        "limit": float(hard_upper[index]),
                     }
                 )
+            if value < hard_lower[index] - position_tolerance:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "lower_hard_position",
+                        "value": float(value),
+                        "limit": float(hard_lower[index]),
+                    }
+                )
+                continue
+            if value > hard_upper[index] + position_tolerance:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "upper_hard_position",
+                        "value": float(value),
+                        "limit": float(hard_upper[index]),
+                    }
+                )
+                continue
+            if command_violation[index] <= position_tolerance:
+                continue
+            if reference_violation[index] <= position_tolerance:
+                kind = (
+                    "lower_position" if value < soft_lower[index] else "upper_position"
+                )
+                limit = (
+                    soft_lower[index]
+                    if value < soft_lower[index]
+                    else soft_upper[index]
+                )
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": kind,
+                        "value": float(value),
+                        "limit": float(limit),
+                    }
+                )
+                continue
+            if (
+                command_violation[index]
+                > reference_violation[index] + position_tolerance
+            ):
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "recovery_outward",
+                        "value": float(command_violation[index]),
+                        "limit": float(reference_violation[index]),
+                    }
+                )
+
+        has_position_hit = any(
+            "position" in str(hit["kind"]) or hit["kind"] == "recovery_outward"
+            for hit in hits
+        )
+        if (
+            bool(np.any(command_violation > position_tolerance))
+            and not has_position_hit
+        ):
+            if float(np.sum(command_violation)) >= (
+                float(np.sum(reference_violation)) - position_tolerance
+            ):
+                hits.append(
+                    {
+                        "joint_index": -1,
+                        "kind": "recovery_no_progress",
+                        "value": float(np.sum(command_violation)),
+                        "limit": float(np.sum(reference_violation)),
+                    }
+                )
+            else:
+                for index in np.flatnonzero(
+                    command_violation > position_tolerance
+                ).tolist():
+                    below = command_vector[index] < soft_lower[index]
+                    recovery.append(
+                        {
+                            "joint_index": int(index),
+                            "kind": "lower" if below else "upper",
+                            "hard_limit": float(
+                                hard_lower[index] if below else hard_upper[index]
+                            ),
+                            "soft_limit": float(
+                                soft_lower[index] if below else soft_upper[index]
+                            ),
+                            "reference": float(reference[index]),
+                            "command": float(command_vector[index]),
+                            "violation_before": float(reference_violation[index]),
+                            "violation_after": float(command_violation[index]),
+                        }
+                    )
 
         for kind, values, limit in (
             ("velocity", velocity, self.config.max_joint_velocity),
@@ -717,7 +837,7 @@ class JointCommandSafetyGuard:
                             "limit": float(limit),
                         }
                     )
-        return hits, velocity, acceleration
+        return hits, velocity, acceleration, recovery
 
     def commit(
         self,
