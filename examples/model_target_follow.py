@@ -32,15 +32,6 @@ from detection_visualization import (
     DEFAULT_VISUALIZATION_ENDPOINT,
     DetectionVisualizationPublisher,
 )
-from model_detectors import (
-    Detector,
-    ImageDetection,
-    available_models,
-    create_detector,
-    normalize_target,
-    select_detection,
-    supported_targets_for_model,
-)
 from websockets.sync.client import ClientConnection, connect
 from yellow_box_follow import (
     APPROVED_TRACKING_CONFIG,
@@ -49,6 +40,15 @@ from yellow_box_follow import (
     _return_neutral,
 )
 
+from reachy_mini.attention.detectors import (
+    Detector,
+    ImageDetection,
+    available_models,
+    create_detector,
+    normalize_target,
+    select_detection,
+    supported_targets_for_model,
+)
 from reachy_mini.daemon.tracking.telemetry import dump_jsonl, summarize_records
 from reachy_mini.media.receivers.zeromq_client import (
     ZeroMQClient,

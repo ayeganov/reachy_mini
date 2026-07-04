@@ -1,4 +1,4 @@
-"""Optional model adapters for the host-side target-following example."""
+"""Model adapters for host-side visual attention."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from typing import Any, Protocol, cast
 import cv2
 import numpy as np
 import numpy.typing as npt
-from yellow_box_follow import YellowBoxDetectorConfig, detect_yellow_box
 
 Frame = npt.NDArray[np.uint8]
 
@@ -92,40 +91,6 @@ def _validate_request(
 def _validate_frame(frame_bgr: Frame) -> None:
     if frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3 or frame_bgr.size == 0:
         raise ValueError("frame must be a non-empty BGR image")
-
-
-class YellowDetector:
-    """Adapter around the approved yellow-box detector."""
-
-    supported_targets = frozenset({"yellow"})
-
-    def __init__(self) -> None:
-        """Use the exact approved yellow detector configuration."""
-        self.config = YellowBoxDetectorConfig()
-
-    def detect(
-        self,
-        frame_bgr: Frame,
-        *,
-        target: str,
-        min_confidence: float,
-    ) -> list[ImageDetection]:
-        """Convert the approved detector result to the common box contract."""
-        _validate_request(target, min_confidence, self.supported_targets)
-        detection, _mask = detect_yellow_box(frame_bgr, self.config)
-        if detection is None:
-            return []
-        x, y, width, height = detection.bounding_box
-        return [
-            ImageDetection(
-                x1=float(x),
-                y1=float(y),
-                x2=float(x + width),
-                y2=float(y + height),
-                confidence=1.0,
-                label="yellow",
-            )
-        ]
 
 
 class YoloFaceDetector:
@@ -298,7 +263,6 @@ class RfDetrDetector:
 
 
 MODEL_DESCRIPTIONS = {
-    "yellow": "approved HSV yellow reference detector",
     "yolo-face": "YOLO face detector",
     "rfdetr-nano": "RF-DETR Nano COCO detector",
     "rfdetr-large": "RF-DETR Large COCO detector",
@@ -313,8 +277,6 @@ def available_models() -> dict[str, str]:
 
 def supported_targets_for_model(model_name: str) -> frozenset[str] | None:
     """Return fixed labels, or None for open-vocabulary models."""
-    if model_name == "yellow":
-        return YellowDetector.supported_targets
     if model_name == "yolo-face":
         return YoloFaceDetector.supported_targets
     if model_name in {"rfdetr-nano", "rfdetr-large"}:
@@ -333,10 +295,6 @@ def create_detector(
     optimize: bool = False,
 ) -> Detector:
     """Create one detector from the built-in registry."""
-    if model_name == "yellow":
-        if weights is not None:
-            raise ValueError("the yellow detector does not accept model weights")
-        return YellowDetector()
     if model_name == "yolo-face":
         if weights is None:
             raise ValueError("--weights is required for yolo-face")

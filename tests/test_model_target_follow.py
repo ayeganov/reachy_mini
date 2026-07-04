@@ -6,24 +6,11 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import cv2
 import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "examples"))
 
-from model_detectors import (  # noqa: E402
-    ImageDetection,
-    RfDetrDetector,
-    YellowDetector,
-    YoloEDetector,
-    YoloFaceDetector,
-    available_models,
-    create_detector,
-    normalize_target,
-    select_detection,
-    supported_targets_for_model,
-)
 from model_target_follow import (  # noqa: E402
     _establish_neutral_start,
     _finish_tracking,
@@ -32,6 +19,18 @@ from model_target_follow import (  # noqa: E402
     detection_payload,
     latency_summary,
     mode_banner,
+)
+
+from reachy_mini.attention.detectors import (
+    ImageDetection,
+    RfDetrDetector,
+    YoloEDetector,
+    YoloFaceDetector,
+    available_models,
+    create_detector,
+    normalize_target,
+    select_detection,
+    supported_targets_for_model,
 )
 
 
@@ -81,16 +80,6 @@ def test_image_detection_rejects_invalid_values(kwargs: dict[str, object]) -> No
 
 def test_normalize_target_accepts_cli_spelling() -> None:
     assert normalize_target("  CELL_phone ") == "cell phone"
-
-
-def test_yellow_adapter_reuses_approved_detector() -> None:
-    frame = np.zeros((200, 300, 3), dtype=np.uint8)
-    cv2.rectangle(frame, (40, 30), (100, 70), (0, 255, 255), -1)
-
-    results = YellowDetector().detect(frame, target="yellow", min_confidence=0.5)
-
-    assert len(results) == 1
-    assert results[0].centroid == pytest.approx((70.5, 50.5), abs=1.0)
 
 
 @pytest.mark.parametrize(
@@ -216,7 +205,6 @@ def test_rfdetr_adapter_filters_requested_target() -> None:
 
 def test_registry_exposes_models_without_loading_weights() -> None:
     assert set(available_models()) == {
-        "yellow",
         "yolo-face",
         "rfdetr-nano",
         "rfdetr-large",
@@ -224,7 +212,6 @@ def test_registry_exposes_models_without_loading_weights() -> None:
     }
     assert supported_targets_for_model("yolo-face") == frozenset({"face"})
     assert supported_targets_for_model("yoloe-26x") is None
-    assert isinstance(create_detector("yellow"), YellowDetector)
 
 
 def test_registry_requires_face_weights() -> None:
@@ -235,14 +222,6 @@ def test_registry_requires_face_weights() -> None:
 def test_explicit_missing_model_weights_are_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="model weights do not exist"):
         create_detector("rfdetr-nano", weights=tmp_path / "missing.pth")
-
-
-def test_yellow_detector_rejects_model_weights(tmp_path: Path) -> None:
-    weights = tmp_path / "unused.pth"
-    weights.touch()
-
-    with pytest.raises(ValueError, match="does not accept model weights"):
-        create_detector("yellow", weights=weights)
 
 
 def test_detection_payload_contains_only_current_centroid() -> None:
