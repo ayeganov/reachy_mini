@@ -7,6 +7,11 @@ import pytest
 from scipy.spatial.transform import Rotation as R
 
 from reachy_mini.daemon.tracking import visual_servo as visual_servo_module
+from reachy_mini.daemon.tracking.config import VisualServoConfig
+from reachy_mini.daemon.tracking.joint_motion import (
+    JointCommandSafetyGuard,
+    LookAtJointCommandProfile,
+)
 from reachy_mini.daemon.tracking.telemetry import (
     VisualServoTelemetryBuffer,
     dump_jsonl,
@@ -16,14 +21,10 @@ from reachy_mini.daemon.tracking.telemetry import (
 )
 from reachy_mini.daemon.tracking.visual_servo import (
     DetectionBuffer,
-    JointCommandLimiter,
-    JointCommandSafetyGuard,
-    LookAtJointCommandProfile,
     LookAtTargetFilter,
     PixelTargetFilter,
     TrackingDetection,
     TrackingLookAtTarget,
-    VisualServoConfig,
     VisualServoController,
 )
 
@@ -128,14 +129,18 @@ def test_look_at_joint_profile_stops_bounded_motion_in_both_directions(
 
     for _ in range(15):
         command, _hits = profile.update_with_telemetry(desired, current, 0.02)
-        guard_hits, velocity, acceleration = guard.check(command, current, 0.02)
+        guard_hits, velocity, acceleration, _recovery = guard.check_with_telemetry(
+            command, current, 0.02
+        )
         assert guard_hits == []
         guard.commit(command, velocity, acceleration)
         current = command
 
     for _ in range(100):
         command, _hits = profile.stop_with_telemetry(current, 0.02)
-        guard_hits, velocity, acceleration = guard.check(command, current, 0.02)
+        guard_hits, velocity, acceleration, _recovery = guard.check_with_telemetry(
+            command, current, 0.02
+        )
         assert guard_hits == []
         guard.commit(command, velocity, acceleration)
         current = command
@@ -163,7 +168,9 @@ def test_look_at_joint_profile_preserves_boundary_on_abrupt_reversals() -> None:
         hold_ticks -= 1
         dt = float(random.uniform(0.017, 0.026))
         command, profile_hits = profile.update_with_telemetry(desired, current, dt)
-        guard_hits, next_velocity, next_acceleration = guard.check(command, current, dt)
+        guard_hits, next_velocity, next_acceleration, _recovery = (
+            guard.check_with_telemetry(command, current, dt)
+        )
 
         assert lower <= command[3] <= upper
         assert not any(hit.get("source") == "profile_position" for hit in profile_hits)
@@ -202,7 +209,9 @@ def test_joint_command_safety_guard_ignores_only_numerical_limit_noise() -> None
 
     def hits_for_jerk(jerk: float) -> list[dict[str, float | int | str]]:
         command = np.full(7, jerk * dt**3)
-        hits, _velocity, _acceleration = guard.check(command, np.zeros(7), dt)
+        hits, _velocity, _acceleration, _recovery = guard.check_with_telemetry(
+            command, np.zeros(7), dt
+        )
         return hits
 
     assert not any(hit["kind"] == "jerk" for hit in hits_for_jerk(8.00000245))
@@ -283,9 +292,6 @@ def test_look_at_joint_profile_reset_clears_motion_state() -> None:
     profile.reset()
 
     assert profile._position is None
-    assert profile._body_yaw_position is None
-    assert profile._body_yaw_velocity == 0.0
-    assert profile._body_yaw_acceleration == 0.0
     np.testing.assert_allclose(profile._velocity, 0.0)
     np.testing.assert_allclose(profile._acceleration, 0.0)
 
@@ -298,9 +304,6 @@ def test_look_at_joint_profile_rejects_invalid_inputs_without_state_mutation() -
         profile._position.copy(),  # type: ignore[union-attr]
         profile._velocity.copy(),
         profile._acceleration.copy(),
-        profile._body_yaw_position,
-        profile._body_yaw_velocity,
-        profile._body_yaw_acceleration,
     )
     invalid_calls = [
         (desired, np.zeros(7), 0.0),
@@ -319,9 +322,6 @@ def test_look_at_joint_profile_rejects_invalid_inputs_without_state_mutation() -
         np.testing.assert_array_equal(profile._position, state[0])
         np.testing.assert_array_equal(profile._velocity, state[1])
         np.testing.assert_array_equal(profile._acceleration, state[2])
-        assert profile._body_yaw_position == state[3]
-        assert profile._body_yaw_velocity == state[4]
-        assert profile._body_yaw_acceleration == state[5]
 
     for response_hz in (0.0, -1.0, 5.1, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="look_at_profile_response_hz"):
@@ -586,7 +586,6 @@ def test_visual_servo_look_at_ik_failure_stops_motion_and_recovers() -> None:
     assert len(backend.commands) == command_count + 1
     assert controller.look_at_profile._position is not None
     assert controller.look_at_guard._last_command is not None
-    assert controller.limiter._last_command is None
     assert controller._last_command_path is None
     record = controller.telemetry.query()["records"][-1]
     assert record["ik_failed"] is True
@@ -690,42 +689,13 @@ def test_visual_servo_detection_reuses_look_at_profile_after_look_at() -> None:
     )
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
     assert controller.step(dt=0.02)
-    assert controller.limiter._last_command is None
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0, timestamp=0.0))
     controller.submit(TrackingDetection(u=10.0, v=10.0))
 
     assert controller.step(dt=0.02)
     assert controller.look_at_profile._position is not None
     assert controller.look_at_guard._last_command is not None
-    assert controller.limiter._last_command is None
     assert controller._last_command_path == "detection"
-
-
-def test_joint_command_limiter_rejects_invalid_inputs_without_state_mutation() -> None:
-    limiter = JointCommandLimiter(limits=np.array([[-1.0, 1.0]]))
-    invalid_calls = [
-        (np.zeros(1), np.zeros(1), 0.0),
-        (np.zeros(1), np.zeros(1), -0.1),
-        (np.zeros(1), np.zeros(1), float("nan")),
-        (np.zeros(1), np.zeros(1), float("inf")),
-        (np.zeros(2), np.zeros(1), 0.02),
-        (np.zeros(1), np.zeros(2), 0.02),
-        (np.array([np.nan]), np.zeros(1), 0.02),
-        (np.zeros(1), np.array([np.inf]), 0.02),
-    ]
-
-    for desired, current, dt in invalid_calls:
-        with pytest.raises(ValueError):
-            limiter.limit_with_telemetry(desired, current, dt)
-        assert limiter._last_command is None
-        np.testing.assert_allclose(limiter._velocity, 0.0)
-        np.testing.assert_allclose(limiter._acceleration, 0.0)
-
-    command = limiter.limit(np.array([0.5]), np.array([0.25]), dt=0.02)
-    fresh_command = JointCommandLimiter(limits=np.array([[-1.0, 1.0]])).limit(
-        np.array([0.5]), np.array([0.25]), dt=0.02
-    )
-    np.testing.assert_array_equal(command, fresh_command)
 
 
 def test_visual_servo_rejects_invalid_dt_before_backend_reads() -> None:
@@ -745,16 +715,14 @@ def test_visual_servo_rejects_invalid_dt_before_backend_reads() -> None:
 def test_visual_servo_resets_without_io_after_a_control_stall() -> None:
     backend = _MotionTestBackend()
     controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
-    controller.look_at_profile._position = np.ones(6)
+    controller.look_at_profile._position = np.ones(7)
     controller.look_at_guard._last_command = np.ones(7)
-    controller.limiter._last_command = np.ones(7)
     controller._last_command_path = "look_at"
 
     assert not controller.step(dt=0.041)
 
     assert controller.look_at_profile._position is None
     assert controller.look_at_guard._last_command is None
-    assert controller.limiter._last_command is None
     assert controller._last_command_path is None
     assert backend.joint_reads == 0
     assert backend.pose_reads == 0
@@ -774,7 +742,7 @@ def test_visual_servo_control_stall_preserves_committed_command_anchor() -> None
 
     assert not controller.step(dt=0.041)
 
-    np.testing.assert_array_equal(controller.look_at_profile._position, committed[1:])
+    np.testing.assert_array_equal(controller.look_at_profile._position, committed)
     np.testing.assert_array_equal(controller.look_at_guard._last_command, committed)
     assert controller.look_at_profile.stationary
     assert len(backend.commands) == command_count
@@ -913,7 +881,6 @@ def test_visual_servo_backend_write_failure_resets_state_and_recovers() -> None:
         controller.step(dt=0.02)
     assert controller.look_at_profile._position is None
     assert controller.look_at_guard._last_command is None
-    assert controller.limiter._last_command is None
     assert controller._last_command_path is None
 
     backend.current = np.full(7, 0.4)
@@ -941,7 +908,6 @@ def test_visual_servo_detection_backend_write_failure_resets_profile_and_recover
         controller.step(dt=0.02)
     assert controller.look_at_profile._position is None
     assert controller.look_at_guard._last_command is None
-    assert controller.limiter._last_command is None
     assert controller._last_command_path is None
 
     backend.current = np.full(7, 0.4)
@@ -965,7 +931,6 @@ def test_visual_servo_non_finite_current_joints_fail_closed_and_recover() -> Non
     assert backend.commands == []
     assert controller.look_at_profile._position is None
     assert controller.look_at_guard._last_command is None
-    assert controller.limiter._last_command is None
 
     backend.current = np.full(7, 0.3)
     assert controller.step(dt=0.02)
@@ -990,26 +955,22 @@ def test_visual_servo_start_and_stop_reset_motion_state(
 
     backend = _MotionTestBackend()
     controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
-    controller.look_at_profile._position = np.ones(6)
+    controller.look_at_profile._position = np.ones(7)
     controller.look_at_guard._last_command = np.ones(7)
-    controller.limiter._last_command = np.ones(7)
     controller._last_command_path = "look_at"
     monkeypatch.setattr(visual_servo_module.threading, "Thread", ControlledThread)
 
     controller.start()
     assert controller.look_at_profile._position is None
     assert controller.look_at_guard._last_command is None
-    assert controller.limiter._last_command is None
     assert controller._last_command_path is None
 
-    controller.look_at_profile._position = np.ones(6)
+    controller.look_at_profile._position = np.ones(7)
     controller.look_at_guard._last_command = np.ones(7)
-    controller.limiter._last_command = np.ones(7)
     controller._last_command_path = "look_at"
     controller.stop()
     assert controller.look_at_profile._position is None
     assert controller.look_at_guard._last_command is None
-    assert controller.limiter._last_command is None
     assert controller._last_command_path is None
     assert backend.joint_reads == 0
     assert backend.pose_reads == 0
@@ -1024,16 +985,14 @@ def test_visual_servo_start_and_stop_reset_motion_state(
 
     timed_out = VisualServoController(backend=backend)  # type: ignore[arg-type]
     timed_out._thread = StuckThread()  # type: ignore[assignment]
-    timed_out.look_at_profile._position = np.ones(6)
+    timed_out.look_at_profile._position = np.ones(7)
     timed_out.look_at_guard._last_command = np.ones(7)
-    timed_out.limiter._last_command = np.ones(7)
     timed_out._last_command_path = "look_at"
 
     timed_out.stop()
 
-    np.testing.assert_array_equal(timed_out.look_at_profile._position, np.ones(6))
+    np.testing.assert_array_equal(timed_out.look_at_profile._position, np.ones(7))
     np.testing.assert_array_equal(timed_out.look_at_guard._last_command, np.ones(7))
-    np.testing.assert_array_equal(timed_out.limiter._last_command, np.ones(7))
     assert timed_out._last_command_path == "look_at"
 
 
@@ -1072,104 +1031,6 @@ def test_detection_buffer_rejects_stale_and_low_confidence_detection() -> None:
     )
 
     assert buffer.fresh(config=config, now=now) is None
-
-
-def test_joint_command_limiter_clamps_to_safe_limits() -> None:
-    limits = np.array([[-0.5, 0.5], [-1.0, 1.0]], dtype=np.float64)
-    config = VisualServoConfig(
-        joint_safety_margin=0.1,
-        max_joint_velocity=1e9,
-        max_joint_acceleration=1e9,
-        max_joint_jerk=1e9,
-    )
-    limiter = JointCommandLimiter(limits=limits, config=config)
-
-    command = limiter.limit(
-        desired=np.array([10.0, -10.0]),
-        current=np.array([0.0, 0.0]),
-        dt=0.02,
-    )
-
-    np.testing.assert_allclose(command, np.array([0.4, -0.9]))
-
-
-def test_joint_command_limiter_rejects_invalid_limit_shape() -> None:
-    with np.testing.assert_raises(ValueError):
-        JointCommandLimiter(limits=np.array([1.0, 2.0], dtype=np.float64))
-
-
-def test_joint_command_limiter_limits_velocity_acceleration_and_jerk() -> None:
-    limits = np.array([[-10.0, 10.0], [-10.0, 10.0]], dtype=np.float64)
-    config = VisualServoConfig(
-        joint_safety_margin=0.0,
-        max_joint_velocity=1.0,
-        max_joint_acceleration=2.0,
-        max_joint_jerk=10.0,
-    )
-    limiter = JointCommandLimiter(limits=limits, config=config)
-
-    first = limiter.limit(
-        desired=np.array([10.0, -10.0]),
-        current=np.array([0.0, 0.0]),
-        dt=0.02,
-    )
-    second = limiter.limit(
-        desired=np.array([10.0, -10.0]),
-        current=first,
-        dt=0.02,
-    )
-
-    np.testing.assert_allclose(first, np.array([0.00008, -0.00008]))
-    np.testing.assert_allclose(second, np.array([0.00032, -0.00032]))
-
-
-def test_joint_command_limiter_does_not_reset_when_joint_state_lags_command() -> None:
-    limits = np.array([[-10.0, 10.0]], dtype=np.float64)
-    config = VisualServoConfig(
-        joint_safety_margin=0.0,
-        max_joint_velocity=1.0,
-        max_joint_acceleration=2.0,
-        max_joint_jerk=10.0,
-    )
-    limiter = JointCommandLimiter(limits=limits, config=config)
-
-    current = np.array([0.0])
-    command = current
-    for _ in range(30):
-        command = limiter.limit(
-            desired=np.array([1.0]),
-            current=current,
-            dt=0.02,
-        )
-        current = current + 0.25 * (command - current)
-
-    assert command[0] > 0.01
-
-
-def test_joint_command_limiter_settles_on_constant_target() -> None:
-    limits = np.array([[-10.0, 10.0]], dtype=np.float64)
-    config = VisualServoConfig(
-        joint_safety_margin=0.0,
-        max_joint_velocity=0.30,
-        max_joint_acceleration=0.80,
-        max_joint_jerk=4.0,
-    )
-    limiter = JointCommandLimiter(limits=limits, config=config)
-
-    current = np.array([0.0])
-    commands = []
-    for _ in range(600):
-        command = limiter.limit(
-            desired=np.array([0.5]),
-            current=current,
-            dt=0.02,
-        )
-        current = command.copy()
-        commands.append(float(command[0]))
-
-    settled_commands = commands[-100:]
-    assert max(settled_commands) - min(settled_commands) < 0.01
-    assert abs(commands[-1] - 0.5) < 0.01
 
 
 def test_pixel_filter_eases_first_detection_from_image_center() -> None:
@@ -1968,79 +1829,6 @@ def test_tracking_telemetry_query_rejects_non_integer_bounds() -> None:
 
     with pytest.raises(ValueError, match="limit must be an integer"):
         buffer.query(limit=True)  # type: ignore[arg-type]
-
-
-def test_joint_command_limiter_reports_limit_hits_without_changing_command() -> None:
-    limits = np.array([[-0.5, 0.5]], dtype=np.float64)
-
-    def find_hit(
-        hits: list[dict[str, float | int | str]],
-        kind: str,
-    ) -> dict[str, float | int | str]:
-        matches = [hit for hit in hits if hit["kind"] == kind]
-        assert len(matches) == 1
-        return matches[0]
-
-    def run_case(config: VisualServoConfig) -> list[dict[str, float | int | str]]:
-        plain_limiter = JointCommandLimiter(limits=limits, config=config)
-        telemetry_limiter = JointCommandLimiter(limits=limits, config=config)
-        command = plain_limiter.limit(
-            desired=np.array([10.0]),
-            current=np.array([0.0]),
-            dt=0.02,
-        )
-        command_with_telemetry, telemetry = telemetry_limiter.limit_with_telemetry(
-            desired=np.array([10.0]),
-            current=np.array([0.0]),
-            dt=0.02,
-        )
-
-        np.testing.assert_allclose(command_with_telemetry, command)
-        assert telemetry["clamped_desired"] == [0.4]
-        return telemetry["limit_hits"]
-
-    position_hits = run_case(
-        VisualServoConfig(
-            joint_safety_margin=0.1,
-            max_joint_velocity=1e9,
-            max_joint_acceleration=1e9,
-            max_joint_jerk=1e9,
-        )
-    )
-    velocity_hits = run_case(
-        VisualServoConfig(
-            joint_safety_margin=0.1,
-            max_joint_velocity=0.01,
-            max_joint_acceleration=1e9,
-            max_joint_jerk=1e9,
-        )
-    )
-    acceleration_hits = run_case(
-        VisualServoConfig(
-            joint_safety_margin=0.1,
-            max_joint_velocity=1e9,
-            max_joint_acceleration=0.02,
-            max_joint_jerk=1e9,
-        )
-    )
-    jerk_hits = run_case(
-        VisualServoConfig(
-            joint_safety_margin=0.1,
-            max_joint_velocity=1e9,
-            max_joint_acceleration=1e9,
-            max_joint_jerk=0.03,
-        )
-    )
-
-    position_hit = find_hit(position_hits, "upper_position")
-    velocity_hit = find_hit(velocity_hits, "velocity")
-    acceleration_hit = find_hit(acceleration_hits, "acceleration")
-    jerk_hit = find_hit(jerk_hits, "jerk")
-
-    assert float(position_hit["value"]) > float(position_hit["limit"])
-    assert float(velocity_hit["value"]) > float(velocity_hit["limit"])
-    assert float(acceleration_hit["value"]) > float(acceleration_hit["limit"])
-    assert float(jerk_hit["value"]) > float(jerk_hit["limit"])
 
 
 def test_visual_servo_records_no_fresh_detection_without_backend_reads() -> None:
