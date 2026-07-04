@@ -116,6 +116,35 @@ def test_look_at_joint_profile_has_no_unbounded_target_crossing_reset() -> None:
     np.testing.assert_allclose(profile._acceleration, 0.0, atol=1e-9)
 
 
+@pytest.mark.parametrize("target", [-0.3, 0.3])
+def test_look_at_joint_profile_stops_bounded_motion_in_both_directions(
+    target: float,
+) -> None:
+    config = _acceptance_profile_config()
+    profile = LookAtJointCommandProfile(config=config)
+    guard = JointCommandSafetyGuard(config=config)
+    current = np.zeros(7)
+    desired = np.full(7, target)
+
+    for _ in range(15):
+        command, _hits = profile.update_with_telemetry(desired, current, 0.02)
+        guard_hits, velocity, acceleration = guard.check(command, current, 0.02)
+        assert guard_hits == []
+        guard.commit(command, velocity, acceleration)
+        current = command
+
+    for _ in range(100):
+        command, _hits = profile.stop_with_telemetry(current, 0.02)
+        guard_hits, velocity, acceleration = guard.check(command, current, 0.02)
+        assert guard_hits == []
+        guard.commit(command, velocity, acceleration)
+        current = command
+
+    assert profile.stationary
+    held, _hits = profile.stop_with_telemetry(current, 0.02)
+    np.testing.assert_allclose(held, current, atol=1e-12)
+
+
 def test_look_at_joint_profile_preserves_boundary_on_abrupt_reversals() -> None:
     config = _acceptance_profile_config()
     profile = LookAtJointCommandProfile(config=config)
@@ -488,6 +517,9 @@ def test_visual_servo_rejects_unsafe_profiled_body_yaw_without_writing() -> None
     retained_records = len(controller.telemetry.query()["records"])
     assert not controller.step(dt=0.02)
     assert len(controller.telemetry.query()["records"]) == retained_records
+    assert not controller.step(dt=0.041)
+    assert controller.status()["motion_state"] == "fault"
+    assert controller.status()["motion_fault"] == "safety_rejected"
 
 
 def test_visual_servo_profile_fields_are_empty_without_profile_update() -> None:
@@ -745,6 +777,43 @@ def test_visual_servo_control_stall_preserves_committed_command_anchor() -> None
     assert controller.look_at_profile.stationary
     assert len(backend.commands) == command_count
     assert controller.status()["motion_state"] == "holding_no_target"
+
+
+def test_visual_servo_no_target_command_stall_holds_committed_anchor() -> None:
+    backend = _MotionTestBackend()
+    controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+    assert controller.step(dt=0.02)
+    committed = backend.commands[-1].copy()
+    controller._last_command_time = time.monotonic() - 1.0
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0, timestamp=0.0))
+
+    assert not controller.step(dt=0.02, use_command_elapsed=True)
+
+    record = controller.telemetry.query()["records"][-1]
+    assert record["reason"] == "control_stall"
+    np.testing.assert_array_equal(controller.look_at_guard._last_command, committed)
+    assert controller.look_at_profile.stationary
+    assert controller.status()["motion_state"] == "holding_no_target"
+
+
+def test_visual_servo_ik_failure_command_stall_holds_committed_anchor() -> None:
+    backend = _MotionTestBackend()
+    controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+    assert controller.step(dt=0.02)
+    committed = backend.commands[-1].copy()
+    command_count = len(backend.commands)
+    controller._last_command_time = time.monotonic() - 1.0
+    backend.head_kinematics.joints = np.full(7, np.nan)
+
+    assert not controller.step(dt=0.02, use_command_elapsed=True)
+
+    record = controller.telemetry.query()["records"][-1]
+    assert record["reason"] == "control_stall"
+    assert len(backend.commands) == command_count
+    np.testing.assert_array_equal(controller.look_at_guard._last_command, committed)
+    assert controller.look_at_profile.stationary
 
 
 def test_visual_servo_look_at_commands_obey_elapsed_time_limits_under_jitter() -> None:

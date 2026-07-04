@@ -324,10 +324,28 @@ class LookAtJointCommandProfile:
         current_vector = _finite_joint_vector(current, length=7, name="current")
         if self._position is None or self._body_yaw_position is None:
             return current_vector, []
-        retained_position = np.concatenate(
+        position = np.concatenate(
             (np.array([self._body_yaw_position]), self._position.copy())
         )
-        return self.update_with_telemetry(retained_position, current_vector, dt)
+        velocity = np.concatenate(
+            (np.array([self._body_yaw_velocity]), self._velocity.copy())
+        )
+        acceleration = np.concatenate(
+            (np.array([self._body_yaw_acceleration]), self._acceleration.copy())
+        )
+        target = position.copy()
+        for index, (speed, rate) in enumerate(zip(velocity, acceleration)):
+            direction = float(np.sign(speed if abs(speed) > 1e-10 else rate))
+            if direction == 0.0:
+                continue
+            distance = self._stopping_distance(
+                direction * float(speed),
+                direction * float(rate),
+                self.config.max_joint_jerk,
+                self.config.max_joint_acceleration,
+            )
+            target[index] += direction * max(distance, 1e-12)
+        return self.update_with_telemetry(target, current_vector, dt)
 
     @staticmethod
     def _advance_motion(
@@ -1349,6 +1367,9 @@ class VisualServoController:
         if not np.isfinite(dt) or dt <= 0.0:
             raise ValueError("dt must be finite and positive")
         start_monotonic = time.monotonic()
+        if self._motion_fault is not None:
+            self._last_reason = self._motion_fault
+            return False
         if dt > 2.0 / self.config.control_frequency:
             if self._last_command is None:
                 self._reset_motion_state()
@@ -1363,9 +1384,6 @@ class VisualServoController:
                     start_monotonic=start_monotonic,
                 )
             )
-            return False
-        if self._motion_fault is not None:
-            self._last_reason = self._motion_fault
             return False
 
         look_at = self.look_at_buffer.fresh(self.config)
@@ -1493,6 +1511,18 @@ class VisualServoController:
                 command_dt = dt
                 if use_command_elapsed and self._last_command_time is not None:
                     command_dt = command_time - self._last_command_time
+                if command_dt > 2.0 / self.config.control_frequency:
+                    self._hold_committed_motion()
+                    record["dt"] = command_dt
+                    record["monotonic_timestamp"] = command_time
+                    record["reason"] = "control_stall"
+                    record["motion_state"] = self._motion_state
+                    record["latency"]["processing_duration"] = (
+                        time.monotonic() - start_monotonic
+                    )
+                    self._last_reason = "control_stall"
+                    self._append_telemetry(record)
+                    return False
                 self._reset_target_state()
                 command, profile_hits = self.look_at_profile.stop_with_telemetry(
                     current_joints, command_dt
@@ -1609,6 +1639,20 @@ class VisualServoController:
             command_dt = dt
             if use_command_elapsed and self._last_command_time is not None:
                 command_dt = command_time - self._last_command_time
+            if command_dt > 2.0 / self.config.control_frequency:
+                self._hold_committed_motion()
+                self._last_reason = "control_stall"
+                record = self._new_telemetry_record(
+                    dt=command_dt,
+                    target_type="none",
+                    reason="control_stall",
+                    start_monotonic=start_monotonic,
+                )
+                record["monotonic_timestamp"] = command_time
+                record["current_joints"] = finite_json_value(current_joints)
+                record["motion_state"] = self._motion_state
+                self._append_telemetry(record)
+                return False
             record = self._new_telemetry_record(
                 dt=command_dt,
                 target_type="none",
