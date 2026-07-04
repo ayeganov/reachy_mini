@@ -182,7 +182,7 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
     )
     stream: ClientConnection | None = None
     publisher: DetectionPublisher | None = None
-    tracking_started = False
+    tracking_start_attempted = False
     frame_count = 0
     matching_frames = 0
     submitted_targets = 0
@@ -218,8 +218,8 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
         )
 
         if args.follow:
+            tracking_start_attempted = True
             api.post("/tracking/start", {})
-            tracking_started = True
             websocket_url = api.base_url.replace("http://", "ws://", 1).replace(
                 "https://", "wss://", 1
             )
@@ -294,11 +294,12 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
                 stream.close()
             except Exception as exc:
                 cleanup_error = exc
-        if tracking_started:
-            cleanup_error = cleanup_error or finish_tracking(
+        if tracking_start_attempted:
+            tracking_error = finish_tracking(
                 api,
                 return_neutral=args.return_neutral,
             )
+            cleanup_error = cleanup_error or tracking_error
         try:
             camera.close()
         except Exception as exc:
@@ -329,7 +330,11 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line interface."""
     parser = argparse.ArgumentParser(
-        description="Preview or follow one model-selected image target"
+        description="Preview or follow one model-selected image target",
+        epilog=(
+            "Install the selected model family with --extra attention-yolo-face, "
+            "--extra attention-yoloe, or --extra attention-rfdetr."
+        ),
     )
     parser.add_argument("--model", default="yolo-face", choices=available_models())
     parser.add_argument("--target", default="face")

@@ -30,13 +30,6 @@ DEFAULT_ORBIT_RADIUS = 0.5
 DEFAULT_VERTICAL_RANGE = 0.2
 ORBIT_PAD_SIZE = 640
 RED = np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
-MOTION_CONFIG = {
-    "joint_safety_margin": 0.1745329252,
-    "max_joint_velocity": 0.6,
-    "max_joint_acceleration": 2.4,
-    "max_joint_jerk": 16.0,
-    "look_at_profile_response_hz": 2.0,
-}
 SCENARIOS = {
     "center": (0.0, 0.0),
     "left": (math.atan2(0.2, 0.5), 0.0),
@@ -183,21 +176,22 @@ class MujocoRedTargetHarness:
         vertical_fov = math.radians(float(self.backend.model.cam_fovy[self.camera_id]))
         horizontal_fov = 2.0 * math.atan(math.tan(vertical_fov / 2.0) * width / height)
         self.elevation_limit = math.atan2(vertical_range, orbit_radius)
+        servo_config = VisualServoConfig(
+            image_horizontal_fov=horizontal_fov,
+            image_vertical_fov=vertical_fov,
+            image_error_upward_elevation_limit=self.elevation_limit,
+            image_error_downward_elevation_limit=self.elevation_limit,
+        )
+        assert (
+            servo_config.joint_safety_margin,
+            servo_config.max_joint_velocity,
+            servo_config.max_joint_acceleration,
+            servo_config.max_joint_jerk,
+            servo_config.look_at_profile_response_hz,
+        ) == (0.1745329252, 0.6, 2.4, 16.0, 2.0)
         self.servo = VisualServoController(
             backend=self.backend,
-            config=VisualServoConfig(
-                joint_safety_margin=MOTION_CONFIG["joint_safety_margin"],
-                max_joint_velocity=MOTION_CONFIG["max_joint_velocity"],
-                max_joint_acceleration=MOTION_CONFIG["max_joint_acceleration"],
-                max_joint_jerk=MOTION_CONFIG["max_joint_jerk"],
-                look_at_profile_response_hz=MOTION_CONFIG[
-                    "look_at_profile_response_hz"
-                ],
-                image_horizontal_fov=horizontal_fov,
-                image_vertical_fov=vertical_fov,
-                image_error_upward_elevation_limit=self.elevation_limit,
-                image_error_downward_elevation_limit=self.elevation_limit,
-            ),
+            config=servo_config,
         )
 
         self.marker_orbit_radius = orbit_radius
@@ -462,18 +456,7 @@ class MujocoRedTargetHarness:
         self.last_frame_rgb = frame
         detection = detect_red_marker(frame)
         self.last_detection = detection
-        if detection is None:
-            self.servo.submit(
-                TrackingDetection(
-                    u=self.width / 2.0,
-                    v=self.height / 2.0,
-                    timestamp=0.0,
-                    frame_id=self.frame_id,
-                    width=self.width,
-                    height=self.height,
-                )
-            )
-        else:
+        if detection is not None:
             self.servo.submit(
                 TrackingDetection(
                     u=detection.u,

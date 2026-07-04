@@ -93,6 +93,28 @@ def _validate_frame(frame_bgr: Frame) -> None:
         raise ValueError("frame must be a non-empty BGR image")
 
 
+def _detections_from_yolo_boxes(
+    boxes: Any,
+    *,
+    label: str,
+    min_confidence: float,
+) -> list[ImageDetection]:
+    xyxy = _to_numpy(boxes.xyxy)
+    confidence = _to_numpy(boxes.conf)
+    return [
+        ImageDetection(
+            x1=float(bounds[0]),
+            y1=float(bounds[1]),
+            x2=float(bounds[2]),
+            y2=float(bounds[3]),
+            confidence=float(score),
+            label=label,
+        )
+        for bounds, score in zip(xyxy, confidence, strict=True)
+        if float(score) >= min_confidence
+    ]
+
+
 class YoloFaceDetector:
     """Adapter for the local YOLO face checkpoint."""
 
@@ -101,7 +123,7 @@ class YoloFaceDetector:
     def __init__(self, *, weights: Path | str, model: Any | None = None) -> None:
         """Load the checkpoint unless a test model was provided."""
         if model is None:
-            from ultralytics import YOLO
+            from ultralytics import YOLO  # type: ignore[attr-defined]
 
             model = YOLO(str(weights))
         self.model: Any = model
@@ -120,20 +142,11 @@ class YoloFaceDetector:
         boxes = getattr(result, "boxes", None)
         if boxes is None:
             return []
-        xyxy = _to_numpy(boxes.xyxy)
-        confidence = _to_numpy(boxes.conf)
-        return [
-            ImageDetection(
-                x1=float(bounds[0]),
-                y1=float(bounds[1]),
-                x2=float(bounds[2]),
-                y2=float(bounds[3]),
-                confidence=float(score),
-                label="face",
-            )
-            for bounds, score in zip(xyxy, confidence, strict=True)
-            if float(score) >= min_confidence
-        ]
+        return _detections_from_yolo_boxes(
+            boxes,
+            label="face",
+            min_confidence=min_confidence,
+        )
 
 
 class YoloEDetector:
@@ -149,7 +162,7 @@ class YoloEDetector:
     ) -> None:
         """Load YOLOE-26X unless a test model was provided."""
         if model is None:
-            from ultralytics import YOLOE
+            from ultralytics import YOLOE  # type: ignore[attr-defined]
 
             model = YOLOE(str(weights))
         self.model: Any = model
@@ -176,20 +189,11 @@ class YoloEDetector:
         boxes = getattr(result, "boxes", None)
         if boxes is None:
             return []
-        xyxy = _to_numpy(boxes.xyxy)
-        confidence = _to_numpy(boxes.conf)
-        return [
-            ImageDetection(
-                x1=float(bounds[0]),
-                y1=float(bounds[1]),
-                x2=float(bounds[2]),
-                y2=float(bounds[3]),
-                confidence=float(score),
-                label=normalized,
-            )
-            for bounds, score in zip(xyxy, confidence, strict=True)
-            if float(score) >= min_confidence
-        ]
+        return _detections_from_yolo_boxes(
+            boxes,
+            label=normalized,
+            min_confidence=min_confidence,
+        )
 
 
 class RfDetrDetector:
@@ -226,7 +230,7 @@ class RfDetrDetector:
             kwargs = {} if weights is None else {"pretrain_weights": str(weights)}
             model = model_class(**kwargs)
             if optimize:
-                model.optimize_for_inference()
+                model.optimize_for_inference()  # type: ignore[no-untyped-call]
         self.model: Any = model
 
     def detect(

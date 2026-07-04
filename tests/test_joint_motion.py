@@ -65,6 +65,35 @@ def test_guard_accepts_monotonic_inward_soft_limit_recovery() -> None:
     guard.commit(command, velocity, acceleration)
 
 
+def test_guard_rejects_measured_hard_limit_after_a_command_was_committed() -> None:
+    guard = JointCommandSafetyGuard(config=motion_config())
+    safe = np.zeros(7)
+    hits, velocity, acceleration, _recovery = guard.check_with_telemetry(
+        safe,
+        safe,
+        0.02,
+    )
+    assert hits == []
+    guard.commit(safe, velocity, acceleration)
+
+    measured = safe.copy()
+    measured[6] = guard.limits[6, 0] - 0.001
+    hits, _velocity, _acceleration, _recovery = guard.check_with_telemetry(
+        safe,
+        measured,
+        0.02,
+    )
+
+    assert hits == [
+        {
+            "joint_index": 6,
+            "kind": "current_lower_hard_position",
+            "value": pytest.approx(measured[6]),
+            "limit": pytest.approx(guard.limits[6, 0]),
+        }
+    ]
+
+
 def test_look_at_joint_profile_initializes_from_current_and_profiles_body_yaw() -> None:
     profile = LookAtJointCommandProfile(config=motion_config())
     current = np.array([0.1, *([0.2] * 6)])

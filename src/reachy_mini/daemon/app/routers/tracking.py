@@ -243,6 +243,12 @@ async def ws_detections(
     try:
         while True:
             data = await websocket.receive_text()
+            if websocket.app.state.visual_servo is not controller:
+                await websocket.close(
+                    code=1012,
+                    reason="tracking controller was replaced; reconnect",
+                )
+                return
             try:
                 detection_req = TrackingDetectionRequest.model_validate_json(data)
                 controller.submit(detection_req.to_detection())

@@ -66,12 +66,12 @@ picamera2 = [
     "picamera2; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'armv7l')",
 ]
 rerun = ["rerun-sdk>=0.27.2", "urdf-parser-py==0.0.4"]
-attention = [
+attention-yolo-face = ["ultralytics>=8.4,<9"]
+attention-yoloe = [
     "clip @ git+https://github.com/ultralytics/CLIP.git@16be45c7062240d445cce764f2afd9454a91ef7e",
-    "omegaconf>=2.3,<3",
-    "rfdetr>=1.3,<2",
     "ultralytics>=8.4,<9",
 ]
+attention-rfdetr = ["omegaconf>=2.3,<3", "rfdetr>=1.3,<2"]
 wireless-version = [
     "semver>=3,<4",
     "nmcli>=1.5",

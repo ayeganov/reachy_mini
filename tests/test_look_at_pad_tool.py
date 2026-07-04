@@ -153,19 +153,12 @@ def _profile_replay_records() -> list[dict[str, object]]:
     ]
 
 
-def test_replay_summary_reports_profile_and_limiter_diagnostics() -> None:
+def test_replay_summary_reports_profile_diagnostics() -> None:
     summary = summarize_replay_records(_profile_replay_records())
 
     assert summary["profile_limit_hits"] == {"jerk": 1}
     assert summary["profile_limit_hit_count"] == 1
     assert summary["limit_hits"] == {"acceleration": 1}
-    assert summary["limiter_delta"] == {
-        "max_abs_rad": pytest.approx(0.1),
-        "mean_abs_rad": pytest.approx(0.1 / 28.0),
-        "changed_tick_count": 1,
-    }
-    assert summary["limiter_changed_count"] == 1
-    assert summary["limiter_compared_count"] == 4
     assert summary["command_smoothness"] == summary["final_command_smoothness"]
     for field in (
         "profiled_command_smoothness",
@@ -177,58 +170,6 @@ def test_replay_summary_reports_profile_and_limiter_diagnostics() -> None:
             "max_jerk",
         }
         assert all(isinstance(value, float) for value in summary[field].values())
-
-
-def test_replay_summary_skips_invalid_profile_pairs() -> None:
-    valid = _profile_replay_records()[0]
-    invalid_pairs = [
-        {"final_command": [0.0] * 7},
-        {"profiled_command": None, "final_command": [0.0] * 7},
-        {"profiled_command": ["bad"] * 7, "final_command": [0.0] * 7},
-        {"profiled_command": [float("nan")] * 7, "final_command": [0.0] * 7},
-        {"profiled_command": [0.0] * 6, "final_command": [0.0] * 7},
-    ]
-    records = [valid]
-    records.extend(
-        {
-            "timestamp": float(index + 2),
-            "target_type": "look_at",
-            "reason": "commanded",
-            "profile_limit_hits": [],
-            "limit_hits": [],
-            **pair,
-        }
-        for index, pair in enumerate(invalid_pairs)
-    )
-    records.append(
-        {
-            "timestamp": 20.0,
-            "target_type": "detection",
-            "reason": "commanded",
-            "profiled_command": [0.0] * 7,
-            "final_command": [1.0] * 7,
-            "profile_limit_hits": [],
-            "limit_hits": [],
-        }
-    )
-
-    summary = summarize_replay_records(records)
-
-    assert summary["limiter_compared_count"] == 1
-    assert summary["limiter_changed_count"] == 0
-    assert summary["limiter_delta"] == {
-        "max_abs_rad": 0.0,
-        "mean_abs_rad": 0.0,
-        "changed_tick_count": 0,
-    }
-
-    no_pairs = summarize_replay_records(records[1:])
-    assert no_pairs["limiter_delta"] == {
-        "max_abs_rad": None,
-        "mean_abs_rad": None,
-        "changed_tick_count": 0,
-    }
-    assert no_pairs["limiter_compared_count"] == 0
 
 
 def test_replay_sends_config_and_retains_post_return_state(

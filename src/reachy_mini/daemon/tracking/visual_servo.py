@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import numpy as np
 import numpy.typing as npt
@@ -74,76 +74,49 @@ class JointTargetTelemetry:
     ik_failed: bool
 
 
-class DetectionBuffer:
-    """Thread-safe latest-only detection buffer."""
+_Target = TypeVar("_Target", TrackingDetection, TrackingLookAtTarget)
+
+
+class LatestTargetBuffer(Generic[_Target]):
+    """Thread-safe latest-only target buffer aged from daemon receipt time."""
 
     def __init__(self) -> None:
         """Initialize the buffer."""
         self._lock = threading.Lock()
-        self._latest: TrackingDetection | None = None
+        self._latest: tuple[_Target, float] | None = None
         self.accepted_count = 0
 
-    def submit(self, detection: TrackingDetection) -> None:
-        """Replace any pending detection with the newest one."""
-        with self._lock:
-            self._latest = detection
-            self.accepted_count += 1
-
-    def latest(self) -> TrackingDetection | None:
-        """Return the most recently submitted detection."""
-        with self._lock:
-            return self._latest
-
-    def fresh(
-        self,
-        config: VisualServoConfig,
-        now: float | None = None,
-    ) -> TrackingDetection | None:
-        """Return the latest usable detection, or None if stale/low-confidence."""
-        detection = self.latest()
-        if detection is None:
-            return None
-
-        now = time.time() if now is None else now
-        if now - detection.timestamp > config.max_detection_age:
-            return None
-        if detection.confidence < config.min_confidence:
-            return None
-        return detection
-
-
-class LookAtTargetBuffer:
-    """Thread-safe latest-only metric look-at target buffer."""
-
-    def __init__(self) -> None:
-        """Initialize the buffer."""
-        self._lock = threading.Lock()
-        self._latest: TrackingLookAtTarget | None = None
-        self.accepted_count = 0
-
-    def submit(self, target: TrackingLookAtTarget) -> None:
+    def submit(self, target: _Target) -> None:
         """Replace any pending target with the newest one."""
         with self._lock:
-            self._latest = target
+            self._latest = (target, time.monotonic())
             self.accepted_count += 1
 
-    def latest(self) -> TrackingLookAtTarget | None:
+    def latest(self) -> _Target | None:
         """Return the most recently submitted target."""
         with self._lock:
-            return self._latest
+            return None if self._latest is None else self._latest[0]
+
+    def age(self, now: float | None = None) -> float | None:
+        """Return elapsed monotonic time since daemon receipt."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if self._latest is None:
+                return None
+            return max(0.0, now - self._latest[1])
 
     def fresh(
         self,
         config: VisualServoConfig,
         now: float | None = None,
-    ) -> TrackingLookAtTarget | None:
+    ) -> _Target | None:
         """Return the latest usable target, or None if stale/low-confidence."""
-        target = self.latest()
-        if target is None:
-            return None
-
-        now = time.time() if now is None else now
-        if now - target.timestamp > config.max_detection_age:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if self._latest is None:
+                return None
+            target, received_at = self._latest
+        if now - received_at > config.max_detection_age:
             return None
         if target.confidence < config.min_confidence:
             return None
@@ -161,8 +134,8 @@ class VisualServoController:
         """Initialize the controller."""
         self.backend = backend
         self.config = config or VisualServoConfig()
-        self.buffer = DetectionBuffer()
-        self.look_at_buffer = LookAtTargetBuffer()
+        self.buffer = LatestTargetBuffer[TrackingDetection]()
+        self.look_at_buffer = LatestTargetBuffer[TrackingLookAtTarget]()
         self.look_at_profile = LookAtJointCommandProfile(config=self.config)
         self.look_at_guard = JointCommandSafetyGuard(config=self.config)
         self.telemetry = VisualServoTelemetryBuffer(
@@ -270,7 +243,6 @@ class VisualServoController:
         """Return a JSON-serializable status dictionary."""
         latest = self.buffer.latest()
         latest_look_at = self.look_at_buffer.latest()
-        now = time.time()
         return {
             "running": self.running,
             "accepted_detections": self.buffer.accepted_count,
@@ -278,12 +250,10 @@ class VisualServoController:
             "command_count": self._command_count,
             "last_reason": self._last_reason,
             "last_target_type": self._last_target_type,
-            "last_detection_age": None
-            if latest is None
-            else max(0.0, now - latest.timestamp),
+            "last_detection_age": None if latest is None else self.buffer.age(),
             "last_look_at_age": None
             if latest_look_at is None
-            else max(0.0, now - latest_look_at.timestamp),
+            else self.look_at_buffer.age(),
             "last_command": None
             if self._last_command is None
             else self._last_command.tolist(),
@@ -448,15 +418,15 @@ class VisualServoController:
 
         target_type = "none"
         input_target: dict[str, Any] | None = None
-        target_timestamp: float | None = None
+        target_age: float | None = None
         if look_at is not None:
             target_type = "look_at"
             input_target = self._look_at_target(look_at)
-            target_timestamp = look_at.timestamp
+            target_age = self.look_at_buffer.age()
         elif detection is not None:
             target_type = "detection"
             input_target = self._detection_target(detection)
-            target_timestamp = detection.timestamp
+            target_age = self.buffer.age()
 
         release_motion_guard = self._try_acquire_motion_guard()
         if release_motion_guard is None:
@@ -533,11 +503,7 @@ class VisualServoController:
             record["ik_failed"] = target_result.ik_failed
             record["body_yaw"]["current"] = body_yaw
             record["body_yaw"]["ik_input"] = body_yaw
-            record["latency"]["target_age"] = (
-                None
-                if target_timestamp is None
-                else max(0.0, time.time() - target_timestamp)
-            )
+            record["latency"]["target_age"] = target_age
             if target_result.joints is None:
                 if self._last_command is None:
                     self._reset_motion_state()
@@ -549,11 +515,11 @@ class VisualServoController:
                     )
                     self.telemetry.append(record)
                     return False
-                command_time = time.monotonic()
-                command_dt = dt
-                if use_command_elapsed and self._last_command_time is not None:
-                    command_dt = command_time - self._last_command_time
-                if command_dt > 2.0 / self.config.control_frequency:
+                command_time, command_dt, stalled = self._command_timing(
+                    dt,
+                    use_elapsed=use_command_elapsed,
+                )
+                if stalled:
                     self._hold_committed_motion()
                     record["dt"] = command_dt
                     record["monotonic_timestamp"] = command_time
@@ -591,11 +557,11 @@ class VisualServoController:
                 )
 
             desired_joints = np.array(target_result.joints, dtype=np.float64)
-            command_time = time.monotonic()
-            command_dt = dt
-            if use_command_elapsed and self._last_command_time is not None:
-                command_dt = command_time - self._last_command_time
-            if command_dt > 2.0 / self.config.control_frequency:
+            command_time, command_dt, stalled = self._command_timing(
+                dt,
+                use_elapsed=use_command_elapsed,
+            )
+            if stalled:
                 if self._last_command is None:
                     self._reset_motion_state()
                 else:
@@ -677,11 +643,11 @@ class VisualServoController:
             except ValueError:
                 self._reset_motion_state()
                 raise
-            command_time = time.monotonic()
-            command_dt = dt
-            if use_command_elapsed and self._last_command_time is not None:
-                command_dt = command_time - self._last_command_time
-            if command_dt > 2.0 / self.config.control_frequency:
+            command_time, command_dt, stalled = self._command_timing(
+                dt,
+                use_elapsed=use_command_elapsed,
+            )
+            if stalled:
                 self._hold_committed_motion()
                 self._last_reason = "control_stall"
                 record = self._new_telemetry_record(
@@ -726,6 +692,25 @@ class VisualServoController:
             )
         finally:
             release_motion_guard()
+
+    def _command_timing(
+        self,
+        dt: float,
+        *,
+        use_elapsed: bool,
+    ) -> tuple[float, float, bool]:
+        """Return command time, effective interval, and stall state."""
+        command_time = time.monotonic()
+        command_dt = (
+            command_time - self._last_command_time
+            if use_elapsed and self._last_command_time is not None
+            else dt
+        )
+        return (
+            command_time,
+            command_dt,
+            command_dt > 2.0 / self.config.control_frequency,
+        )
 
     def _write_profiled_command(
         self,

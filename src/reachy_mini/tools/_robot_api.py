@@ -65,8 +65,8 @@ class RobotApi:
             return {}
         return json.loads(body)
 
-    def return_neutral(self, duration: float = 2.0) -> None:
-        """Move the head, body, and antennas to neutral and wait for completion."""
+    def return_neutral(self, duration: float = 2.0) -> dict[str, Any]:
+        """Move to neutral, wait for completion, and return the move response."""
         move = self.post(
             "/move/goto",
             {
@@ -85,13 +85,20 @@ class RobotApi:
             },
         )
         uuid = move.get("uuid")
+        if not isinstance(uuid, str) or not uuid:
+            raise ValueError("/move/goto did not return a move UUID")
         deadline = time.monotonic() + max(self.timeout, duration + 5.0)
-        while isinstance(uuid, str) and time.monotonic() < deadline:
+        while True:
             moves = self.request_value("GET", "/move/running")
             if not isinstance(moves, list):
-                break
-            if not any(
-                item.get("uuid") == uuid for item in moves if isinstance(item, dict)
+                raise ValueError("/move/running did not return a JSON list")
+            if not all(
+                isinstance(item, dict) and isinstance(item.get("uuid"), str)
+                for item in moves
             ):
-                break
+                raise ValueError("/move/running returned invalid move entries")
+            if not any(item["uuid"] == uuid for item in moves):
+                return move
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"move {uuid} did not complete before the deadline")
             time.sleep(0.1)

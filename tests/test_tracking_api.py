@@ -3,30 +3,47 @@
 import math
 
 import numpy as np
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from reachy_mini.daemon.app import bg_job_register
-from reachy_mini.daemon.app.dependencies import get_backend
+from reachy_mini.daemon.app.dependencies import get_backend, ws_get_backend
 from reachy_mini.daemon.app.main import Args, create_app
 from reachy_mini.daemon.app.routers.tracking import _get_or_create_visual_servo
 from reachy_mini.daemon.tracking.visual_servo import VisualServoController
 
 
+class _ApiKinematics:
+    automatic_body_yaw = False
+
+    def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
+        self.automatic_body_yaw = automatic_body_yaw
+
+    def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
+        return np.zeros(7)
+
+
+class _ApiBackend:
+    is_move_running = False
+
+    def __init__(self) -> None:
+        self.head_kinematics = _ApiKinematics()
+        self.command: np.ndarray | None = None
+
+    def get_present_head_joint_positions(self) -> np.ndarray:
+        return np.zeros(7)
+
+    def get_present_head_pose(self) -> np.ndarray:
+        return np.eye(4)
+
+    def set_target_head_joint_positions(self, command: np.ndarray) -> None:
+        self.command = command
+
+
 def test_tracking_start_uses_centralized_defaults() -> None:
-    class FakeKinematics:
-        automatic_body_yaw = False
-
-        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
-            self.automatic_body_yaw = automatic_body_yaw
-
-    class FakeBackend:
-        is_move_running = False
-
-        def __init__(self) -> None:
-            self.head_kinematics = FakeKinematics()
-
     app = create_app(Args(autostart=False))
-    app.dependency_overrides[get_backend] = lambda: FakeBackend()
+    app.dependency_overrides[get_backend] = lambda: _ApiBackend()
 
     with TestClient(app) as client:
         response = client.post("/api/tracking/start", json={})
@@ -58,30 +75,7 @@ def test_tracking_status_route_is_registered() -> None:
 
 
 def test_tracking_look_at_route_accepts_metric_target() -> None:
-    class FakeKinematics:
-        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
-            self.automatic_body_yaw = automatic_body_yaw
-
-        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.full(7, 0.2)
-
-    class FakeBackend:
-        is_move_running = False
-
-        def __init__(self) -> None:
-            self.head_kinematics = FakeKinematics()
-            self.command: np.ndarray | None = None
-
-        def get_present_head_joint_positions(self) -> np.ndarray:
-            return np.zeros(7)
-
-        def get_present_head_pose(self) -> np.ndarray:
-            return np.eye(4)
-
-        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
-            self.command = command
-
-    backend = FakeBackend()
+    backend = _ApiBackend()
     app = create_app(Args(autostart=False))
     app.dependency_overrides[get_backend] = lambda: backend
 
@@ -99,29 +93,7 @@ def test_tracking_look_at_route_accepts_metric_target() -> None:
 
 
 def test_tracking_detection_rejects_invalid_camera_dimensions() -> None:
-    class FakeKinematics:
-        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
-            self.automatic_body_yaw = automatic_body_yaw
-
-        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.full(7, 0.2)
-
-    class FakeBackend:
-        is_move_running = False
-
-        def __init__(self) -> None:
-            self.head_kinematics = FakeKinematics()
-
-        def get_present_head_joint_positions(self) -> np.ndarray:
-            return np.zeros(7)
-
-        def get_present_head_pose(self) -> np.ndarray:
-            return np.eye(4)
-
-        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
-            self.command = command
-
-    backend = FakeBackend()
+    backend = _ApiBackend()
     app = create_app(Args(autostart=False))
     app.dependency_overrides[get_backend] = lambda: backend
 
@@ -136,29 +108,7 @@ def test_tracking_detection_rejects_invalid_camera_dimensions() -> None:
 
 
 def test_tracking_api_rejects_non_finite_values() -> None:
-    class FakeKinematics:
-        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
-            self.automatic_body_yaw = automatic_body_yaw
-
-        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.full(7, 0.2)
-
-    class FakeBackend:
-        is_move_running = False
-
-        def __init__(self) -> None:
-            self.head_kinematics = FakeKinematics()
-
-        def get_present_head_joint_positions(self) -> np.ndarray:
-            return np.zeros(7)
-
-        def get_present_head_pose(self) -> np.ndarray:
-            return np.eye(4)
-
-        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
-            self.command = command
-
-    backend = FakeBackend()
+    backend = _ApiBackend()
     app = create_app(Args(autostart=False))
     app.dependency_overrides[get_backend] = lambda: backend
 
@@ -185,30 +135,8 @@ def test_tracking_api_rejects_non_finite_values() -> None:
 
 
 def test_tracking_start_rejects_oversized_telemetry_capacity() -> None:
-    class FakeKinematics:
-        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
-            self.automatic_body_yaw = automatic_body_yaw
-
-        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.zeros(7)
-
-    class FakeBackend:
-        is_move_running = False
-
-        def __init__(self) -> None:
-            self.head_kinematics = FakeKinematics()
-
-        def get_present_head_joint_positions(self) -> np.ndarray:
-            return np.zeros(7)
-
-        def get_present_head_pose(self) -> np.ndarray:
-            return np.eye(4)
-
-        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
-            self.command = command
-
     app = create_app(Args(autostart=False))
-    app.dependency_overrides[get_backend] = lambda: FakeBackend()
+    app.dependency_overrides[get_backend] = lambda: _ApiBackend()
 
     with TestClient(app) as client:
         response = client.post(
@@ -222,32 +150,8 @@ def test_tracking_start_rejects_oversized_telemetry_capacity() -> None:
 
 
 def test_tracking_start_validates_look_at_profile_response_hz() -> None:
-    class FakeKinematics:
-        automatic_body_yaw = False
-
-        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
-            self.automatic_body_yaw = automatic_body_yaw
-
-        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.zeros(7)
-
-    class FakeBackend:
-        is_move_running = False
-
-        def __init__(self) -> None:
-            self.head_kinematics = FakeKinematics()
-
-        def get_present_head_joint_positions(self) -> np.ndarray:
-            return np.zeros(7)
-
-        def get_present_head_pose(self) -> np.ndarray:
-            return np.eye(4)
-
-        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
-            self.command = command
-
     app = create_app(Args(autostart=False))
-    app.dependency_overrides[get_backend] = lambda: FakeBackend()
+    app.dependency_overrides[get_backend] = lambda: _ApiBackend()
 
     with TestClient(app) as client:
         accepted = client.post(
@@ -278,18 +182,8 @@ def test_tracking_start_validates_look_at_profile_response_hz() -> None:
 
 
 def test_tracking_start_validates_camera_and_elevation_limits() -> None:
-    class FakeKinematics:
-        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
-            self.automatic_body_yaw = automatic_body_yaw
-
-    class FakeBackend:
-        is_move_running = False
-
-        def __init__(self) -> None:
-            self.head_kinematics = FakeKinematics()
-
     app = create_app(Args(autostart=False))
-    app.dependency_overrides[get_backend] = lambda: FakeBackend()
+    app.dependency_overrides[get_backend] = lambda: _ApiBackend()
 
     with TestClient(app) as client:
         accepted = client.post(
@@ -322,31 +216,9 @@ def test_tracking_start_validates_camera_and_elevation_limits() -> None:
 
 
 def test_wireless_startup_starts_visual_tracking() -> None:
-    class FakeKinematics:
-        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
-            self.automatic_body_yaw = automatic_body_yaw
-
-        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.zeros(7)
-
-    class FakeBackend:
-        is_move_running = False
-
-        def __init__(self) -> None:
-            self.head_kinematics = FakeKinematics()
-
-        def get_present_head_joint_positions(self) -> np.ndarray:
-            return np.zeros(7)
-
-        def get_present_head_pose(self) -> np.ndarray:
-            return np.eye(4)
-
-        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
-            self.command = command
-
     class FakeDaemon:
         def __init__(self) -> None:
-            self.backend = FakeBackend()
+            self.backend = _ApiBackend()
             self.started = False
             self.stopped = False
 
@@ -432,30 +304,6 @@ def test_daemon_stop_route_stops_visual_tracking_before_backend_stop(
 def test_daemon_restart_route_replaces_visual_tracking_after_backend_restart(
     monkeypatch: object,
 ) -> None:
-    class FakeKinematics:
-        automatic_body_yaw = False
-
-        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
-            self.automatic_body_yaw = automatic_body_yaw
-
-        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.zeros(7)
-
-    class FakeBackend:
-        is_move_running = False
-
-        def __init__(self) -> None:
-            self.head_kinematics = FakeKinematics()
-
-        def get_present_head_joint_positions(self) -> np.ndarray:
-            return np.zeros(7)
-
-        def get_present_head_pose(self) -> np.ndarray:
-            return np.eye(4)
-
-        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
-            self.command = command
-
     class FakeVisualServo:
         def __init__(self) -> None:
             self.stopped = False
@@ -465,13 +313,13 @@ def test_daemon_restart_route_replaces_visual_tracking_after_backend_restart(
 
     class FakeDaemon:
         def __init__(self, visual_servo: FakeVisualServo) -> None:
-            self.backend = FakeBackend()
+            self.backend = _ApiBackend()
             self.visual_servo = visual_servo
             self.restarted_after_visual_servo = False
 
         async def restart(self) -> None:
             self.restarted_after_visual_servo = self.visual_servo.stopped
-            self.backend = FakeBackend()
+            self.backend = _ApiBackend()
 
         async def stop(self, **kwargs: object) -> None:
             pass
@@ -516,33 +364,11 @@ def test_daemon_restart_route_replaces_visual_tracking_after_backend_restart(
 
 
 def test_replacing_visual_servo_backend_stops_old_controller() -> None:
-    class FakeKinematics:
-        def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
-            self.automatic_body_yaw = automatic_body_yaw
-
-        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.zeros(7)
-
-    class FakeBackend:
-        is_move_running = False
-
-        def __init__(self) -> None:
-            self.head_kinematics = FakeKinematics()
-
-        def get_present_head_joint_positions(self) -> np.ndarray:
-            return np.zeros(7)
-
-        def get_present_head_pose(self) -> np.ndarray:
-            return np.eye(4)
-
-        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
-            self.command = command
-
     class AppState:
         pass
 
-    old_backend = FakeBackend()
-    new_backend = FakeBackend()
+    old_backend = _ApiBackend()
+    new_backend = _ApiBackend()
     app_state = AppState()
     old_controller = VisualServoController(backend=old_backend)  # type: ignore[arg-type]
     old_controller.start()
@@ -553,6 +379,32 @@ def test_replacing_visual_servo_backend_stops_old_controller() -> None:
     assert old_controller.status()["last_reason"] == "stopped"
     assert not old_controller.running
     assert new_controller.backend is new_backend
+
+
+def test_detection_websocket_closes_when_controller_is_replaced() -> None:
+    backend = _ApiBackend()
+    app = create_app(Args(autostart=False))
+    app.dependency_overrides[get_backend] = lambda: backend
+    app.dependency_overrides[ws_get_backend] = lambda: backend
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/api/tracking/ws/detections") as websocket:
+            websocket.send_json({"u": 10.0, "v": 10.0})
+            assert websocket.receive_json() == {"status": "accepted"}
+            old_controller = app.state.visual_servo
+
+            response = client.post("/api/tracking/start", json={})
+            assert response.status_code == 200
+            new_controller = app.state.visual_servo
+            assert new_controller is not old_controller
+
+            websocket.send_json({"u": 20.0, "v": 20.0})
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                websocket.receive_json()
+
+    assert exc_info.value.code == 1012
+    assert old_controller.status()["accepted_detections"] == 1
+    assert new_controller.status()["accepted_detections"] == 0
 
 
 def test_tracking_telemetry_route_does_not_create_controller() -> None:
@@ -585,26 +437,7 @@ def test_tracking_telemetry_route_rejects_invalid_query_without_controller() -> 
 
 
 def test_tracking_telemetry_route_filters_records() -> None:
-    class FakeKinematics:
-        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.zeros(7)
-
-    class FakeBackend:
-        is_move_running = False
-
-        def __init__(self) -> None:
-            self.head_kinematics = FakeKinematics()
-
-        def get_present_head_joint_positions(self) -> np.ndarray:
-            return np.zeros(7)
-
-        def get_present_head_pose(self) -> np.ndarray:
-            return np.eye(4)
-
-        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
-            self.command = command
-
-    backend = FakeBackend()
+    backend = _ApiBackend()
     app = create_app(Args(autostart=False))
     controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
     controller.telemetry.append({"timestamp": 10.0, "sequence": 0, "reason": "a"})
@@ -633,27 +466,8 @@ def test_tracking_telemetry_route_filters_records() -> None:
 
 
 def test_tracking_telemetry_route_rejects_invalid_query() -> None:
-    class FakeKinematics:
-        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.zeros(7)
-
-    class FakeBackend:
-        is_move_running = False
-
-        def __init__(self) -> None:
-            self.head_kinematics = FakeKinematics()
-
-        def get_present_head_joint_positions(self) -> np.ndarray:
-            return np.zeros(7)
-
-        def get_present_head_pose(self) -> np.ndarray:
-            return np.eye(4)
-
-        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
-            self.command = command
-
     app = create_app(Args(autostart=False))
-    app.state.visual_servo = VisualServoController(backend=FakeBackend())  # type: ignore[arg-type]
+    app.state.visual_servo = VisualServoController(backend=_ApiBackend())  # type: ignore[arg-type]
 
     with TestClient(app) as client:
         response = client.get(
@@ -665,27 +479,8 @@ def test_tracking_telemetry_route_rejects_invalid_query() -> None:
 
 
 def test_tracking_telemetry_route_rejects_non_finite_query() -> None:
-    class FakeKinematics:
-        def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
-            return np.zeros(7)
-
-    class FakeBackend:
-        is_move_running = False
-
-        def __init__(self) -> None:
-            self.head_kinematics = FakeKinematics()
-
-        def get_present_head_joint_positions(self) -> np.ndarray:
-            return np.zeros(7)
-
-        def get_present_head_pose(self) -> np.ndarray:
-            return np.eye(4)
-
-        def set_target_head_joint_positions(self, command: np.ndarray) -> None:
-            self.command = command
-
     app = create_app(Args(autostart=False))
-    app.state.visual_servo = VisualServoController(backend=FakeBackend())  # type: ignore[arg-type]
+    app.state.visual_servo = VisualServoController(backend=_ApiBackend())  # type: ignore[arg-type]
 
     with TestClient(app) as client:
         response = client.get("/api/tracking/telemetry?from=Infinity")

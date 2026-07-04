@@ -16,7 +16,7 @@ from reachy_mini.daemon.tracking.telemetry import (
     summarize_records,
 )
 from reachy_mini.daemon.tracking.visual_servo import (
-    DetectionBuffer,
+    LatestTargetBuffer,
     TrackingDetection,
     TrackingLookAtTarget,
     VisualServoController,
@@ -223,6 +223,30 @@ def test_visual_servo_rejects_unsafe_profiled_body_yaw_without_writing() -> None
     assert controller.status()["motion_fault"] == "safety_rejected"
 
 
+def test_visual_servo_rejects_measured_hard_limit_without_writing() -> None:
+    backend = _MotionTestBackend()
+    controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
+    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
+    assert controller.step(dt=0.02)
+    assert len(backend.commands) == 1
+
+    backend.current[6] = controller.look_at_guard.limits[6, 0] - 0.001
+
+    assert not controller.step(dt=0.02)
+    assert len(backend.commands) == 1
+    record = controller.telemetry.query()["records"][-1]
+    assert record["reason"] == "safety_rejected"
+    assert record["limit_hits"] == [
+        {
+            "joint_index": 6,
+            "kind": "current_lower_hard_position",
+            "value": pytest.approx(backend.current[6]),
+            "limit": pytest.approx(controller.look_at_guard.limits[6, 0]),
+        }
+    ]
+    assert controller.status()["motion_fault"] == "safety_rejected"
+
+
 def test_visual_servo_profile_fields_are_empty_without_profile_update() -> None:
     records = []
 
@@ -298,7 +322,11 @@ def test_visual_servo_look_at_ik_failure_stops_motion_and_recovers() -> None:
     assert recovered["limit_hits"] == []
 
 
-def test_visual_servo_no_target_gap_preserves_look_at_motion_state() -> None:
+def test_visual_servo_no_target_gap_preserves_look_at_motion_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 10.0
+    monkeypatch.setattr(visual_servo_module.time, "monotonic", lambda: now)
     backend = _MotionTestBackend()
     controller = VisualServoController(
         backend=backend,  # type: ignore[arg-type]
@@ -307,7 +335,7 @@ def test_visual_servo_no_target_gap_preserves_look_at_motion_state() -> None:
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
     assert controller.step(dt=0.02)
     reads = (backend.joint_reads, backend.pose_reads)
-    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0, timestamp=0.0))
+    now = 10.02
 
     assert controller.step(dt=0.02)
 
@@ -322,7 +350,11 @@ def test_visual_servo_no_target_gap_preserves_look_at_motion_state() -> None:
     }
 
 
-def test_visual_servo_recovers_after_hardware_boundary_dropout() -> None:
+def test_visual_servo_recovers_after_hardware_boundary_dropout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 10.0
+    monkeypatch.setattr(visual_servo_module.time, "monotonic", lambda: now)
     config = _motion_config()
     config.max_detection_age = 0.01
     desired = np.zeros(7)
@@ -337,10 +369,11 @@ def test_visual_servo_recovers_after_hardware_boundary_dropout() -> None:
     commands_before_gap = len(backend.commands)
 
     backend.current[6] = -1.227184630308513
-    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0, timestamp=0.0))
+    now = 10.02
     assert controller.step(dt=0.02)
     assert len(backend.commands) == commands_before_gap + 1
 
+    now = 10.03
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
     for _ in range(20):
         assert controller.step(dt=0.02)
@@ -380,7 +413,11 @@ def test_visual_servo_commits_monotonic_soft_boundary_recovery() -> None:
     assert controller.telemetry.query()["records"][-1]["reason"] == "commanded"
 
 
-def test_visual_servo_detection_reuses_look_at_profile_after_look_at() -> None:
+def test_visual_servo_detection_reuses_look_at_profile_after_look_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 10.0
+    monkeypatch.setattr(visual_servo_module.time, "monotonic", lambda: now)
     backend = _MotionTestBackend()
     controller = VisualServoController(
         backend=backend,  # type: ignore[arg-type]
@@ -388,7 +425,7 @@ def test_visual_servo_detection_reuses_look_at_profile_after_look_at() -> None:
     )
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
     assert controller.step(dt=0.02)
-    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0, timestamp=0.0))
+    now = 10.02
     controller.submit(TrackingDetection(u=10.0, v=10.0))
 
     assert controller.step(dt=0.02)
@@ -448,14 +485,18 @@ def test_visual_servo_control_stall_preserves_committed_command_anchor() -> None
     assert controller.status()["motion_state"] == "holding_no_target"
 
 
-def test_visual_servo_no_target_command_stall_holds_committed_anchor() -> None:
+def test_visual_servo_no_target_command_stall_holds_committed_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 10.0
+    monkeypatch.setattr(visual_servo_module.time, "monotonic", lambda: now)
     backend = _MotionTestBackend()
     controller = VisualServoController(backend=backend)  # type: ignore[arg-type]
     controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0))
     assert controller.step(dt=0.02)
     committed = backend.commands[-1].copy()
-    controller._last_command_time = time.monotonic() - 1.0
-    controller.submit_look_at(TrackingLookAtTarget(x=0.5, y=0.0, z=0.0, timestamp=0.0))
+    controller._last_command_time = 9.0
+    now = 11.0
 
     assert not controller.step(dt=0.02, use_command_elapsed=True)
 
@@ -695,8 +736,8 @@ def test_visual_servo_start_and_stop_reset_motion_state(
     assert timed_out._last_command_path == "look_at"
 
 
-def test_detection_buffer_keeps_only_latest_detection() -> None:
-    buffer = DetectionBuffer()
+def test_latest_target_buffer_keeps_only_latest_detection() -> None:
+    buffer = LatestTargetBuffer[TrackingDetection]()
 
     first = TrackingDetection(u=100.0, v=200.0, timestamp=1.0, frame_id=1)
     second = TrackingDetection(u=300.0, v=400.0, timestamp=2.0, frame_id=2)
@@ -707,29 +748,79 @@ def test_detection_buffer_keeps_only_latest_detection() -> None:
     assert buffer.latest() == second
 
 
-def test_detection_buffer_rejects_stale_and_low_confidence_detection() -> None:
-    now = time.time()
+def test_latest_target_buffer_rejects_stale_and_low_confidence_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = VisualServoConfig(max_detection_age=0.1, min_confidence=0.5)
-    buffer = DetectionBuffer()
+    buffer = LatestTargetBuffer[TrackingDetection]()
+    monkeypatch.setattr(visual_servo_module.time, "monotonic", lambda: 10.0)
 
     buffer.submit(
         TrackingDetection(
             u=320.0,
             v=240.0,
-            timestamp=now - 1.0,
             confidence=1.0,
         )
     )
+    assert buffer.fresh(config=config, now=10.2) is None
+
     buffer.submit(
         TrackingDetection(
             u=320.0,
             v=240.0,
-            timestamp=now,
             confidence=0.1,
         )
     )
 
-    assert buffer.fresh(config=config, now=now) is None
+    assert buffer.fresh(config=config, now=10.0) is None
+
+
+@pytest.mark.parametrize(
+    ("buffer", "target"),
+    [
+        (
+            LatestTargetBuffer[TrackingDetection](),
+            TrackingDetection(u=320.0, v=240.0, timestamp=10**12),
+        ),
+        (
+            LatestTargetBuffer[TrackingLookAtTarget](),
+            TrackingLookAtTarget(x=0.5, y=0.0, z=0.0, timestamp=10**12),
+        ),
+    ],
+)
+def test_target_expiry_uses_daemon_receipt_time_not_source_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+    buffer: LatestTargetBuffer[TrackingDetection]
+    | LatestTargetBuffer[TrackingLookAtTarget],
+    target: TrackingDetection | TrackingLookAtTarget,
+) -> None:
+    monkeypatch.setattr(visual_servo_module.time, "monotonic", lambda: 10.0)
+    buffer.submit(target)  # type: ignore[arg-type]
+
+    assert (
+        buffer.fresh(
+            VisualServoConfig(max_detection_age=0.1),
+            now=10.2,
+        )
+        is None
+    )
+
+
+def test_target_status_and_telemetry_age_use_daemon_receipt_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 10.0
+    monkeypatch.setattr(visual_servo_module.time, "monotonic", lambda: now)
+    controller = VisualServoController(
+        backend=_MotionTestBackend()  # type: ignore[arg-type]
+    )
+    controller.submit(TrackingDetection(u=640.0, v=360.0, timestamp=10**12))
+    now = 10.05
+
+    assert controller.status()["last_detection_age"] == pytest.approx(0.05)
+    assert controller.step(dt=0.02)
+    record = controller.telemetry.query()["records"][-1]
+    assert record["latency"]["target_age"] == pytest.approx(0.05)
 
 
 def test_visual_servo_detection_ik_failure_recovers_on_new_detection() -> None:
@@ -982,7 +1073,12 @@ def test_visual_servo_3d_look_at_keeps_fixed_reference_origin() -> None:
     )
 
 
-def test_visual_servo_detection_refreshes_reference_across_target_gap() -> None:
+def test_visual_servo_detection_refreshes_reference_across_target_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 10.0
+    monkeypatch.setattr(visual_servo_module.time, "monotonic", lambda: now)
+
     class FakeKinematics:
         def __init__(self) -> None:
             self.poses: list[np.ndarray] = []
@@ -1020,8 +1116,9 @@ def test_visual_servo_detection_refreshes_reference_across_target_gap() -> None:
     )
     controller.submit(TrackingDetection(u=640.0, v=360.0, frame_id=0))
     assert controller.step(dt=0.02)
-    controller.submit(TrackingDetection(u=640.0, v=360.0, frame_id=1, timestamp=0.0))
+    now = 10.02
     assert controller.step(dt=0.02)
+    now = 10.03
     controller.submit(TrackingDetection(u=640.0, v=360.0, frame_id=1))
     assert controller.step(dt=0.02)
 
@@ -1580,7 +1677,7 @@ def test_visual_servo_records_non_finite_ik_as_failure(
 ) -> None:
     class FakeTime:
         def __init__(self) -> None:
-            self.monotonic_values = iter([1.0, 1.1, 1.7])
+            self.monotonic_values = iter([1.0, 1.1, 1.1, 1.1, 1.1, 1.8])
 
         def monotonic(self) -> float:
             return next(self.monotonic_values)

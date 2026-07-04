@@ -11,9 +11,10 @@ import urllib.request
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn, cast
+from typing import Any, NoReturn
 
 from reachy_mini.daemon.tracking.telemetry import dump_jsonl, summarize_records
+from reachy_mini.tools._robot_api import RobotApi
 
 DEFAULT_BASE_URL = "http://reachy-mini.local:8017/api"
 DEFAULT_REPLAY_PATH = ("center", "top", "right", "bottom", "left", "center")
@@ -330,27 +331,6 @@ def summarize_replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             for hit in profile_hits:
                 key = _limit_hit_key(hit)
                 profile_limit_hits[key] = profile_limit_hits.get(key, 0) + 1
-    limiter_deltas: list[float] = []
-    limiter_changed_count = 0
-    limiter_compared_count = 0
-    for record in look_at:
-        if record.get("reason") != "commanded":
-            continue
-        profiled = record.get("profiled_command")
-        final = record.get("final_command")
-        if not _finite_vector(profiled, length=7) or not _finite_vector(
-            final, length=7
-        ):
-            continue
-        profiled_values = cast(list[int | float], profiled)
-        final_values = cast(list[int | float], final)
-        differences = [
-            abs(float(final_value) - float(profiled_value))
-            for profiled_value, final_value in zip(profiled_values, final_values)
-        ]
-        limiter_deltas.extend(differences)
-        limiter_compared_count += 1
-        limiter_changed_count += int(any(value > 1e-9 for value in differences))
     command_spans = _joint_spans(command_rows)
     final_command_smoothness = telemetry_summary["final_command_smoothness"]
     return {
@@ -366,15 +346,6 @@ def summarize_replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "command_smoothness": final_command_smoothness,
         "profiled_command_smoothness": telemetry_summary["profiled_command_smoothness"],
         "final_command_smoothness": final_command_smoothness,
-        "limiter_delta": {
-            "max_abs_rad": max(limiter_deltas) if limiter_deltas else None,
-            "mean_abs_rad": (
-                sum(limiter_deltas) / len(limiter_deltas) if limiter_deltas else None
-            ),
-            "changed_tick_count": limiter_changed_count,
-        },
-        "limiter_changed_count": limiter_changed_count,
-        "limiter_compared_count": limiter_compared_count,
         "target_y_span_m": _span(target_y),
         "target_z_span_m": _span(target_z),
         "final_command_spans_rad": command_spans,
@@ -807,37 +778,7 @@ def _return_neutral(
     duration: float,
     timeout: float,
 ) -> dict[str, Any]:
-    move = _post_json(
-        base_url,
-        "/move/goto",
-        {
-            "head_pose": {
-                "x": 0.0,
-                "y": 0.0,
-                "z": 0.0,
-                "roll": 0.0,
-                "pitch": 0.0,
-                "yaw": 0.0,
-            },
-            "antennas": [0.0, 0.0],
-            "body_yaw": 0.0,
-            "duration": duration,
-            "interpolation": "minjerk",
-        },
-        timeout=timeout,
-    )
-    uuid = move.get("uuid")
-    deadline = time.monotonic() + max(timeout, duration + 5.0)
-    while isinstance(uuid, str) and time.monotonic() < deadline:
-        running = _request_payload("GET", base_url, "/move/running", timeout=timeout)
-        if not isinstance(running, list):
-            break
-        if not any(
-            item.get("uuid") == uuid for item in running if isinstance(item, dict)
-        ):
-            break
-        time.sleep(0.25)
-    return move
+    return RobotApi(base_url, timeout).return_neutral(duration)
 
 
 def _summarize_neutral_return(state: Mapping[str, Any]) -> dict[str, Any]:

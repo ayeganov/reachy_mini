@@ -464,10 +464,6 @@ class JointCommandSafetyGuard:
             raise ValueError("dt must be finite and positive")
         command_vector = _finite_joint_vector(command, length=7, name="command")
         current_vector = _finite_joint_vector(current, length=7, name="current")
-        reference = current_vector if self._last_command is None else self._last_command
-        velocity = (command_vector - reference) / dt
-        acceleration = (velocity - self._velocity) / dt
-        jerk = (acceleration - self._acceleration) / dt
         margin = self.config.joint_safety_margin
         hard_lower = self.limits[:, 0]
         hard_upper = self.limits[:, 1]
@@ -476,6 +472,33 @@ class JointCommandSafetyGuard:
         position_tolerance = 1e-9
         hits: list[dict[str, float | int | str]] = []
         recovery: list[dict[str, float | int | str]] = []
+
+        for index, value in enumerate(current_vector):
+            if value < hard_lower[index] - position_tolerance:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "current_lower_hard_position",
+                        "value": float(value),
+                        "limit": float(hard_lower[index]),
+                    }
+                )
+            elif value > hard_upper[index] + position_tolerance:
+                hits.append(
+                    {
+                        "joint_index": index,
+                        "kind": "current_upper_hard_position",
+                        "value": float(value),
+                        "limit": float(hard_upper[index]),
+                    }
+                )
+        if hits:
+            return hits, self._velocity.copy(), self._acceleration.copy(), recovery
+
+        reference = current_vector if self._last_command is None else self._last_command
+        velocity = (command_vector - reference) / dt
+        acceleration = (velocity - self._velocity) / dt
+        jerk = (acceleration - self._acceleration) / dt
 
         reference_violation = np.maximum(soft_lower - reference, 0.0) + np.maximum(
             reference - soft_upper, 0.0

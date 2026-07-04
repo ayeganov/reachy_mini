@@ -12,13 +12,14 @@ mujoco = pytest.importorskip("mujoco")
 
 from examples.mujoco_red_target_tracking import (  # noqa: E402
     CONTROL_DT,
+    SCENARIOS,
     SENSOR_TICKS,
     MujocoRedTargetHarness,
     run_orbit_sweep,
     run_scenario,
 )
-from reachy_mini.daemon.tracking.visual_servo import (  # noqa: E402
-    TrackingDetection,
+from reachy_mini.daemon.tracking import (  # noqa: E402
+    visual_servo as visual_servo_module,
 )
 
 
@@ -86,17 +87,7 @@ def test_harness_step_reads_only_latest_telemetry_record(
 
 @pytest.mark.parametrize(
     ("name", "marker_azimuth", "marker_height"),
-    [
-        ("center", 0.0, 0.0),
-        ("left", math.atan2(0.2, 0.5), 0.0),
-        ("right", -math.atan2(0.2, 0.5), 0.0),
-        ("top", 0.0, 0.2),
-        ("bottom", 0.0, -0.2),
-        ("top_left", math.atan2(0.1414, 0.5), 0.1414),
-        ("top_right", -math.atan2(0.1414, 0.5), 0.1414),
-        ("bottom_left", math.atan2(0.1414, 0.5), -0.1414),
-        ("bottom_right", -math.atan2(0.1414, 0.5), -0.1414),
-    ],
+    [(name, *coordinates) for name, coordinates in SCENARIOS.items()],
 )
 def test_rendered_marker_grid_centers_through_production_detection_path(
     name: str,
@@ -117,7 +108,11 @@ def test_rendered_marker_grid_centers_through_production_detection_path(
     assert result.maximum_abs_elevation <= math.atan2(0.2, 0.5) + 1e-12, result
 
 
-def test_marker_loss_expires_detection_and_stops_without_fault() -> None:
+def test_marker_loss_expires_detection_and_stops_without_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 10.0
+    monkeypatch.setattr(visual_servo_module.time, "monotonic", lambda: now)
     harness = MujocoRedTargetHarness()
     harness.set_marker_orbit(-0.2, 0.0)
     try:
@@ -125,14 +120,17 @@ def test_marker_loss_expires_detection_and_stops_without_fault() -> None:
             if tick % SENSOR_TICKS == 0:
                 assert harness.observe(CONTROL_DT * SENSOR_TICKS) is not None
             harness.step()
+            now += CONTROL_DT
         before = harness.last_target
 
         harness.marker_visible = False
+        now += harness.servo.config.max_detection_age
         reasons = set()
         for tick in range(30):
             if tick % SENSOR_TICKS == 0:
                 assert harness.observe(CONTROL_DT * SENSOR_TICKS) is None
             reasons.add(str(harness.step()["reason"]))
+            now += CONTROL_DT
 
         assert harness.last_target == before
         assert reasons <= {"stopping_no_target", "holding_no_target"}
@@ -142,7 +140,11 @@ def test_marker_loss_expires_detection_and_stops_without_fault() -> None:
         harness.close()
 
 
-def test_mujoco_target_gap_preserves_command_motion_state() -> None:
+def test_mujoco_target_gap_preserves_command_motion_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 10.0
+    monkeypatch.setattr(visual_servo_module.time, "monotonic", lambda: now)
     harness = MujocoRedTargetHarness()
     harness.set_marker_orbit(math.atan2(0.2, 0.5), 0.0)
     try:
@@ -150,16 +152,9 @@ def test_mujoco_target_gap_preserves_command_motion_state() -> None:
             if tick % SENSOR_TICKS == 0:
                 assert harness.observe(CONTROL_DT * SENSOR_TICKS) is not None
             harness.step()
+            now += CONTROL_DT
 
-        harness.servo.submit(
-            TrackingDetection(
-                u=harness.width / 2.0,
-                v=harness.height / 2.0,
-                timestamp=0.0,
-                width=harness.width,
-                height=harness.height,
-            )
-        )
+        now += harness.servo.config.max_detection_age
         gap_reasons = []
         for _ in range(6):
             assert harness.servo.step(dt=CONTROL_DT)
@@ -171,6 +166,7 @@ def test_mujoco_target_gap_preserves_command_motion_state() -> None:
             for _ in range(round(CONTROL_DT / harness.backend.model.opt.timestep)):
                 mujoco.mj_step(harness.backend.model, harness.backend.data)
             harness._refresh_backend_state()
+            now += CONTROL_DT
 
         assert harness.observe(CONTROL_DT * SENSOR_TICKS) is not None
         resumed = harness.step()
