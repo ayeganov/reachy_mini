@@ -2,7 +2,7 @@
 # requires-python = ">=3.13"
 # dependencies = [
 #   "numpy>=2,<3",
-#   "opencv-python>=4.10,<5",
+#   "opencv-python>=4.10,<4.13",
 #   "pyzmq>=25,<28",
 # ]
 # ///
