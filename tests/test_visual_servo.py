@@ -383,6 +383,8 @@ def test_detection_target_is_stateless_and_clamps_absolute_elevation() -> None:
             image_horizontal_fov=0.4,
             image_vertical_fov=vertical_fov,
             image_error_elevation_limit=elevation_limit,
+            image_error_upward_elevation_limit=elevation_limit,
+            image_error_downward_elevation_limit=elevation_limit,
         ),
     )
     started = time.time()

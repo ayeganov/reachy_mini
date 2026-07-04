@@ -18,6 +18,7 @@ import numpy as np
 import numpy.typing as npt
 from scipy.spatial.transform import Rotation as R
 
+from .config import VisualServoConfig
 from .telemetry import VisualServoTelemetryBuffer, finite_json_value
 
 if TYPE_CHECKING:
@@ -74,29 +75,6 @@ class TrackingLookAtTarget:
     timestamp: float = field(default_factory=time.time)
     confidence: float = 1.0
     frame_id: int | None = None
-
-
-@dataclass
-class VisualServoConfig:
-    """Configuration for robot-side visual servoing."""
-
-    control_frequency: float = 50.0
-    min_confidence: float = 0.3
-    max_detection_age: float = 0.35
-    smoothing_alpha: float = 0.35
-    lookahead_distance: float = 0.5
-    image_horizontal_fov: float = np.deg2rad(98.88965079926311)
-    image_vertical_fov: float = np.deg2rad(66.67916209122708)
-    image_error_elevation_limit: float = np.arctan2(0.2, 0.5)
-    image_error_upward_elevation_limit: float | None = None
-    image_error_downward_elevation_limit: float | None = None
-    joint_safety_margin: float = np.deg2rad(5.0)
-    max_joint_velocity: float = np.deg2rad(80.0)
-    max_joint_acceleration: float = np.deg2rad(300.0)
-    max_joint_jerk: float = np.deg2rad(2000.0)
-    look_at_profile_response_hz: float = 1.0
-    automatic_body_yaw: bool = True
-    telemetry_capacity: int = 3000
 
 
 @dataclass(frozen=True)

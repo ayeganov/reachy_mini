@@ -9,7 +9,6 @@ import pytest
 
 from reachy_mini.tools import look_at_pad
 from reachy_mini.tools.look_at_pad import (
-    DEFAULT_TRACKING_CONFIG,
     CirclePlane,
     LookAtPadApp,
     build_replay_targets,
@@ -69,15 +68,8 @@ def test_build_replay_targets_exercises_both_lateral_and_vertical_axes() -> None
     assert targets[-1].frame_id == len(targets) - 1
 
 
-def test_default_tracking_config_matches_interactive_pad_values() -> None:
-    assert DEFAULT_TRACKING_CONFIG == {
-        "smoothing_alpha": 1.0,
-        "joint_safety_margin": 0.1745329252,
-        "max_joint_velocity": 0.60,
-        "max_joint_acceleration": 2.40,
-        "max_joint_jerk": 16.0,
-        "look_at_profile_response_hz": 2.0,
-    }
+def test_pad_does_not_duplicate_daemon_tracking_defaults() -> None:
+    assert not hasattr(look_at_pad, "DEFAULT_TRACKING_CONFIG")
 
 
 def test_replay_summary_includes_command_smoothness() -> None:
@@ -332,8 +324,6 @@ def test_replay_sends_config_and_retains_post_return_state(
     assert start_payload["look_at_profile_response_hz"] == 2.0
     assert summary["tracking_config"] == start_payload
     assert result["tracking_config"] == start_payload
-    assert summary["default_config"] == DEFAULT_TRACKING_CONFIG
-    assert summary["default_config"]["look_at_profile_response_hz"] == 2.0
     assert summary["return_status"] == {"uuid": "neutral"}
     assert summary["post_return_state"] == post_return_state
     assert summary["neutral_return"]["within_tolerance"] is True

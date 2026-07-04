@@ -16,14 +16,6 @@ from typing import Any, NoReturn, cast
 from reachy_mini.daemon.tracking.telemetry import dump_jsonl, summarize_records
 
 DEFAULT_BASE_URL = "http://reachy-mini.local:8017/api"
-DEFAULT_TRACKING_CONFIG = {
-    "smoothing_alpha": 1.0,
-    "joint_safety_margin": 0.1745329252,
-    "max_joint_velocity": 0.60,
-    "max_joint_acceleration": 2.40,
-    "max_joint_jerk": 16.0,
-    "look_at_profile_response_hz": 2.0,
-}
 DEFAULT_REPLAY_PATH = ("center", "top", "right", "bottom", "left", "center")
 NEUTRAL_TRANSLATION_TOLERANCE_M = 0.02
 NEUTRAL_ROTATION_TOLERANCE_RAD = 0.05
@@ -206,8 +198,7 @@ def replay(args: argparse.Namespace) -> dict[str, Any]:
     output_prefix = _resolve_output_prefix(args.output_prefix)
     jsonl_path = output_prefix.with_suffix(".jsonl")
     summary_path = output_prefix.with_suffix(".json")
-    tracking_config = dict(DEFAULT_TRACKING_CONFIG)
-    tracking_config["look_at_profile_response_hz"] = args.look_at_profile_response_hz
+    tracking_config = {"look_at_profile_response_hz": args.look_at_profile_response_hz}
 
     _post_json(base_url, "/tracking/start", tracking_config, timeout=args.timeout)
     start_monotonic = time.monotonic()
@@ -265,7 +256,6 @@ def replay(args: argparse.Namespace) -> dict[str, Any]:
 
     summary = {
         "base_url": base_url,
-        "default_config": DEFAULT_TRACKING_CONFIG,
         "tracking_config": tracking_config,
         "plane": _plane_summary(plane),
         "path": list(path_names),
@@ -294,7 +284,6 @@ def replay(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "jsonl_path": str(jsonl_path),
         "summary_path": str(summary_path),
-        "default_config": DEFAULT_TRACKING_CONFIG,
         "tracking_config": tracking_config,
         "submitted_targets": len(targets),
         "record_count": len(object_records),
@@ -511,7 +500,7 @@ class LookAtPadApp:
 
     def _start_tracking(self) -> None:
         try:
-            status = self._post("/tracking/start", DEFAULT_TRACKING_CONFIG)
+            status = self._post("/tracking/start", {})
             self.tracking_active = True
             self.status_var.set(f"tracking: {status['last_reason']}")
         except Exception as exc:

@@ -48,6 +48,10 @@ def test_mode_banner_makes_motion_opt_in() -> None:
     assert "FOLLOW ENABLED" in attention.mode_banner(follow)
 
 
+def test_attention_uses_daemon_owned_tracking_defaults() -> None:
+    assert not hasattr(attention, "TRACKING_CONFIG")
+
+
 def test_finish_tracking_stops_and_returns_neutral_after_stop_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

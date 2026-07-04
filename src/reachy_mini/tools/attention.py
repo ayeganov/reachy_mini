@@ -34,22 +34,6 @@ from reachy_mini.tools.attention_viewer import DEFAULT_ENDPOINT, DetectionPublis
 
 DEFAULT_BASE_URL = "http://reachy-mini.local:8017/api"
 
-# Removed in Task 3 when these effective values become daemon defaults.
-TRACKING_CONFIG = {
-    "max_detection_age": 0.35,
-    "smoothing_alpha": 1.0,
-    "joint_safety_margin": 0.1745329252,
-    "max_joint_velocity": 0.60,
-    "max_joint_acceleration": 2.40,
-    "max_joint_jerk": 16.0,
-    "look_at_profile_response_hz": 2.0,
-    "image_horizontal_fov": math.radians(98.88965079926311),
-    "image_vertical_fov": math.radians(66.67916209122708),
-    "image_error_elevation_limit": math.radians(15.0),
-    "image_error_upward_elevation_limit": math.radians(20.0),
-    "image_error_downward_elevation_limit": math.radians(15.0),
-}
-
 # Joining an H.264 stream between keyframes can produce transient decoder noise.
 av.logging.set_level(av.logging.PANIC)
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
@@ -234,7 +218,7 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
         )
 
         if args.follow:
-            api.post("/tracking/start", TRACKING_CONFIG)
+            api.post("/tracking/start", {})
             tracking_started = True
             websocket_url = api.base_url.replace("http://", "ws://", 1).replace(
                 "https://", "wss://", 1
