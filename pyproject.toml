@@ -87,7 +87,6 @@ reachy-mini-reflash-motors = "reachy_mini.tools.reflash_motors:main"
 reachy-mini-tracking-telemetry = "reachy_mini.tools.tracking_telemetry:main"
 reachy-mini-look-at-pad = "reachy_mini.tools.look_at_pad:main"
 reachy-mini-attend = "reachy_mini.tools.attention:main"
-reachy-mini-attend-viewer = "reachy_mini.tools.attention_viewer:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

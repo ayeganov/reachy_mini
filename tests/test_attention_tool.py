@@ -80,14 +80,11 @@ def test_finish_tracking_stops_and_returns_neutral_after_stop_error(
     assert calls == ["/tracking/stop", "neutral"]
 
 
-def test_console_entry_points_are_declared() -> None:
+def test_control_client_entrypoint_is_declared_without_gui_viewer() -> None:
     pyproject = (Path(__file__).parents[1] / "pyproject.toml").read_text()
 
     assert 'reachy-mini-attend = "reachy_mini.tools.attention:main"' in pyproject
-    assert (
-        'reachy-mini-attend-viewer = "reachy_mini.tools.attention_viewer:main"'
-        in pyproject
-    )
+    assert "reachy-mini-attend-viewer" not in pyproject
 
 
 def test_neutral_wait_accepts_move_list_response() -> None:

@@ -61,3 +61,13 @@ def test_viewer_uses_local_default_endpoint() -> None:
     assert (
         build_parser().parse_args([]).endpoint == "ipc:///tmp/reachy-attention-viewer"
     )
+
+
+def test_viewer_script_declares_isolated_gui_opencv() -> None:
+    source = (
+        Path(__file__).parents[1] / "src/reachy_mini/tools/attention_viewer.py"
+    ).read_text()
+
+    assert source.startswith("# /// script\n")
+    assert '"opencv-python>=4.10,<4.13"' in source
+    assert "opencv-python-headless" not in source

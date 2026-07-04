@@ -1,3 +1,11 @@
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#   "numpy>=2,<3",
+#   "opencv-python>=4.10,<4.13",
+#   "pyzmq>=25,<28",
+# ]
+# ///
 """Latest-frame transport and isolated OpenCV viewer for model detections."""
 
 from __future__ import annotations
