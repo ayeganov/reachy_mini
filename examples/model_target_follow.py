@@ -49,7 +49,7 @@ from yellow_box_follow import (
     _return_neutral,
 )
 
-from reachy_mini.daemon.tracking.telemetry import dump_jsonl
+from reachy_mini.daemon.tracking.telemetry import dump_jsonl, summarize_records
 from reachy_mini.media.receivers.zeromq_client import (
     ZeroMQClient,
     ZeroMQClientConfig,
@@ -481,6 +481,7 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
         "state_after": state_after,
         "tracking_before": tracking_before,
         "telemetry_records": len(records),
+        "controller_telemetry": summarize_records(records) if records else None,
     }
     output_prefix.with_suffix(".json").write_text(
         json.dumps(summary, indent=2, allow_nan=False) + "\n"

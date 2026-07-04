@@ -1794,6 +1794,38 @@ def test_tracking_telemetry_summary_skips_empty_and_mismatched_commands() -> Non
     }
 
 
+def test_tracking_telemetry_summary_counts_every_backend_command() -> None:
+    records = [
+        {
+            "timestamp": 1.0,
+            "sequence": 1,
+            "reason": "recovering",
+            "final_command": [0.0] * 7,
+        },
+        {
+            "timestamp": 2.0,
+            "sequence": 2,
+            "reason": "holding_no_target",
+            "final_command": [0.0] * 7,
+        },
+        {
+            "timestamp": 3.0,
+            "sequence": 3,
+            "reason": "safety_rejected",
+            "final_command": None,
+        },
+    ]
+
+    summary = summarize_records(records)
+
+    assert summary["command_count"] == 2
+    assert summary["reason_counts"] == {
+        "recovering": 1,
+        "holding_no_target": 1,
+        "safety_rejected": 1,
+    }
+
+
 def test_tracking_telemetry_summary_includes_profile_and_final_smoothness() -> None:
     records = [
         {

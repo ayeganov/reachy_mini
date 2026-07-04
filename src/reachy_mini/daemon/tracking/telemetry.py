@@ -259,7 +259,9 @@ def summarize_records(records: list[dict[str, JsonValue]]) -> dict[str, Any]:
         "first_sequence": min(sequences) if sequences else None,
         "last_sequence": max(sequences) if sequences else None,
         "reason_counts": dict(reason_counts),
-        "command_count": reason_counts.get("commanded", 0),
+        "command_count": sum(
+            isinstance(record.get("final_command"), list) for record in records
+        ),
         "ik_failure_count": sum(1 for record in records if record.get("ik_failed")),
         "limit_hit_count": _count_limit_hits(records),
         "latency": _summarize_numbers(latencies),
