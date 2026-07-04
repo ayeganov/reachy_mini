@@ -177,7 +177,7 @@ class VisualServoController:
         self._last_command_path: str | None = None
         self._command_count = 0
         self._error: str | None = None
-        self._look_at_reference_pose: npt.NDArray[np.float64] | None = None
+        self._metric_reference_pose: npt.NDArray[np.float64] | None = None
         self._detection_reference_pose: npt.NDArray[np.float64] | None = None
         self._processed_detection: TrackingDetection | None = None
         self._detection_target_cache: TrackingLookAtTarget | None = None
@@ -207,7 +207,7 @@ class VisualServoController:
         self.look_at_profile.reset()
         self.look_at_guard.reset()
         self._last_command_path = None
-        self._look_at_reference_pose = None
+        self._metric_reference_pose = None
         self._detection_reference_pose = None
         self._processed_detection = None
         self._detection_target_cache = None
@@ -241,7 +241,7 @@ class VisualServoController:
                 self._error = "Visual servo thread did not stop within 2.0s."
                 return
         self._thread = None
-        self._look_at_reference_pose = None
+        self._metric_reference_pose = None
         self._detection_reference_pose = None
         self._processed_detection = None
         self._detection_target_cache = None
@@ -496,7 +496,7 @@ class VisualServoController:
             )
             body_yaw = float(current_joints[0])
             if self._last_command_path != target_type:
-                self._look_at_reference_pose = current_pose.copy()
+                self._metric_reference_pose = current_pose.copy()
             if look_at is not None:
                 self._processed_detection = None
                 self._detection_target_cache = None
@@ -511,10 +511,10 @@ class VisualServoController:
                     current_pose,
                     self._detection_reference_pose,
                 )
-            if self._look_at_reference_pose is None:
-                self._look_at_reference_pose = current_pose.copy()
+            if self._metric_reference_pose is None:
+                self._metric_reference_pose = current_pose.copy()
             ik_reference_pose = (
-                self._look_at_reference_pose
+                self._metric_reference_pose
                 if look_at is not None
                 else self._detection_reference_pose
             )
@@ -783,7 +783,7 @@ class VisualServoController:
 
     def _reset_target_state(self) -> None:
         """Clear stale perception state without erasing committed motion."""
-        self._look_at_reference_pose = None
+        self._metric_reference_pose = None
         self._detection_reference_pose = None
         self._processed_detection = None
         self._detection_target_cache = None

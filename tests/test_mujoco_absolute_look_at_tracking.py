@@ -4,24 +4,19 @@ from __future__ import annotations
 
 import math
 import os
-import sys
-from pathlib import Path
 
 import pytest
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 mujoco = pytest.importorskip("mujoco")
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "examples"))
-
-from mujoco_red_target_tracking import (  # noqa: E402
+from examples.mujoco_red_target_tracking import (  # noqa: E402
     CONTROL_DT,
     SENSOR_TICKS,
     MujocoRedTargetHarness,
     run_orbit_sweep,
     run_scenario,
 )
-
 from reachy_mini.daemon.tracking.visual_servo import (  # noqa: E402
     TrackingDetection,
 )

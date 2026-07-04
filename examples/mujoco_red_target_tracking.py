@@ -30,7 +30,7 @@ DEFAULT_ORBIT_RADIUS = 0.5
 DEFAULT_VERTICAL_RANGE = 0.2
 ORBIT_PAD_SIZE = 640
 RED = np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
-APPROVED_MOTION = {
+MOTION_CONFIG = {
     "joint_safety_margin": 0.1745329252,
     "max_joint_velocity": 0.6,
     "max_joint_acceleration": 2.4,
@@ -186,11 +186,11 @@ class MujocoRedTargetHarness:
         self.servo = VisualServoController(
             backend=self.backend,
             config=VisualServoConfig(
-                joint_safety_margin=APPROVED_MOTION["joint_safety_margin"],
-                max_joint_velocity=APPROVED_MOTION["max_joint_velocity"],
-                max_joint_acceleration=APPROVED_MOTION["max_joint_acceleration"],
-                max_joint_jerk=APPROVED_MOTION["max_joint_jerk"],
-                look_at_profile_response_hz=APPROVED_MOTION[
+                joint_safety_margin=MOTION_CONFIG["joint_safety_margin"],
+                max_joint_velocity=MOTION_CONFIG["max_joint_velocity"],
+                max_joint_acceleration=MOTION_CONFIG["max_joint_acceleration"],
+                max_joint_jerk=MOTION_CONFIG["max_joint_jerk"],
+                look_at_profile_response_hz=MOTION_CONFIG[
                     "look_at_profile_response_hz"
                 ],
                 image_horizontal_fov=horizontal_fov,

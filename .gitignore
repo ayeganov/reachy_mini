@@ -260,3 +260,4 @@ examples/debug/measures/*
 /rf-detr*.pth
 /mobileclip*.ts
 /yolo*.pt
+/MUJOCO_LOG.TXT
