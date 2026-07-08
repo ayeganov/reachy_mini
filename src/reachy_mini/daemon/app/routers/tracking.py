@@ -1,11 +1,12 @@
 """Visual tracking API routes.
 
 These routes accept 2D detections from an external perception process while the
-robot-side daemon owns smoothing, safety constraints, and motor target updates.
+robot-side daemon owns gaze conversion, safety constraints, and motor target updates.
 """
 
 import json
-from typing import Any
+import threading
+from typing import Any, Self
 
 from fastapi import (
     APIRouter,
@@ -17,7 +18,8 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from pydantic import BaseModel, Field, FiniteFloat, NonNegativeInt
+from pydantic import BaseModel, Field, FiniteFloat, NonNegativeInt, model_validator
+from pydantic_core import PydanticCustomError
 
 from ....daemon.backend.abstract import Backend
 from ....daemon.tracking.config import VisualServoConfig
@@ -30,6 +32,8 @@ from ....daemon.tracking.visual_servo import (
 from ..dependencies import get_backend, ws_get_backend
 
 router = APIRouter(prefix="/tracking")
+_VISUAL_SERVO_LIFECYCLE_LOCK = threading.RLock()
+_MAX_IMAGE_DIMENSION = 8192
 
 
 class TrackingDetectionRequest(BaseModel):
@@ -40,8 +44,18 @@ class TrackingDetectionRequest(BaseModel):
     timestamp: FiniteFloat | None = None
     confidence: FiniteFloat = Field(default=1.0, ge=0.0, le=1.0)
     frame_id: int | None = None
-    width: int = Field(default=1280, gt=0)
-    height: int = Field(default=720, gt=0)
+    width: int = Field(default=1280, gt=0, le=_MAX_IMAGE_DIMENSION)
+    height: int = Field(default=720, gt=0, le=_MAX_IMAGE_DIMENSION)
+
+    @model_validator(mode="after")
+    def validate_centroid_inside_frame(self) -> Self:
+        """Reject coordinates outside the declared image rectangle."""
+        if self.u > self.width or self.v > self.height:
+            raise PydanticCustomError(
+                "centroid_outside_image",
+                "detection centroid must be inside the image dimensions",
+            )
+        return self
 
     def to_detection(self) -> TrackingDetection:
         """Convert request into a TrackingDetection."""
@@ -86,34 +100,36 @@ def _get_or_create_visual_servo(
     app_state: Any,
     backend: Backend,
 ) -> VisualServoController:
-    controller = getattr(app_state, "visual_servo", None)
-    if isinstance(controller, VisualServoController) and controller.backend is backend:
-        return controller
-    if controller is not None:
-        stop_visual_servo(app_state)
-    controller = getattr(app_state, "visual_servo", None)
-    if controller is None:
+    with _VISUAL_SERVO_LIFECYCLE_LOCK:
+        controller = getattr(app_state, "visual_servo", None)
+        if (
+            isinstance(controller, VisualServoController)
+            and controller.backend is backend
+        ):
+            return controller
+        if controller is not None:
+            stop_visual_servo(app_state)
         controller = VisualServoController(backend=backend)
         app_state.visual_servo = controller
-    assert isinstance(controller, VisualServoController)
-    return controller
+        return controller
 
 
 def stop_visual_servo(app_state: Any) -> Any | None:
     """Stop and detach the app-owned visual servo controller."""
-    controller = getattr(app_state, "visual_servo", None)
-    if controller is None:
-        return None
+    with _VISUAL_SERVO_LIFECYCLE_LOCK:
+        controller = getattr(app_state, "visual_servo", None)
+        if controller is None:
+            return None
 
-    stop = getattr(controller, "stop", None)
-    if callable(stop):
-        stop()
+        stop = getattr(controller, "stop", None)
+        if callable(stop):
+            stop()
 
-    if bool(getattr(controller, "running", False)):
-        raise RuntimeError("Visual servo controller did not stop within timeout.")
+        if bool(getattr(controller, "running", False)):
+            raise RuntimeError("Visual servo controller did not stop within timeout.")
 
-    app_state.visual_servo = None
-    return controller
+        app_state.visual_servo = None
+        return controller
 
 
 def start_visual_servo(
@@ -122,16 +138,24 @@ def start_visual_servo(
     config: VisualServoConfig | None = None,
 ) -> VisualServoController:
     """Start a fresh visual servo controller for the app backend."""
-    if getattr(app_state, "visual_servo", None) is not None:
-        stop_visual_servo(app_state)
+    with _VISUAL_SERVO_LIFECYCLE_LOCK:
+        if getattr(app_state, "visual_servo", None) is not None:
+            stop_visual_servo(app_state)
 
-    controller = VisualServoController(
-        backend=backend,
-        config=config or VisualServoConfig(),
-    )
-    app_state.visual_servo = controller
-    controller.start()
-    return controller
+        controller = VisualServoController(
+            backend=backend,
+            config=config or VisualServoConfig(),
+        )
+        try:
+            controller.start()
+        except BaseException:
+            try:
+                controller.stop()
+            except BaseException:
+                pass
+            raise
+        app_state.visual_servo = controller
+        return controller
 
 
 def get_visual_servo(

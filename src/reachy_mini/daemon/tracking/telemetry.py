@@ -265,7 +265,6 @@ def summarize_records(records: list[dict[str, JsonValue]]) -> dict[str, Any]:
         "ik_failure_count": sum(1 for record in records if record.get("ik_failed")),
         "limit_hit_count": _count_limit_hits(records),
         "latency": _summarize_numbers(latencies),
-        "command_smoothness": final_command_smoothness,
         "profiled_command_smoothness": profiled_command_smoothness,
         "final_command_smoothness": final_command_smoothness,
     }

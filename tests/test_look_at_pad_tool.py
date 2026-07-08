@@ -72,7 +72,7 @@ def test_pad_does_not_duplicate_daemon_tracking_defaults() -> None:
     assert not hasattr(look_at_pad, "DEFAULT_TRACKING_CONFIG")
 
 
-def test_replay_summary_includes_command_smoothness() -> None:
+def test_replay_summary_includes_final_command_smoothness() -> None:
     records = [
         {
             "timestamp": 1.0,
@@ -106,11 +106,12 @@ def test_replay_summary_includes_command_smoothness() -> None:
     summary = summarize_replay_records(records)
 
     assert summary["limit_hit_count"] == 1
-    assert summary["command_smoothness"] == {
+    assert summary["final_command_smoothness"] == {
         "max_velocity": 1.0,
         "max_acceleration": 1.0,
         "max_jerk": None,
     }
+    assert "command_smoothness" not in summary
 
 
 def _profile_replay_records() -> list[dict[str, object]]:
@@ -159,7 +160,7 @@ def test_replay_summary_reports_profile_diagnostics() -> None:
     assert summary["profile_limit_hits"] == {"jerk": 1}
     assert summary["profile_limit_hit_count"] == 1
     assert summary["limit_hits"] == {"acceleration": 1}
-    assert summary["command_smoothness"] == summary["final_command_smoothness"]
+    assert "command_smoothness" not in summary
     for field in (
         "profiled_command_smoothness",
         "final_command_smoothness",
@@ -277,6 +278,80 @@ def test_replay_sends_config_and_retains_post_return_state(
     }
 
 
+def test_replay_stops_after_ambiguous_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    posted: list[str] = []
+
+    def fake_post(
+        _base_url: str,
+        path: str,
+        _payload: object = None,
+        timeout: float = 10.0,
+    ) -> dict[str, object]:
+        del timeout
+        posted.append(path)
+        if path == "/tracking/start":
+            raise TimeoutError("response lost")
+        return {"last_reason": "stopped"}
+
+    monkeypatch.setattr(look_at_pad, "_post_json", fake_post)
+
+    with pytest.raises(TimeoutError, match="response lost"):
+        replay(_replay_args(tmp_path))
+
+    assert posted == ["/tracking/start", "/tracking/stop"]
+
+
+def test_replay_stops_after_first_target_submission_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    posted: list[str] = []
+
+    def fake_post(
+        _base_url: str,
+        path: str,
+        _payload: object = None,
+        timeout: float = 10.0,
+    ) -> dict[str, object]:
+        del timeout
+        posted.append(path)
+        if path == "/tracking/look_at":
+            raise RuntimeError("submission failed")
+        return {"last_reason": "stopped"}
+
+    monkeypatch.setattr(look_at_pad, "_post_json", fake_post)
+
+    with pytest.raises(RuntimeError, match="submission failed"):
+        replay(_replay_args(tmp_path, initial_hold=0.1))
+
+    assert posted == ["/tracking/start", "/tracking/look_at", "/tracking/stop"]
+
+
+def test_gui_ambiguous_start_failure_attempts_stop() -> None:
+    app = LookAtPadApp.__new__(LookAtPadApp)
+    app.tracking_active = False
+    app.tracking_start_attempted = False
+    app.status_var = _ValueVar("idle")
+    posted: list[str] = []
+
+    def post(path: str, _payload: object = None) -> dict[str, object]:
+        posted.append(path)
+        if path == "/tracking/start":
+            raise TimeoutError("response lost")
+        return {"last_reason": "stopped"}
+
+    app._post = post  # type: ignore[method-assign]
+
+    app._start_tracking()
+
+    assert posted == ["/tracking/start", "/tracking/stop"]
+    assert not app.tracking_active
+    assert not app.tracking_start_attempted
+
+
 def test_gui_plane_uses_current_slider_values() -> None:
     app = LookAtPadApp.__new__(LookAtPadApp)
     app.args = argparse.Namespace(
@@ -314,8 +389,38 @@ def test_gui_slider_redraws_without_selected_target() -> None:
 
 
 class _ValueVar:
-    def __init__(self, value: float) -> None:
+    def __init__(self, value: object) -> None:
         self.value = value
 
-    def get(self) -> float:
+    def get(self) -> object:
         return self.value
+
+    def set(self, value: object) -> None:
+        self.value = value
+
+
+def _replay_args(tmp_path: Path, **overrides: object) -> argparse.Namespace:
+    values: dict[str, object] = {
+        "base_url": "http://robot/api",
+        "eye_height": 0.0,
+        "canvas_size": 720,
+        "height_offset": 0.0,
+        "distance": 0.5,
+        "radius_m": 0.15,
+        "path": "center",
+        "fps": 30.0,
+        "segment_duration": 0.0,
+        "hold_duration": 0.0,
+        "initial_hold": 0.0,
+        "final_hold": 0.0,
+        "settle": 0.0,
+        "timeout": 1.0,
+        "telemetry_limit": 5000,
+        "output_prefix": tmp_path / "failed-replay",
+        "leave_running": False,
+        "return_neutral": False,
+        "return_duration": 1.0,
+        "look_at_profile_response_hz": 2.0,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)

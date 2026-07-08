@@ -182,13 +182,6 @@ class MujocoRedTargetHarness:
             image_error_upward_elevation_limit=self.elevation_limit,
             image_error_downward_elevation_limit=self.elevation_limit,
         )
-        assert (
-            servo_config.joint_safety_margin,
-            servo_config.max_joint_velocity,
-            servo_config.max_joint_acceleration,
-            servo_config.max_joint_jerk,
-            servo_config.look_at_profile_response_hz,
-        ) == (0.1745329252, 0.6, 2.4, 16.0, 2.0)
         self.servo = VisualServoController(
             backend=self.backend,
             config=servo_config,

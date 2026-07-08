@@ -31,7 +31,7 @@ def format_summary(records: list[dict[str, JsonValue]]) -> str:
         f"limit_hit_count: {summary['limit_hit_count']}",
         "latency: " + json.dumps(summary["latency"], sort_keys=True, allow_nan=False),
     ]
-    smoothness = summary.get("command_smoothness")
+    smoothness = summary.get("final_command_smoothness")
     if isinstance(smoothness, dict):
         lines.extend(
             [

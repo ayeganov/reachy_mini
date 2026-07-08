@@ -189,16 +189,21 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
     last_timestamp: object = None
     stopped_by = "duration"
     run_error: Exception | None = None
+    visualization_error: str | None = None
     started_at = 0.0
 
     try:
         if args.visualize:
-            publisher = DetectionPublisher(args.visualization_endpoint)
-            print(
-                f"Publishing target-filtered detections at "
-                f"{args.visualization_endpoint}",
-                flush=True,
-            )
+            try:
+                publisher = DetectionPublisher(args.visualization_endpoint)
+                print(
+                    f"Publishing target-filtered detections at "
+                    f"{args.visualization_endpoint}",
+                    flush=True,
+                )
+            except Exception as exc:
+                visualization_error = str(exc)
+                print(f"Visualization disabled: {exc}", flush=True)
         if not camera.start(wait_timeout=args.timeout):
             raise RuntimeError("remote camera stream did not start")
 
@@ -271,17 +276,26 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
                     submitted_targets += 1
             now = time.monotonic()
             if publisher is not None and now >= next_visualization:
-                publisher.publish(
-                    annotate_frame(
-                        frame,
-                        detections,
-                        selected,
-                        model_name=model_name,
-                        target=target,
-                        follow=args.follow,
+                try:
+                    publisher.publish(
+                        annotate_frame(
+                            frame,
+                            detections,
+                            selected,
+                            model_name=model_name,
+                            target=target,
+                            follow=args.follow,
+                        )
                     )
-                )
-                next_visualization = now + 1.0 / args.visualization_fps
+                    next_visualization = now + 1.0 / args.visualization_fps
+                except Exception as exc:
+                    visualization_error = visualization_error or str(exc)
+                    print(f"Visualization disabled: {exc}", flush=True)
+                    try:
+                        publisher.close()
+                    except Exception as close_exc:
+                        visualization_error = visualization_error or str(close_exc)
+                    publisher = None
     except KeyboardInterrupt:
         stopped_by = "interrupt"
     except Exception as exc:
@@ -308,7 +322,7 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
             try:
                 publisher.close()
             except Exception as exc:
-                cleanup_error = cleanup_error or exc
+                visualization_error = visualization_error or str(exc)
         run_error = run_error or cleanup_error
 
     summary = {
@@ -319,6 +333,7 @@ def run(args: argparse.Namespace, detector: Detector | None = None) -> dict[str,
         "frame_count": frame_count,
         "matching_frame_count": matching_frames,
         "submitted_targets": submitted_targets,
+        "visualization_error": visualization_error,
         "stopped_by": stopped_by,
         "error": None if run_error is None else repr(run_error),
     }

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
@@ -58,9 +59,21 @@ class DetectionPublisher:
         self._owns_context = context is None
         self._context = context if context is not None else zmq.Context()
         self._socket = self._context.socket(zmq.PUB)
+        self._closed = False
+        self._ipc_path = (
+            Path(endpoint.removeprefix("ipc://"))
+            if endpoint.startswith("ipc:///")
+            else None
+        )
         self._socket.setsockopt(zmq.SNDHWM, 1)
         self._socket.setsockopt(zmq.LINGER, 0)
-        self._socket.bind(endpoint)
+        try:
+            self._socket.bind(endpoint)
+        except BaseException:
+            self._socket.close(linger=0)
+            if self._owns_context:
+                self._context.term()
+            raise
 
     def publish(self, frame: npt.NDArray[np.uint8]) -> None:
         """Publish one frame, dropping it rather than blocking control."""
@@ -71,9 +84,14 @@ class DetectionPublisher:
 
     def close(self) -> None:
         """Release the publisher without waiting for queued frames."""
+        if self._closed:
+            return
+        self._closed = True
         self._socket.close(linger=0)
         if self._owns_context:
             self._context.term()
+        if self._ipc_path is not None:
+            self._ipc_path.unlink(missing_ok=True)
 
 
 def build_parser() -> argparse.ArgumentParser:

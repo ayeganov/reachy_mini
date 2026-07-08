@@ -34,7 +34,8 @@ def test_decode_rejects_non_jpeg_message() -> None:
 
 
 def test_publisher_sends_latest_frame_without_blocking(tmp_path: Path) -> None:
-    endpoint = f"ipc://{tmp_path}/detections.sock"
+    socket_path = tmp_path / "detections.sock"
+    endpoint = f"ipc://{socket_path}"
     context = zmq.Context()
     publisher = DetectionPublisher(endpoint, context=context)
     subscriber = context.socket(zmq.SUB)
@@ -55,6 +56,8 @@ def test_publisher_sends_latest_frame_without_blocking(tmp_path: Path) -> None:
         subscriber.close(linger=0)
         publisher.close()
         context.term()
+
+    assert not socket_path.exists()
 
 
 def test_viewer_uses_local_default_endpoint() -> None:

@@ -856,24 +856,9 @@ class VisualServoController:
 
     def _try_acquire_motion_guard(self) -> Callable[[], None] | None:
         """Acquire backend motion ownership for one servo step."""
-        try_start_move = getattr(self.backend, "_try_start_move", None)
-        end_move = getattr(self.backend, "_end_move", None)
-        if callable(try_start_move) and callable(end_move):
-            if not bool(try_start_move()):
-                return None
-
-            def release() -> None:
-                end_move()
-
-            return release
-
-        if getattr(self.backend, "is_move_running", False):
+        if not self.backend._try_start_move():
             return None
-
-        def noop() -> None:
-            return None
-
-        return noop
+        return self.backend._end_move
 
     def _ik_from_target_world_with_telemetry(
         self,

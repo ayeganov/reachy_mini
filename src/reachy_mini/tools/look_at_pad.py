@@ -200,53 +200,74 @@ def replay(args: argparse.Namespace) -> dict[str, Any]:
     jsonl_path = output_prefix.with_suffix(".jsonl")
     summary_path = output_prefix.with_suffix(".json")
     tracking_config = {"look_at_profile_response_hz": args.look_at_profile_response_hz}
-
-    _post_json(base_url, "/tracking/start", tracking_config, timeout=args.timeout)
-    start_monotonic = time.monotonic()
-    for index, target in enumerate(targets):
-        _post_json(
-            base_url, "/tracking/look_at", target.payload(), timeout=args.timeout
-        )
-        next_time = start_monotonic + (index + 1) / args.fps
-        sleep_time = next_time - time.monotonic()
-        if sleep_time > 0.0:
-            time.sleep(sleep_time)
-    time.sleep(args.settle)
-
-    after_sweep_state = _request_json(
-        "GET",
-        base_url,
-        "/state/full?with_head_joints=true&with_body_yaw=true&with_antenna_positions=true",
-        timeout=args.timeout,
-    )
-    status_after = _request_json(
-        "GET", base_url, "/tracking/status", timeout=args.timeout
-    )
-    telemetry = _request_json(
-        "GET",
-        base_url,
-        f"/tracking/telemetry?limit={args.telemetry_limit}",
-        timeout=args.timeout,
-    )
-    records = telemetry.get("records")
-    if not isinstance(records, list):
-        raise ValueError("telemetry response must include a records list")
-    object_records = _as_object_records(records)
-    dump_jsonl(object_records, jsonl_path)
-    record_summary = summarize_replay_records(object_records)
-
+    start_attempted = False
+    replay_completed = False
     stop_status = None
-    if not args.leave_running or args.return_neutral:
-        stop_status = _post_json(base_url, "/tracking/stop", timeout=args.timeout)
     return_status = None
+    cleanup_error: BaseException | None = None
+    try:
+        start_attempted = True
+        _post_json(base_url, "/tracking/start", tracking_config, timeout=args.timeout)
+        start_monotonic = time.monotonic()
+        for index, target in enumerate(targets):
+            _post_json(
+                base_url, "/tracking/look_at", target.payload(), timeout=args.timeout
+            )
+            next_time = start_monotonic + (index + 1) / args.fps
+            sleep_time = next_time - time.monotonic()
+            if sleep_time > 0.0:
+                time.sleep(sleep_time)
+        time.sleep(args.settle)
+
+        after_sweep_state = _request_json(
+            "GET",
+            base_url,
+            "/state/full?with_head_joints=true&with_body_yaw=true&with_antenna_positions=true",
+            timeout=args.timeout,
+        )
+        status_after = _request_json(
+            "GET", base_url, "/tracking/status", timeout=args.timeout
+        )
+        telemetry = _request_json(
+            "GET",
+            base_url,
+            f"/tracking/telemetry?limit={args.telemetry_limit}",
+            timeout=args.timeout,
+        )
+        records = telemetry.get("records")
+        if not isinstance(records, list):
+            raise ValueError("telemetry response must include a records list")
+        object_records = _as_object_records(records)
+        dump_jsonl(object_records, jsonl_path)
+        record_summary = summarize_replay_records(object_records)
+        replay_completed = True
+    finally:
+        if start_attempted and (
+            not replay_completed or not args.leave_running or args.return_neutral
+        ):
+            try:
+                stop_status = _post_json(
+                    base_url, "/tracking/stop", timeout=args.timeout
+                )
+            except BaseException as exc:
+                cleanup_error = exc
+            if args.return_neutral:
+                try:
+                    return_status = _return_neutral(
+                        base_url,
+                        duration=args.return_duration,
+                        timeout=args.timeout,
+                    )
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+
+    if cleanup_error is not None:
+        raise cleanup_error
+
     post_return_state = None
     neutral_return = None
     if args.return_neutral:
-        return_status = _return_neutral(
-            base_url,
-            duration=args.return_duration,
-            timeout=args.timeout,
-        )
         post_return_state = _request_json(
             "GET",
             base_url,
@@ -343,7 +364,6 @@ def summarize_replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "limit_hit_count": telemetry_summary["limit_hit_count"],
         "profile_limit_hits": profile_limit_hits,
         "profile_limit_hit_count": profile_limit_hit_count,
-        "command_smoothness": final_command_smoothness,
         "profiled_command_smoothness": telemetry_summary["profiled_command_smoothness"],
         "final_command_smoothness": final_command_smoothness,
         "target_y_span_m": _span(target_y),
@@ -370,6 +390,7 @@ class LookAtPadApp:
         self.frame_id = 0
         self.mouse_down = False
         self.tracking_active = False
+        self.tracking_start_attempted = False
         self.hold_current_target = not args.stream_only_while_dragging
         self.eye_height_m = resolve_eye_height(self.base_url, args.eye_height)
         self.last_screen_point: tuple[float, float] | None = None
@@ -470,17 +491,25 @@ class LookAtPadApp:
         return _post_json(self.base_url, path, payload, timeout=0.75)
 
     def _start_tracking(self) -> None:
+        self.tracking_start_attempted = True
         try:
             status = self._post("/tracking/start", {})
             self.tracking_active = True
             self.status_var.set(f"tracking: {status['last_reason']}")
         except Exception as exc:
-            self.status_var.set(f"start failed: {exc}")
+            self.tracking_active = False
+            try:
+                self._post("/tracking/stop")
+                self.tracking_start_attempted = False
+                self.status_var.set(f"start failed: {exc}; tracking stopped")
+            except Exception as stop_exc:
+                self.status_var.set(f"start failed: {exc}; stop failed: {stop_exc}")
 
     def _stop_tracking(self) -> None:
         try:
             status = self._post("/tracking/stop")
             self.tracking_active = False
+            self.tracking_start_attempted = False
             self.status_var.set(f"tracking: {status['last_reason']}")
         except Exception as exc:
             self.status_var.set(f"stop failed: {exc}")
@@ -591,7 +620,9 @@ class LookAtPadApp:
 
     def quit(self) -> None:
         """Stop tracking unless requested otherwise, then close the window."""
-        if not self.args.leave_running:
+        if not self.args.leave_running and (
+            self.tracking_active or self.tracking_start_attempted
+        ):
             self._stop_tracking()
         self.root.destroy()
 

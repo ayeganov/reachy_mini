@@ -70,6 +70,16 @@ class _EmptyDetector:
         return []
 
 
+class _IncrementingCamera(_RunCamera):
+    def __init__(self, calls: list[str]) -> None:
+        super().__init__(calls)
+        self.timestamp = 0
+
+    def get_frame_with_metadata(self) -> tuple[np.ndarray, dict[str, int]]:
+        self.timestamp += 1
+        return np.zeros((10, 10, 3), dtype=np.uint8), {"ts": self.timestamp}
+
+
 def test_detection_payload_contains_only_current_centroid() -> None:
     selected = ImageDetection(10.0, 20.0, 50.0, 80.0, 0.87, "face")
 
@@ -158,10 +168,8 @@ def test_detector_dependencies_are_split_by_model_family() -> None:
         "clip @ git+https://github.com/ultralytics/CLIP.git@16be45c7062240d445cce764f2afd9454a91ef7e",
         "ultralytics>=8.4,<9",
     ]
-    assert extras["attention-rfdetr"] == [
-        "omegaconf>=2.3,<3",
-        "rfdetr>=1.3,<2",
-    ]
+    assert extras["attention-rfdetr"] == ["rfdetr>=1.3,<2"]
+    assert pyproject["tool"]["uv"]["exclude-dependencies"] == ["opencv-python-headless"]
     help_text = attention.build_parser().format_help()
     for extra in (
         "attention-yolo-face",
@@ -259,6 +267,89 @@ def test_attention_stops_tracking_even_when_stream_close_fails(
         "neutral",
         "camera_closed",
     ]
+
+
+def test_attention_continues_when_visualization_bind_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    api = _RunApi(calls)
+    monkeypatch.setattr(attention, "RobotApi", lambda *args: api)
+    monkeypatch.setattr(
+        attention,
+        "ZeroMQClient",
+        lambda **kwargs: _IncrementingCamera(calls),
+    )
+
+    def fail_to_bind(_endpoint: str) -> object:
+        raise RuntimeError("endpoint already in use")
+
+    monkeypatch.setattr(attention, "DetectionPublisher", fail_to_bind)
+    args = attention.build_parser().parse_args(
+        [
+            "--model",
+            "rfdetr-nano",
+            "--target",
+            "person",
+            "--visualize",
+            "--duration",
+            "0.001",
+        ]
+    )
+
+    summary = attention.run(args, detector=_EmptyDetector())
+
+    assert summary["frame_count"] > 0
+    assert summary["error"] is None
+    assert "endpoint already in use" in summary["visualization_error"]
+
+
+def test_attention_disables_visualization_after_publish_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    api = _RunApi(calls)
+    monkeypatch.setattr(attention, "RobotApi", lambda *args: api)
+    monkeypatch.setattr(
+        attention,
+        "ZeroMQClient",
+        lambda **kwargs: _IncrementingCamera(calls),
+    )
+
+    class FailingPublisher:
+        publish_count = 0
+        close_count = 0
+
+        def __init__(self, _endpoint: str) -> None:
+            pass
+
+        def publish(self, _frame: np.ndarray) -> None:
+            type(self).publish_count += 1
+            raise RuntimeError("JPEG encoding failed")
+
+        def close(self) -> None:
+            type(self).close_count += 1
+
+    monkeypatch.setattr(attention, "DetectionPublisher", FailingPublisher)
+    args = attention.build_parser().parse_args(
+        [
+            "--model",
+            "rfdetr-nano",
+            "--target",
+            "person",
+            "--visualize",
+            "--duration",
+            "0.002",
+        ]
+    )
+
+    summary = attention.run(args, detector=_EmptyDetector())
+
+    assert summary["frame_count"] > 1
+    assert summary["error"] is None
+    assert "JPEG encoding failed" in summary["visualization_error"]
+    assert FailingPublisher.publish_count == 1
+    assert FailingPublisher.close_count == 1
 
 
 def test_neutral_wait_rejects_missing_move_uuid() -> None:

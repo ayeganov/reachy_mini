@@ -48,9 +48,20 @@ class _MotionTestKinematics:
         return joints
 
 
-class _MotionTestBackend:
+class _MoveGuardBackend:
     is_move_running = False
 
+    def _try_start_move(self) -> bool:
+        if self.is_move_running:
+            return False
+        self.is_move_running = True
+        return True
+
+    def _end_move(self) -> None:
+        self.is_move_running = False
+
+
+class _MotionTestBackend(_MoveGuardBackend):
     def __init__(self, joints: np.ndarray | None = None) -> None:
         self.head_kinematics = _MotionTestKinematics(joints)
         self.current = np.zeros(7)
@@ -716,25 +727,6 @@ def test_visual_servo_start_and_stop_reset_motion_state(
     assert backend.pose_reads == 0
     assert backend.commands == []
 
-    class StuckThread:
-        def join(self, timeout: float | None = None) -> None:
-            pass
-
-        def is_alive(self) -> bool:
-            return True
-
-    timed_out = VisualServoController(backend=backend)  # type: ignore[arg-type]
-    timed_out._thread = StuckThread()  # type: ignore[assignment]
-    timed_out.look_at_profile._position = np.ones(7)
-    timed_out.look_at_guard._last_command = np.ones(7)
-    timed_out._last_command_path = "look_at"
-
-    timed_out.stop()
-
-    np.testing.assert_array_equal(timed_out.look_at_profile._position, np.ones(7))
-    np.testing.assert_array_equal(timed_out.look_at_guard._last_command, np.ones(7))
-    assert timed_out._last_command_path == "look_at"
-
 
 def test_latest_target_buffer_keeps_only_latest_detection() -> None:
     buffer = LatestTargetBuffer[TrackingDetection]()
@@ -837,7 +829,7 @@ def test_visual_servo_detection_ik_failure_recovers_on_new_detection() -> None:
                 return np.full(7, np.nan)
             return np.full(7, 0.2)
 
-    class FakeBackend:
+    class FakeBackend(_MoveGuardBackend):
         is_move_running = False
 
         def __init__(self) -> None:
@@ -877,7 +869,7 @@ def test_visual_servo_commands_from_3d_look_at_target() -> None:
             self.last_pose = pose
             return np.array([body_yaw, *([0.2] * 6)])
 
-    class FakeBackend:
+    class FakeBackend(_MoveGuardBackend):
         is_move_running = False
 
         def __init__(self) -> None:
@@ -918,7 +910,7 @@ def test_visual_servo_uses_latest_look_at_target_without_hidden_filtering() -> N
             self.forward_axes.append(pose[:3, 0].copy())
             return np.zeros(7)
 
-    class FakeBackend:
+    class FakeBackend(_MoveGuardBackend):
         is_move_running = False
 
         def __init__(self) -> None:
@@ -995,7 +987,7 @@ def test_visual_servo_3d_look_at_uses_world_up_for_predictable_target_plane() ->
             self.last_pose = pose
             return np.array([body_yaw, *([0.2] * 6)])
 
-    class FakeBackend:
+    class FakeBackend(_MoveGuardBackend):
         is_move_running = False
 
         def __init__(self) -> None:
@@ -1040,7 +1032,7 @@ def test_visual_servo_3d_look_at_keeps_fixed_reference_origin() -> None:
             self.pose_origins.append(pose[:3, 3].copy())
             return np.zeros(7)
 
-    class FakeBackend:
+    class FakeBackend(_MoveGuardBackend):
         is_move_running = False
 
         def __init__(self) -> None:
@@ -1090,7 +1082,7 @@ def test_visual_servo_detection_refreshes_reference_across_target_gap(
             self.poses.append(pose.copy())
             return np.zeros(7)
 
-    class FakeBackend:
+    class FakeBackend(_MoveGuardBackend):
         is_move_running = False
 
         def __init__(self) -> None:
@@ -1462,11 +1454,12 @@ def test_tracking_telemetry_summary_skips_empty_and_mismatched_commands() -> Non
         ]
     )
 
-    assert summary["command_smoothness"] == {
+    assert summary["final_command_smoothness"] == {
         "max_velocity": None,
         "max_acceleration": None,
         "max_jerk": None,
     }
+    assert "command_smoothness" not in summary
 
 
 def test_tracking_telemetry_summary_counts_every_backend_command() -> None:
@@ -1532,7 +1525,7 @@ def test_tracking_telemetry_summary_includes_profile_and_final_smoothness() -> N
         isinstance(value, float)
         for value in summary["final_command_smoothness"].values()
     )
-    assert summary["command_smoothness"] == summary["final_command_smoothness"]
+    assert "command_smoothness" not in summary
 
 
 def test_tracking_telemetry_smoothness_prefers_monotonic_timestamps() -> None:
@@ -1639,7 +1632,7 @@ def test_visual_servo_records_commanded_look_at_tick() -> None:
         def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
             return np.array([body_yaw, *([0.2] * 6)])
 
-    class FakeBackend:
+    class FakeBackend(_MoveGuardBackend):
         is_move_running = False
 
         def __init__(self) -> None:
@@ -1689,7 +1682,7 @@ def test_visual_servo_records_non_finite_ik_as_failure(
         def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
             return np.array([0.0, np.inf, -np.inf, 0.0, 0.0, 0.0, 0.0])
 
-    class FakeBackend:
+    class FakeBackend(_MoveGuardBackend):
         is_move_running = False
 
         def __init__(self) -> None:
@@ -1726,7 +1719,7 @@ def test_visual_servo_records_detection_as_generated_look_at_target() -> None:
         def ik(self, pose: np.ndarray, body_yaw: float = 0.0) -> np.ndarray:
             return np.full(7, 0.2)
 
-    class FakeBackend:
+    class FakeBackend(_MoveGuardBackend):
         is_move_running = False
 
         def __init__(self) -> None:

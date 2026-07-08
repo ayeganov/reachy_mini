@@ -1,6 +1,8 @@
 # ruff: noqa: D100,D103
 
 import math
+import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -10,7 +12,11 @@ from starlette.websockets import WebSocketDisconnect
 from reachy_mini.daemon.app import bg_job_register
 from reachy_mini.daemon.app.dependencies import get_backend, ws_get_backend
 from reachy_mini.daemon.app.main import Args, create_app
-from reachy_mini.daemon.app.routers.tracking import _get_or_create_visual_servo
+from reachy_mini.daemon.app.routers import tracking as tracking_router
+from reachy_mini.daemon.app.routers.tracking import (
+    _get_or_create_visual_servo,
+    start_visual_servo,
+)
 from reachy_mini.daemon.tracking.visual_servo import VisualServoController
 
 
@@ -40,6 +46,15 @@ class _ApiBackend:
     def set_target_head_joint_positions(self, command: np.ndarray) -> None:
         self.command = command
 
+    def _try_start_move(self) -> bool:
+        if self.is_move_running:
+            return False
+        self.is_move_running = True
+        return True
+
+    def _end_move(self) -> None:
+        self.is_move_running = False
+
 
 def test_tracking_start_uses_centralized_defaults() -> None:
     app = create_app(Args(autostart=False))
@@ -62,6 +77,92 @@ def test_tracking_start_uses_centralized_defaults() -> None:
     assert config.image_vertical_fov == math.radians(66.67916209122708)
     assert config.image_error_upward_elevation_limit == math.radians(30.0)
     assert config.image_error_downward_elevation_limit == math.radians(25.0)
+
+
+def test_concurrent_tracking_starts_leave_one_running_controller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_start_entered = threading.Event()
+    release_first_start = threading.Event()
+    second_finished = threading.Event()
+    controllers = []
+
+    class FakeController:
+        def __init__(self, **_kwargs: object) -> None:
+            self.running = False
+            controllers.append(self)
+
+        def start(self) -> None:
+            if len(controllers) == 1:
+                first_start_entered.set()
+                assert release_first_start.wait(timeout=1.0)
+            self.running = True
+
+        def stop(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(tracking_router, "VisualServoController", FakeController)
+    app_state = SimpleNamespace(visual_servo=None)
+    backend = _ApiBackend()
+    failures: list[BaseException] = []
+
+    def start_controller(done: threading.Event | None = None) -> None:
+        try:
+            start_visual_servo(app_state, backend)  # type: ignore[arg-type]
+        except BaseException as exc:  # pragma: no cover - exposed by assertion below
+            failures.append(exc)
+        finally:
+            if done is not None:
+                done.set()
+
+    first = threading.Thread(target=start_controller)
+    second = threading.Thread(target=start_controller, args=(second_finished,))
+    first.start()
+    assert first_start_entered.wait(timeout=1.0)
+    second.start()
+
+    assert not second_finished.wait(timeout=0.05)
+    release_first_start.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert failures == []
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert len(controllers) == 2
+    assert sum(controller.running for controller in controllers) == 1
+    assert app_state.visual_servo is controllers[-1]
+
+
+def test_tracking_start_failure_cleans_candidate_before_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidates = []
+
+    class FailingController:
+        def __init__(self, **_kwargs: object) -> None:
+            self.running = False
+            self.stop_called = False
+            candidates.append(self)
+
+        def start(self) -> None:
+            self.running = True
+            raise RuntimeError("start failed")
+
+        def stop(self) -> None:
+            self.stop_called = True
+            self.running = False
+
+    monkeypatch.setattr(tracking_router, "VisualServoController", FailingController)
+    app_state = SimpleNamespace(visual_servo=None)
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        start_visual_servo(app_state, _ApiBackend())  # type: ignore[arg-type]
+
+    assert len(candidates) == 1
+    assert candidates[0].stop_called
+    assert not candidates[0].running
+    assert app_state.visual_servo is None
 
 
 def test_tracking_status_route_is_registered() -> None:
@@ -105,6 +206,45 @@ def test_tracking_detection_rejects_invalid_camera_dimensions() -> None:
         )
 
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"u": 1280.01, "v": 360.0, "width": 1280, "height": 720},
+        {"u": 640.0, "v": 720.01, "width": 1280, "height": 720},
+        {"u": 640.0, "v": 360.0, "width": 8193, "height": 720},
+        {"u": 640.0, "v": 360.0, "width": 1280, "height": 8193},
+    ],
+)
+def test_tracking_detection_rejects_out_of_frame_or_oversized_geometry(
+    payload: dict[str, float | int],
+) -> None:
+    backend = _ApiBackend()
+    app = create_app(Args(autostart=False))
+    app.dependency_overrides[get_backend] = lambda: backend
+
+    with TestClient(app) as client:
+        response = client.post("/api/tracking/detection", json=payload)
+
+    assert response.status_code == 422
+
+
+def test_detection_websocket_rejects_out_of_frame_centroid_without_submission() -> None:
+    backend = _ApiBackend()
+    app = create_app(Args(autostart=False))
+    app.dependency_overrides[ws_get_backend] = lambda: backend
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/api/tracking/ws/detections") as websocket:
+            websocket.send_json(
+                {"u": 2560.0, "v": 1440.0, "width": 1280, "height": 720}
+            )
+            response = websocket.receive_json()
+            accepted_detections = app.state.visual_servo.status()["accepted_detections"]
+
+    assert response["status"] == "error"
+    assert accepted_detections == 0
 
 
 def test_tracking_api_rejects_non_finite_values() -> None:

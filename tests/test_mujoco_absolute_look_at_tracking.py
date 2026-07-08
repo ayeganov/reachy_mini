@@ -21,6 +21,7 @@ from examples.mujoco_red_target_tracking import (  # noqa: E402
 from reachy_mini.daemon.tracking import (  # noqa: E402
     visual_servo as visual_servo_module,
 )
+from reachy_mini.daemon.tracking.visual_servo import VisualServoConfig  # noqa: E402
 
 
 def _drive_until_centered(
@@ -83,6 +84,18 @@ def test_harness_step_reads_only_latest_telemetry_record(
         assert record["reason"] == "commanded"
     finally:
         harness.close()
+
+
+def test_mujoco_harness_uses_centralized_motion_defaults() -> None:
+    config = VisualServoConfig()
+
+    assert (
+        config.joint_safety_margin,
+        config.max_joint_velocity,
+        config.max_joint_acceleration,
+        config.max_joint_jerk,
+        config.look_at_profile_response_hz,
+    ) == (0.1745329252, 0.6, 2.4, 16.0, 2.0)
 
 
 @pytest.mark.parametrize(
@@ -193,6 +206,44 @@ def test_abrupt_horizontal_reversal_centers_without_reset_or_stuck_state() -> No
         assert second_centered is not None and second_centered <= 3.5
         assert second_hold >= 0.5
         assert harness.last_target[1] < first_target[1]
+        assert harness.guard_hits == 0
+        assert harness.profile_position_hits == 0
+        assert harness.maximum_direction_norm_error <= 1e-12
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    ("first_height", "second_height"),
+    [(0.2, -0.2), (-0.2, 0.2)],
+)
+def test_abrupt_vertical_reversal_centers_on_same_controller(
+    first_height: float,
+    second_height: float,
+) -> None:
+    harness = MujocoRedTargetHarness()
+    try:
+        harness.set_marker_orbit(0.0, first_height)
+        first_centered, first_hold = _drive_until_centered(harness)
+        first_target = harness.last_target
+
+        # A direct +0.2 m to -0.2 m jump leaves the fixed target outside the
+        # rendered eye frame. Reverse as far as the camera can still observe,
+        # then continue to the requested extreme on the same controller.
+        harness.set_marker_orbit(0.0, second_height * 0.75)
+        reversal_centered, reversal_hold = _drive_until_centered(harness)
+        harness.set_marker_orbit(0.0, second_height)
+        extreme_centered, extreme_hold = _drive_until_centered(harness)
+
+        assert first_centered is not None and first_centered <= 2.5
+        assert first_hold >= 0.5
+        assert reversal_centered is not None and reversal_centered <= 3.5
+        assert reversal_hold >= 0.5
+        assert extreme_centered is not None and extreme_centered <= 2.5
+        assert extreme_hold >= 0.5
+        assert (harness.last_target[2] - first_target[2]) * (
+            second_height - first_height
+        ) > 0.0
         assert harness.guard_hits == 0
         assert harness.profile_position_hits == 0
         assert harness.maximum_direction_norm_error <= 1e-12
